@@ -1,0 +1,8 @@
+[package]
+name = "devscribe"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+devscribe-core = { path = "../devscribe-core" }
+iced = { version = "0.14", features = ["canvas", "tokio"] }

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["devscribe", "devscribe-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+ropey = "1"
