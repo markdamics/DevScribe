@@ -1,5 +1,7 @@
 //! Small reusable visual primitives shared across shell panels.
+use crate::color::color;
 use crate::fonts;
+use devscribe_core::theme::Palette;
 use iced::alignment::Vertical;
 use iced::border;
 use iced::widget::{container, text, Space};
@@ -49,7 +51,7 @@ pub fn lang_badge<'a, Message: 'a>(
     container(
         text(label)
             .font(fonts::mono(iced::font::Weight::Bold))
-            .size(8.0)
+            .size(crate::text_scale::px(8.0))
             .color(fg),
     )
     .center(Length::Fixed(18.0))
@@ -65,7 +67,7 @@ pub fn lang_badge<'a, Message: 'a>(
 pub fn micro<'a, Message: 'a>(content: &'a str, color: Color) -> Element<'a, Message> {
     text(content)
         .font(fonts::mono(iced::font::Weight::Medium))
-        .size(10.0)
+        .size(crate::text_scale::px(10.0))
         .color(color)
         .into()
 }
@@ -80,6 +82,28 @@ pub fn hline<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+/// A muted, centered message filling its panel — "nothing to show here" for
+/// any tab (no file open, not JSON, no diff, empty search).
+pub fn placeholder<'a, Message: 'a>(
+    label: impl text::IntoFragment<'a>,
+    p: Palette,
+) -> Element<'a, Message> {
+    container(
+        text(label)
+            .font(fonts::mono(iced::font::Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_muted)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center(Length::Fill)
+    .style(move |_theme| container::Style {
+        background: Some(color(p.bg_void).into()),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// Shorthand for an unfilled rectangular border, e.g. panel dividers.

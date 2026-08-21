@@ -1,7 +1,15 @@
+pub mod command_palette;
+pub mod diff_view;
 pub mod editor_canvas;
+pub mod find_bar;
+pub mod json_view;
 pub mod logo_mark;
+pub mod search_icon;
+pub mod search_view;
+pub mod settings_panel;
 pub mod shell;
 pub mod sidebar;
 pub mod status_bar;
 pub mod tab_bar;
 pub mod title_bar;
+pub mod toast;

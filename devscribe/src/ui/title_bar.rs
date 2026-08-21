@@ -20,7 +20,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
 
     let wordmark = text("DEVSCRIBE")
         .font(fonts::display(Weight::ExtraBold))
-        .size(14.0)
+        .size(crate::text_scale::px(14.0))
         .color(color(p.text_primary));
 
     let version = widgets::micro("V1.4.0", color(p.text_muted));
@@ -33,14 +33,15 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         row![
             text("RUN ANYTHING")
                 .font(fonts::mono(Weight::Medium))
-                .size(11.0),
-            text("⌘K").font(fonts::mono(Weight::Medium)).size(10.0),
+                .size(crate::text_scale::px(11.0)),
+            text("⌘K").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(10.0)),
         ]
         .spacing(8.0)
         .align_y(Alignment::Center),
     ))
     .padding([0.0, 12.0])
     .height(Length::Fixed(24.0))
+    .on_press(Message::TogglePalette)
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {
@@ -76,7 +77,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
             ),
             text("ASSIST")
                 .font(fonts::mono(Weight::Medium))
-                .size(10.0),
+                .size(crate::text_scale::px(10.0)),
         ]
         .spacing(6.0)
         .align_y(Alignment::Center),
@@ -112,7 +113,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
 
     let theme_switcher = pick_list(ThemeName::ALL, Some(state.theme), Message::SetTheme)
         .font(fonts::mono(Weight::Medium))
-        .text_size(10.0)
+        .text_size(crate::text_scale::px(10.0))
         .padding([0.0, 9.0])
         .style(move |_theme, status| {
             let open_or_hover = !matches!(status, pick_list::Status::Active);
@@ -151,7 +152,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
 
     let bar_panel = container(bar)
         .width(Length::Fill)
-        .height(Length::Fixed(38.0))
+        .height(Length::Fixed(state.density.title_bar_h()))
         .align_y(Vertical::Center)
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_panel).into()),

@@ -1,7 +1,9 @@
 mod color;
+mod density;
 mod fonts;
 mod fs_tree;
 mod state;
+mod text_scale;
 mod ui;
 mod widgets;
 

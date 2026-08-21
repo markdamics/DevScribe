@@ -1,1 +1,1 @@
-# DevScribe
+# ![Main logo](/devscribe/assets/icons/devscribe-mark-2a-fold.svg) DevScribe

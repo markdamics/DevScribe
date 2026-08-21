@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 devscribe-core = { path = "../devscribe-core" }
 iced = { version = "0.14", features = ["canvas", "tokio"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }

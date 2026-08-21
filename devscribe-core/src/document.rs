@@ -43,6 +43,20 @@ impl Document {
         &self.text
     }
 
+    /// Writes the buffer back to `path()`, clearing the dirty flag on
+    /// success. Errors (no path, permission denied, etc.) leave the buffer
+    /// untouched — the caller decides how to surface that.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "document has no path"))?;
+        let file = std::fs::File::create(path)?;
+        self.text.write_to(std::io::BufWriter::new(file))?;
+        self.dirty = false;
+        Ok(())
+    }
+
     pub fn path(&self) -> Option<&std::path::Path> {
         self.path.as_deref()
     }
@@ -132,6 +146,28 @@ mod tests {
         let mut doc = Document::from_str("hello, world");
         doc.remove(5..6);
         assert_eq!(doc.text().to_string(), "hello world");
+    }
+
+    #[test]
+    fn save_without_path_errors() {
+        let mut doc = Document::from_str("no path");
+        assert!(doc.save().is_err());
+    }
+
+    #[test]
+    fn save_writes_buffer_and_clears_dirty() {
+        let path = std::env::temp_dir().join(format!("devscribe-core-save-test-{}", std::process::id()));
+        std::fs::write(&path, "original").unwrap();
+
+        let mut doc = Document::open(&path).unwrap();
+        doc.insert(0, "edited ");
+        assert!(doc.is_dirty());
+
+        doc.save().unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited original");
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -1,35 +1,109 @@
 use devscribe_core::theme::Palette;
 use iced::alignment::Vertical;
 use iced::font::Weight;
-use iced::widget::{button, column, container, row, text};
-use iced::{Alignment, Element, Length, Padding};
+use iced::widget::{button, canvas, container, row, text};
+use iced::{Alignment, Color, Element, Length, Padding};
 
 use crate::color::color;
+use crate::density::Density;
 use crate::fonts;
-use crate::state::{Message, State, Tab};
+use crate::state::{EditorState, Message, OpenTab, State, TabKey};
+use crate::ui::search_icon::SearchIcon;
 use crate::widgets;
 
-fn tab_button(
-    active: bool,
-    p: Palette,
-    tab: Tab,
-    content: Element<'static, Message>,
-) -> Element<'static, Message> {
-    let inner = button(widgets::center_v(content))
-        .height(Length::Fixed(37.0))
+fn underline_color(active: bool, p: Palette) -> Color {
+    color(if active { p.accent } else { p.line_neutral })
+}
+
+/// Wraps `content` with a 1px active/inactive indicator along its bottom
+/// edge, sized to `content`'s own natural width rather than stretching to
+/// fill the tab bar.
+///
+/// Deliberately *not* a `Length::Fill`-width strip stacked below `content`
+/// in a `column!` — a `Fill` child inside a `Shrink` column still expands to
+/// whatever (generous) max-width limit the ancestor `Row` hands it, so with
+/// this tab as the last/only item in the bar, that stacked-underline version
+/// stretched all the way to the far edge instead of tracking the tab. This
+/// version paints the indicator as the *container's own background*, showing
+/// through only the 1px of bottom padding `content` doesn't cover — so the
+/// container's width is simply `content`'s width, no `Fill` involved.
+fn with_underline(content: Element<'static, Message>, active: bool, p: Palette) -> Element<'static, Message> {
+    container(content)
         .padding(Padding {
             top: 0.0,
-            right: 16.0,
-            bottom: 0.0,
-            left: 16.0,
+            right: 0.0,
+            bottom: 1.0,
+            left: 0.0,
         })
-        .on_press(Message::SelectTab(tab))
+        .style(move |_theme| container::Style {
+            background: Some(underline_color(active, p).into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The fixed, always-visible project-search icon — not a closeable tab (see
+/// `OpenTab`'s doc), just a pinned entry point into the search view.
+fn search_icon_tab(active: bool, p: Palette, density: Density) -> Element<'static, Message> {
+    let tab_h = density.tab_bar_h() - 1.0;
+    let icon_color = if active { color(p.text_primary) } else { color(p.text_muted) };
+    let icon = canvas(SearchIcon { color: icon_color })
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0));
+
+    let select = button(widgets::center_fill(icon))
+        .width(Length::Fixed(36.0))
+        .height(Length::Fixed(tab_h))
+        .padding(0.0)
+        .on_press(Message::FocusSearchTab)
         .style(move |_theme, status| {
             let hovered = status == button::Status::Hovered;
             button::Style {
                 background: if active {
                     Some(color(p.bg_void).into())
                 } else if hovered {
+                    Some(color(p.surface_hover).into())
+                } else {
+                    None
+                },
+                ..button::Style::default()
+            }
+        });
+
+    with_underline(select.into(), active, p)
+}
+
+/// The select-button + close-button + active-underline shell shared by every
+/// tab kind. `content` is whatever that tab kind wants to show as its label.
+///
+/// The active background is painted once, by the outer `container` wrapping
+/// both buttons — not by each button individually. Two adjacent buttons each
+/// only fill their own (content-sized) bounds, so painting the "active" fill
+/// on both left a visible gap between the label and the close button instead
+/// of one continuous highlighted tab. Buttons can't nest in iced, so this
+/// container is the only shared surface both can sit on.
+fn tab_shell(
+    key: TabKey,
+    active: bool,
+    p: Palette,
+    density: Density,
+    content: Element<'static, Message>,
+) -> Element<'static, Message> {
+    let tab_h = density.tab_bar_h() - 1.0;
+
+    let select = button(widgets::center_v(content))
+        .height(Length::Fixed(tab_h))
+        .padding(Padding {
+            top: 0.0,
+            right: 8.0,
+            bottom: 0.0,
+            left: 16.0,
+        })
+        .on_press(Message::SelectOpenTab(key.clone()))
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if !active && hovered {
                     Some(color(p.surface_hover).into())
                 } else {
                     None
@@ -43,98 +117,97 @@ fn tab_button(
             }
         });
 
-    let underline = container(
-        iced::widget::Space::new()
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0)),
-    )
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_theme| container::Style {
-            background: Some(
-                if active {
-                    color(p.accent)
+    let close = button(text("\u{2715}").size(crate::text_scale::px(10.0)))
+        .padding(0.0)
+        .width(Length::Fixed(20.0))
+        .height(Length::Fixed(tab_h))
+        .on_press(Message::CloseTab(key))
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if hovered {
+                    Some(color(p.surface_hover).into())
                 } else {
-                    color(p.line_neutral)
-                }
-                .into(),
-            ),
+                    None
+                },
+                text_color: if hovered {
+                    color(p.text_primary)
+                } else {
+                    color(p.text_muted)
+                },
+                ..button::Style::default()
+            }
+        });
+
+    let inner = container(row![select, close].align_y(Alignment::Center))
+        .height(Length::Fixed(tab_h))
+        .style(move |_theme| container::Style {
+            background: active.then(|| color(p.bg_void).into()),
             ..container::Style::default()
         });
 
-    column![inner, underline].into()
+    with_underline(inner.into(), active, p)
+}
+
+fn file_tab_label(editor: &EditorState, p: Palette) -> Element<'static, Message> {
+    let lang = crate::fs_tree::Lang::from_path(&editor.path);
+    let (fg, bg) = lang.badge(p);
+    let name = editor
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut contents = row![
+        widgets::lang_badge(lang.code(&editor.path), fg, bg),
+        text(name)
+            .font(fonts::sans(Weight::Medium))
+            .size(crate::text_scale::px(12.0)),
+    ]
+    .spacing(7.0)
+    .align_y(Alignment::Center);
+    if editor.document.is_dirty() {
+        contents = contents.push(widgets::dot(color(p.status_warn), 5.0));
+    }
+    contents.into()
+}
+
+fn diff_tab_label(path: &std::path::Path, p: Palette) -> Element<'static, Message> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    row![text(format!("{name} \u{2194} HEAD"))
+        .font(fonts::sans(Weight::Medium))
+        .size(crate::text_scale::px(12.0))
+        .color(color(p.text_primary))]
+    .into()
 }
 
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
-    let code = tab_button(
-        state.active_tab == Tab::Code,
-        p,
-        Tab::Code,
-        row![
-            widgets::lang_badge("RS", color(p.status_warn), {
-                let mut c = p.status_warn;
-                c.a = 0.16;
-                color(c)
-            }),
-            text("engine.rs")
-                .font(fonts::sans(Weight::Medium))
-                .size(12.0),
-            widgets::dot(color(p.status_warn), 5.0),
-        ]
-        .spacing(7.0)
-        .align_y(Alignment::Center)
-        .into(),
-    );
+    let bar_h = state.density.tab_bar_h();
 
-    let json = tab_button(
-        state.active_tab == Tab::Json,
-        p,
-        Tab::Json,
-        row![
-            widgets::lang_badge("JS", color(p.status_ok), {
-                let mut c = p.status_ok;
-                c.a = 0.16;
-                color(c)
-            }),
-            text("toolchains.json")
-                .font(fonts::sans(Weight::Medium))
-                .size(12.0),
-        ]
-        .spacing(7.0)
-        .align_y(Alignment::Center)
-        .into(),
-    );
+    let search_active = state.active_tab.as_ref() == Some(&TabKey::Search);
+    let mut tab_elements: Vec<Element<'static, Message>> =
+        vec![search_icon_tab(search_active, p, state.density)];
+    tab_elements.extend(state.open_tabs.iter().map(|tab| {
+        let key = tab.key();
+        let active = state.active_tab.as_ref() == Some(&key);
+        let label = match tab {
+            OpenTab::File(editor) => file_tab_label(editor, p),
+            OpenTab::Diff(path) => diff_tab_label(path, p),
+        };
+        tab_shell(key, active, p, state.density, label)
+    }));
 
-    let search = tab_button(
-        state.active_tab == Tab::Search,
-        p,
-        Tab::Search,
-        row![text("\u{201c}settle_batch\u{201d}")
-            .font(fonts::sans(Weight::Medium))
-            .size(12.0)
-            .color(color(p.text_primary))]
-        .into(),
-    );
-
-    let diff = tab_button(
-        state.active_tab == Tab::Diff,
-        p,
-        Tab::Diff,
-        row![text("engine.rs \u{2194} HEAD")
-            .font(fonts::sans(Weight::Medium))
-            .size(12.0)
-            .color(color(p.text_primary))]
-        .into(),
-    );
-
-    let tabs = row![code, json, search, diff]
+    let tabs = row(tab_elements)
         .width(Length::Fill)
-        .height(Length::Fixed(38.0));
+        .height(Length::Fixed(bar_h));
 
     let overflow_open = state.overflow_open;
-    let overflow = button(widgets::center_fill(text("\u{22ef}").size(15.0)))
-        .width(Length::Fixed(38.0))
-        .height(Length::Fixed(38.0))
+    let overflow = button(widgets::center_fill(text("\u{22ef}").size(crate::text_scale::px(15.0))))
+        .width(Length::Fixed(bar_h))
+        .height(Length::Fixed(bar_h))
         .padding(0.0)
         .on_press(Message::ToggleOverflow)
         .style(move |_theme, status| {
@@ -153,7 +226,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
 
     container(bar)
         .width(Length::Fill)
-        .height(Length::Fixed(38.0))
+        .height(Length::Fixed(bar_h))
         .align_y(Vertical::Center)
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_panel).into()),

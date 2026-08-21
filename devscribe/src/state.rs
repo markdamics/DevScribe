@@ -1,17 +1,48 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use devscribe_core::diff::DiffLine;
+use devscribe_core::git::{ChangeKind, Repo};
+use devscribe_core::lsp::{self, LspCommand, LspEvent};
+use devscribe_core::search::{self, SearchHit};
 use devscribe_core::syntax::{self, Span};
 use devscribe_core::theme::ThemeName;
 use devscribe_core::Document;
+use iced::futures::channel::mpsc;
+use iced::keyboard;
 
+use crate::density::Density;
 use crate::fs_tree::{self, Node};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Code,
-    Json,
+/// Identifies one open tab. Doubles as the dedup/focus key: opening a file
+/// or diff that's already open focuses the matching tab instead of opening
+/// a duplicate — see `open_or_focus_file`/`open_or_focus_diff`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TabKey {
+    File(PathBuf),
+    /// A read-only diff view of a specific file against `HEAD` — always
+    /// backed by a `File` tab for the same path (see `open_or_focus_diff`),
+    /// which is where the actual `DiffStatus` lives.
+    Diff(PathBuf),
     Search,
-    Diff,
+}
+
+/// One entry in `State::open_tabs`. Search isn't one of these — it's a
+/// fixed, always-visible icon in the tab bar rather than something that
+/// gets opened/closed; see `TabKey::Search` and `tab_bar.rs`.
+pub enum OpenTab {
+    File(Box<EditorState>),
+    Diff(PathBuf),
+}
+
+impl OpenTab {
+    pub fn key(&self) -> TabKey {
+        match self {
+            OpenTab::File(editor) => TabKey::File(editor.path.clone()),
+            OpenTab::Diff(path) => TabKey::Diff(path.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,6 +67,130 @@ pub enum Direction {
     LineEnd,
 }
 
+/// A diagnostic from the language server, converted into char-based
+/// positions (`lsp_types` uses UTF-16 code units) so the editor canvas can
+/// place it without re-doing that conversion every frame.
+#[derive(Debug, Clone)]
+pub struct EditorDiagnostic {
+    pub start: CursorPos,
+    pub end: CursorPos,
+    pub severity: lsp::DiagnosticSeverity,
+    pub message: String,
+}
+
+/// Status of the language server for the currently supported language
+/// (Rust, via `rust-analyzer`). Surfaced in the status bar.
+#[derive(Debug, Clone, Default)]
+pub enum LspStatus {
+    #[default]
+    Starting,
+    Ready,
+    Unavailable(String),
+}
+
+/// One project-wide search hit, with the file it was found in.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub path: PathBuf,
+    pub hit: SearchHit,
+    /// `hit.preview`, broken into syntax-colored runs — same highlighter
+    /// the editor canvas uses, run once per file rather than per match.
+    /// Empty when the file's language isn't recognized; the UI falls back
+    /// to rendering `hit.preview` in one flat color.
+    pub segments: Vec<(String, syntax::HighlightKind)>,
+    /// `state.search_query`'s length in chars *at the time this result was
+    /// computed* — snapshotted so a later, still-unsubmitted query edit
+    /// can't desync it from `hit.col`.
+    pub query_len_chars: usize,
+}
+
+/// One row in the sidebar's "CHANGES" panel: a working-tree change plus the
+/// insertion/deletion counts the mockup shows per file. Recomputed by
+/// `refresh_changed_files` — see its doc for when.
+#[derive(Debug, Clone)]
+pub struct ChangesEntry {
+    pub path: PathBuf,
+    pub kind: ChangeKind,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub id: u64,
+    pub kind: ToastKind,
+    pub message: String,
+    created_at: Instant,
+}
+
+const TOAST_LIFETIME: Duration = Duration::from_secs(4);
+
+/// A runnable entry in the command palette: file to open, theme to switch
+/// to, action to run.
+#[derive(Debug, Clone)]
+pub enum PaletteAction {
+    OpenFile(PathBuf),
+    SetTheme(ThemeName),
+    FocusSearchTab,
+    /// Opens (or focuses) a diff tab for the currently active file tab.
+    ViewDiffOfActiveFile,
+    CloseActiveTab,
+    ToggleAssist,
+    ToggleProjects,
+    ToggleProblemLens,
+    IncreaseEditorFontSize,
+    DecreaseEditorFontSize,
+    IncreaseUiFontScale,
+    DecreaseUiFontScale,
+    OpenSettings,
+    SaveFile,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaletteEntry {
+    pub label: String,
+    pub action: PaletteAction,
+}
+
+/// The diff panel's state for the current file, distinguishing the reasons
+/// a diff can be empty (worth showing differently) from an actual diff.
+#[derive(Debug, Clone, Default)]
+pub enum DiffStatus {
+    #[default]
+    NoRepo,
+    /// Tracked, but has no `HEAD` version yet (a new/untracked file).
+    Untracked,
+    UpToDate,
+    Changed(Vec<DiffLine>),
+}
+
+/// One match of an in-file "find" query, as an absolute char range — the
+/// same coordinate space `EditorState::selection()` and `editor_canvas.rs`
+/// already use, so it can be highlighted the same way selection is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindMatch {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The current file's in-buffer "find" widget (Ctrl+F) — independent per
+/// tab, so switching tabs doesn't lose or bleed one file's find state into
+/// another's. Distinct from the project-wide search tab (Ctrl+Shift+F),
+/// which searches every file rather than the current buffer.
+#[derive(Debug, Clone, Default)]
+pub struct FindState {
+    pub query: String,
+    pub matches: Vec<FindMatch>,
+    pub current: usize,
+}
+
 /// An open file: its buffer plus interaction state (cursor, selection). Real
 /// keyboard/mouse editing lives here; `editor_canvas.rs` only ever reads it
 /// and turns raw input events into the `Message`s that call these methods.
@@ -47,6 +202,16 @@ pub struct EditorState {
     pub language: Option<syntax::Language>,
     pub highlights: Vec<Span>,
     highlighter: syntax::Highlighter,
+    pub diagnostics: Vec<EditorDiagnostic>,
+    /// `Some(Ok(_))`/`Some(Err(parse_message))` for `.json` files, `None`
+    /// otherwise. Recomputed on every edit, like `highlights`.
+    pub json: Option<Result<serde_json::Value, String>>,
+    /// Collapsed node paths in the JSON tree view (e.g. `"root.foo[2]"`).
+    pub json_collapsed: HashSet<String>,
+    /// This file's content at `HEAD` diffed against the live buffer.
+    pub diff: DiffStatus,
+    /// `Some` while this tab's find widget (Ctrl+F) is open.
+    pub find: Option<FindState>,
 }
 
 impl EditorState {
@@ -60,7 +225,7 @@ impl EditorState {
             Some(lang) => highlighter.highlight(lang, &document.text().to_string()),
             None => Vec::new(),
         };
-        Self {
+        let mut this = Self {
             document,
             path,
             cursor: CursorPos::default(),
@@ -68,7 +233,14 @@ impl EditorState {
             language,
             highlights,
             highlighter,
-        }
+            diagnostics: Vec::new(),
+            json: None,
+            json_collapsed: HashSet::new(),
+            diff: DiffStatus::default(),
+            find: None,
+        };
+        this.reparse_json();
+        this
     }
 
     /// Recomputes `highlights` from the current buffer contents. Cheap
@@ -80,6 +252,40 @@ impl EditorState {
             self.highlights = self
                 .highlighter
                 .highlight(lang, &self.document.text().to_string());
+        }
+    }
+
+    /// Recomputes `json` from the current buffer contents, for `.json` files.
+    fn reparse_json(&mut self) {
+        self.json = (self.language == Some(syntax::Language::Json)).then(|| {
+            serde_json::from_str::<serde_json::Value>(&self.document.text().to_string())
+                .map_err(|e| e.to_string())
+        });
+    }
+
+    /// Recomputes `find`'s matches from its current query against the
+    /// current buffer contents, for `.find.is_some()` files. Called both
+    /// when the query changes and on every edit, like `rehighlight`.
+    fn refind(&mut self) {
+        let Some(query) = self.find.as_ref().map(|f| f.query.clone()) else {
+            return;
+        };
+        let matches = if query.is_empty() {
+            Vec::new()
+        } else {
+            let text = self.document.text().to_string();
+            let query_len = query.chars().count();
+            search::search_text(&text, &query)
+                .into_iter()
+                .map(|hit| {
+                    let start = self.document.char_index(hit.line, hit.col);
+                    FindMatch { start, end: start + query_len }
+                })
+                .collect()
+        };
+        if let Some(find) = self.find.as_mut() {
+            find.current = find.current.min(matches.len().saturating_sub(1));
+            find.matches = matches;
         }
     }
 
@@ -120,11 +326,15 @@ impl EditorState {
         let new_idx = idx + text.chars().count();
         self.cursor = self.document.line_col(new_idx).into();
         self.rehighlight();
+        self.reparse_json();
+        self.refind();
     }
 
     pub fn backspace(&mut self) {
         if self.delete_selection() {
             self.rehighlight();
+            self.reparse_json();
+            self.refind();
             return;
         }
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
@@ -134,11 +344,15 @@ impl EditorState {
         self.document.remove(idx - 1..idx);
         self.cursor = self.document.line_col(idx - 1).into();
         self.rehighlight();
+        self.reparse_json();
+        self.refind();
     }
 
     pub fn delete_forward(&mut self) {
         if self.delete_selection() {
             self.rehighlight();
+            self.reparse_json();
+            self.refind();
             return;
         }
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
@@ -148,6 +362,8 @@ impl EditorState {
         self.document.remove(idx..idx + 1);
         self.cursor = self.document.line_col(idx).into();
         self.rehighlight();
+        self.reparse_json();
+        self.refind();
     }
 
     pub fn move_cursor(&mut self, dir: Direction, extend: bool) {
@@ -211,7 +427,10 @@ impl EditorState {
 
 pub struct State {
     pub theme: ThemeName,
-    pub active_tab: Tab,
+    /// Every currently open tab, in the order they appear in the tab bar.
+    pub open_tabs: Vec<OpenTab>,
+    /// `None` only when `open_tabs` is empty.
+    pub active_tab: Option<TabKey>,
     pub assist_on: bool,
     pub projects_open: bool,
     pub overflow_open: bool,
@@ -220,35 +439,104 @@ pub struct State {
     /// Walked once at startup (filesystem walks are far too slow to redo on
     /// every `view()` — the caret-blink subscription alone redraws 2x/sec).
     pub tree: Vec<Node>,
-    pub editor: Option<EditorState>,
+    /// Directories collapsed in the sidebar tree, keyed by absolute path.
+    pub collapsed_dirs: HashSet<PathBuf>,
     pub caret_visible: bool,
+    pub lsp_status: LspStatus,
+    lsp_sender: Option<mpsc::Sender<LspCommand>>,
+    /// `None` when `root` isn't a git repository — an expected, common case.
+    pub repo: Option<Repo>,
+    /// The sidebar's "CHANGES" panel contents — every file that differs from
+    /// `HEAD`, across the whole project (not just open tabs). Empty when
+    /// `repo` is `None`. See `refresh_changed_files` for when this updates.
+    pub changed_files: Vec<ChangesEntry>,
+    pub changes_panel_open: bool,
+    pub search_query: String,
+    pub search_results: Vec<SearchResult>,
+    pub search_elapsed: Duration,
+    pub palette_open: bool,
+    pub palette_query: String,
+    pub palette_selected: usize,
+    pub settings_open: bool,
+    pub density: Density,
+    pub problem_lens_enabled: bool,
+    pub editor_font_size: f32,
+    /// Multiplies every chrome text size (sidebar, tabs, status bar, title
+    /// bar, palette, settings, toasts). Independent of `editor_font_size` —
+    /// see `text_scale`.
+    pub ui_font_scale: f32,
+    pub toasts: Vec<Toast>,
+    next_toast_id: u64,
 }
+
+pub const EDITOR_FONT_SIZE_MIN: f32 = 10.0;
+pub const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
+pub const EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const EDITOR_FONT_SIZE_STEP: f32 = 1.0;
+
+pub const UI_FONT_SCALE_MIN: f32 = 0.8;
+pub const UI_FONT_SCALE_MAX: f32 = 1.5;
+pub const UI_FONT_SCALE_DEFAULT: f32 = 1.0;
+pub const UI_FONT_SCALE_STEP: f32 = 0.1;
 
 impl Default for State {
     fn default() -> Self {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let tree = fs_tree::walk(&root);
+        // Directories start collapsed — an uncollapsed default would dump
+        // the whole project tree open on first launch.
+        let collapsed_dirs: HashSet<PathBuf> =
+            fs_tree::flatten_dirs(&tree).into_iter().map(Path::to_path_buf).collect();
+        let repo = Repo::open(&root);
+        let changed_files = compute_changed_files(repo.as_ref());
         Self {
             theme: ThemeName::NullGrid,
-            active_tab: Tab::Code,
+            open_tabs: Vec::new(),
+            active_tab: None,
             assist_on: true,
             projects_open: false,
             overflow_open: false,
             root,
             tree,
-            editor: None,
+            collapsed_dirs,
             caret_visible: true,
+            lsp_status: LspStatus::default(),
+            lsp_sender: None,
+            repo,
+            changed_files,
+            changes_panel_open: true,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_elapsed: Duration::ZERO,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            settings_open: false,
+            density: Density::default(),
+            problem_lens_enabled: true,
+            editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
+            ui_font_scale: UI_FONT_SCALE_DEFAULT,
+            toasts: Vec::new(),
+            next_toast_id: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Message {
     SetTheme(ThemeName),
-    SelectTab(Tab),
+    SelectOpenTab(TabKey),
+    CloseTab(TabKey),
+    CloseActiveTab,
+    FocusSearchTab,
     ToggleAssist,
     ToggleProjects,
     ToggleOverflow,
+    ToggleChangesPanel,
+    /// Opens (or focuses) a diff tab for `path`, from a sidebar Changes row.
+    /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
+    /// targets the currently active tab.
+    OpenDiffFor(PathBuf),
     SelectFile(PathBuf),
     EditorInsertText(String),
     EditorBackspace,
@@ -256,50 +544,1010 @@ pub enum Message {
     EditorMove { dir: Direction, extend: bool },
     EditorClick { line: usize, col: usize, extend: bool },
     CaretTick,
+    Lsp(LspEvent),
+    JsonToggle(String),
+    ToggleDirCollapsed(PathBuf),
+    SearchQueryChanged(String),
+    SearchSubmit,
+    SearchResultSelected { path: PathBuf, line: usize, col: usize },
+    TogglePalette,
+    ClosePalette,
+    PaletteQueryChanged(String),
+    PaletteMove(i32),
+    PaletteExecute,
+    PaletteRun(PaletteAction),
+    ToggleSettings,
+    CloseSettings,
+    SetDensity(Density),
+    ToggleProblemLens,
+    SetEditorFontSize(f32),
+    SetUiFontScale(f32),
+    DismissToast(u64),
+    PruneToasts,
+    EditorSave,
+    ToggleFind,
+    CloseFind,
+    FindQueryChanged(String),
+    FindNext,
+    FindPrev,
+    EscapePressed,
+    Noop,
 }
 
-pub fn update(state: &mut State, message: Message) {
+pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
     match message {
         Message::SetTheme(theme) => state.theme = theme,
-        Message::SelectTab(tab) => state.active_tab = tab,
+        Message::SelectOpenTab(key) => {
+            if state.open_tabs.iter().any(|t| t.key() == key) {
+                state.active_tab = Some(key);
+            }
+        }
+        Message::CloseTab(key) => close_tab(state, &key),
+        Message::CloseActiveTab => {
+            if let Some(key) = state.active_tab.clone() {
+                close_tab(state, &key);
+            }
+        }
+        Message::FocusSearchTab => focus_search(state),
         Message::ToggleAssist => state.assist_on = !state.assist_on,
         Message::ToggleProjects => state.projects_open = !state.projects_open,
         Message::ToggleOverflow => state.overflow_open = !state.overflow_open,
-        Message::SelectFile(path) => {
-            if let Ok(document) = Document::open(&path) {
-                state.editor = Some(EditorState::new(document, path));
-                state.active_tab = Tab::Code;
-            }
-        }
+        Message::ToggleChangesPanel => state.changes_panel_open = !state.changes_panel_open,
+        Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
+        Message::SelectFile(path) => open_or_focus_file(state, path),
         Message::EditorInsertText(text) => {
-            if let Some(editor) = state.editor.as_mut() {
-                editor.insert_text(&text);
+            if let Some(path) = active_file_path(state) {
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.insert_text(&text);
+                }
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
             }
         }
         Message::EditorBackspace => {
-            if let Some(editor) = state.editor.as_mut() {
-                editor.backspace();
+            if let Some(path) = active_file_path(state) {
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.backspace();
+                }
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
             }
         }
         Message::EditorDelete => {
-            if let Some(editor) = state.editor.as_mut() {
-                editor.delete_forward();
+            if let Some(path) = active_file_path(state) {
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.delete_forward();
+                }
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
             }
         }
         Message::EditorMove { dir, extend } => {
-            if let Some(editor) = state.editor.as_mut() {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
                 editor.move_cursor(dir, extend);
             }
         }
         Message::EditorClick { line, col, extend } => {
-            if let Some(editor) = state.editor.as_mut() {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
                 editor.click(line, col, extend);
             }
         }
         Message::CaretTick => state.caret_visible = !state.caret_visible,
+        Message::Lsp(event) => match event {
+            LspEvent::Ready(sender) => {
+                let was_starting = matches!(state.lsp_status, LspStatus::Starting);
+                state.lsp_status = LspStatus::Ready;
+                state.lsp_sender = Some(sender);
+                for path in open_file_paths(state) {
+                    send_did_open_for(state, &path);
+                }
+                if was_starting {
+                    push_toast(state, ToastKind::Success, "rust-analyzer ready");
+                }
+            }
+            LspEvent::Diagnostics { uri, diagnostics } => {
+                if let Some(path) = uri.to_file_path().ok()
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.diagnostics = convert_diagnostics(&editor.document, diagnostics);
+                }
+            }
+            LspEvent::Unavailable(reason) => {
+                state.lsp_status = LspStatus::Unavailable(reason.clone());
+                state.lsp_sender = None;
+                push_toast(state, ToastKind::Warning, format!("rust-analyzer unavailable: {reason}"));
+            }
+        },
+        Message::ToggleDirCollapsed(path) => {
+            if !state.collapsed_dirs.remove(&path) {
+                state.collapsed_dirs.insert(path);
+            }
+        }
+        Message::JsonToggle(key) => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && !editor.json_collapsed.remove(&key)
+            {
+                editor.json_collapsed.insert(key);
+            }
+        }
+        Message::SearchQueryChanged(query) => {
+            state.search_query = query;
+            recompute_search(state);
+        }
+        Message::SearchSubmit => focus_search(state),
+        Message::SearchResultSelected { path, line, col } => {
+            open_or_focus_file(state, path.clone());
+            if let Some(editor) = find_editor_mut(state, &path) {
+                editor.cursor = CursorPos { line, col };
+            }
+        }
+        Message::TogglePalette => {
+            state.palette_open = !state.palette_open;
+            if state.palette_open {
+                state.palette_query.clear();
+                state.palette_selected = 0;
+                state.settings_open = false;
+                return iced::widget::operation::focus(palette_query_id());
+            }
+        }
+        Message::ClosePalette => state.palette_open = false,
+        Message::PaletteQueryChanged(query) => {
+            state.palette_query = query;
+            state.palette_selected = 0;
+        }
+        Message::PaletteMove(delta) => {
+            let len = filtered_palette_entries(state).len();
+            state.palette_selected = if len == 0 {
+                0
+            } else {
+                ((state.palette_selected as i32 + delta).rem_euclid(len as i32)) as usize
+            };
+        }
+        Message::PaletteExecute => {
+            if let Some(entry) = filtered_palette_entries(state).get(state.palette_selected) {
+                run_palette_action(state, entry.action.clone());
+            }
+            state.palette_open = false;
+        }
+        Message::PaletteRun(action) => {
+            run_palette_action(state, action);
+            state.palette_open = false;
+        }
+        Message::ToggleSettings => {
+            state.settings_open = !state.settings_open;
+            if state.settings_open {
+                state.palette_open = false;
+            }
+        }
+        Message::CloseSettings => state.settings_open = false,
+        Message::SetDensity(density) => state.density = density,
+        Message::ToggleProblemLens => state.problem_lens_enabled = !state.problem_lens_enabled,
+        Message::SetEditorFontSize(size) => {
+            state.editor_font_size = size.clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
+        }
+        Message::SetUiFontScale(scale) => {
+            state.ui_font_scale = scale.clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+        }
+        Message::DismissToast(id) => state.toasts.retain(|t| t.id != id),
+        Message::PruneToasts => state.toasts.retain(|t| t.created_at.elapsed() < TOAST_LIFETIME),
+        Message::EditorSave => save_current_file(state),
+        Message::ToggleFind => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                if editor.find.is_some() {
+                    editor.find = None;
+                } else {
+                    let initial_query = editor
+                        .selection()
+                        .map(|(start, end)| editor.document.text().slice(start..end).to_string())
+                        .unwrap_or_default();
+                    editor.find = Some(FindState {
+                        query: initial_query,
+                        ..FindState::default()
+                    });
+                    editor.refind();
+                    return iced::widget::operation::focus(find_query_id());
+                }
+            }
+        }
+        Message::CloseFind => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.find = None;
+            }
+        }
+        Message::FindQueryChanged(query) => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                if let Some(find) = editor.find.as_mut() {
+                    find.query = query;
+                    find.current = 0;
+                }
+                editor.refind();
+            }
+        }
+        Message::FindNext => find_step(state, 1),
+        Message::FindPrev => find_step(state, -1),
+        Message::EscapePressed => {
+            let find_open = active_file_path(state)
+                .and_then(|path| find_editor(state, &path))
+                .is_some_and(|editor| editor.find.is_some());
+            if find_open {
+                if let Some(path) = active_file_path(state)
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.find = None;
+                }
+            } else if state.palette_open {
+                state.palette_open = false;
+            } else if state.settings_open {
+                state.settings_open = false;
+            }
+        }
+        Message::Noop => {}
+    }
+    iced::Task::none()
+}
+
+fn run_palette_action(state: &mut State, action: PaletteAction) {
+    match action {
+        PaletteAction::OpenFile(path) => open_or_focus_file(state, path),
+        PaletteAction::SetTheme(theme) => state.theme = theme,
+        PaletteAction::FocusSearchTab => focus_search(state),
+        PaletteAction::ViewDiffOfActiveFile => {
+            if let Some(path) = active_file_path(state) {
+                open_or_focus_diff(state, path);
+            }
+        }
+        PaletteAction::CloseActiveTab => {
+            if let Some(key) = state.active_tab.clone() {
+                close_tab(state, &key);
+            }
+        }
+        PaletteAction::ToggleAssist => state.assist_on = !state.assist_on,
+        PaletteAction::ToggleProjects => state.projects_open = !state.projects_open,
+        PaletteAction::ToggleProblemLens => state.problem_lens_enabled = !state.problem_lens_enabled,
+        PaletteAction::IncreaseEditorFontSize => {
+            state.editor_font_size =
+                (state.editor_font_size + EDITOR_FONT_SIZE_STEP).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
+        }
+        PaletteAction::DecreaseEditorFontSize => {
+            state.editor_font_size =
+                (state.editor_font_size - EDITOR_FONT_SIZE_STEP).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
+        }
+        PaletteAction::IncreaseUiFontScale => {
+            state.ui_font_scale =
+                (state.ui_font_scale + UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+        }
+        PaletteAction::DecreaseUiFontScale => {
+            state.ui_font_scale =
+                (state.ui_font_scale - UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+        }
+        PaletteAction::OpenSettings => state.settings_open = true,
+        PaletteAction::SaveFile => save_current_file(state),
     }
 }
 
+fn save_current_file(state: &mut State) {
+    let Some(path) = active_file_path(state) else {
+        return;
+    };
+    let Some(editor) = find_editor_mut(state, &path) else {
+        return;
+    };
+    let name = editor
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match editor.document.save() {
+        Ok(()) => {
+            push_toast(state, ToastKind::Success, format!("Saved {name}"));
+            refresh_changed_files(state);
+        }
+        Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't save {name}: {err}")),
+    }
+}
+
+fn push_toast(state: &mut State, kind: ToastKind, message: impl Into<String>) {
+    let id = state.next_toast_id;
+    state.next_toast_id += 1;
+    state.toasts.push(Toast {
+        id,
+        kind,
+        message: message.into(),
+        created_at: Instant::now(),
+    });
+}
+
+/// A stable id for the command palette's search box, so `update()` can focus
+/// it (via `iced::widget::operation::focus`) the moment the palette opens.
+pub fn palette_query_id() -> iced::widget::Id {
+    iced::widget::Id::new("command-palette-query")
+}
+
+/// A stable id for the in-file find widget's search box, so `update()` can
+/// focus it the moment Ctrl+F opens it.
+pub fn find_query_id() -> iced::widget::Id {
+    iced::widget::Id::new("find-query")
+}
+
+/// Moves the active file tab's find selection by `delta` (wrapping) and
+/// moves the cursor to the newly-current match.
+fn find_step(state: &mut State, delta: i32) {
+    let Some(path) = active_file_path(state) else {
+        return;
+    };
+    let Some(editor) = find_editor_mut(state, &path) else {
+        return;
+    };
+    let Some(find) = editor.find.as_mut() else {
+        return;
+    };
+    if find.matches.is_empty() {
+        return;
+    }
+    let len = find.matches.len() as i32;
+    find.current = (find.current as i32 + delta).rem_euclid(len) as usize;
+    let target = find.matches[find.current];
+    editor.cursor = editor.document.line_col(target.start).into();
+    editor.selection_anchor = None;
+}
+
+const MAX_PALETTE_RESULTS: usize = 50;
+
+fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
+    let mut entries = Vec::new();
+
+    for path in fs_tree::flatten_files(&state.tree) {
+        let label = path
+            .strip_prefix(&state.root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        entries.push(PaletteEntry {
+            label: format!("Open: {label}"),
+            action: PaletteAction::OpenFile(path.to_path_buf()),
+        });
+    }
+
+    for theme in ThemeName::ALL {
+        entries.push(PaletteEntry {
+            label: format!("Theme: {}", theme.label()),
+            action: PaletteAction::SetTheme(theme),
+        });
+    }
+
+    entries.push(PaletteEntry {
+        label: "Go to: Search".to_string(),
+        action: PaletteAction::FocusSearchTab,
+    });
+    if let Some(path) = active_file_path(state) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        entries.push(PaletteEntry {
+            label: format!("View Diff: {name} \u{2194} HEAD"),
+            action: PaletteAction::ViewDiffOfActiveFile,
+        });
+    }
+    if state.active_tab.is_some() {
+        entries.push(PaletteEntry {
+            label: "Close active tab".to_string(),
+            action: PaletteAction::CloseActiveTab,
+        });
+    }
+
+    entries.push(PaletteEntry {
+        label: "Toggle Assist panel".to_string(),
+        action: PaletteAction::ToggleAssist,
+    });
+    entries.push(PaletteEntry {
+        label: "Toggle Projects panel".to_string(),
+        action: PaletteAction::ToggleProjects,
+    });
+    entries.push(PaletteEntry {
+        label: format!(
+            "{} inline problem hints",
+            if state.problem_lens_enabled { "Hide" } else { "Show" }
+        ),
+        action: PaletteAction::ToggleProblemLens,
+    });
+    entries.push(PaletteEntry {
+        label: "Increase editor font size".to_string(),
+        action: PaletteAction::IncreaseEditorFontSize,
+    });
+    entries.push(PaletteEntry {
+        label: "Decrease editor font size".to_string(),
+        action: PaletteAction::DecreaseEditorFontSize,
+    });
+    entries.push(PaletteEntry {
+        label: "Increase UI font size".to_string(),
+        action: PaletteAction::IncreaseUiFontScale,
+    });
+    entries.push(PaletteEntry {
+        label: "Decrease UI font size".to_string(),
+        action: PaletteAction::DecreaseUiFontScale,
+    });
+    entries.push(PaletteEntry {
+        label: "Open Settings".to_string(),
+        action: PaletteAction::OpenSettings,
+    });
+    if active_file_path(state).is_some() {
+        entries.push(PaletteEntry {
+            label: "Save File".to_string(),
+            action: PaletteAction::SaveFile,
+        });
+    }
+
+    entries
+}
+
+/// The palette entries matching `state.palette_query`, in the same order
+/// both the view and `PaletteExecute`/`PaletteMove` use — keeping them in
+/// sync is what makes "press Enter" run the entry actually shown selected.
+pub fn filtered_palette_entries(state: &State) -> Vec<PaletteEntry> {
+    let query = state.palette_query.to_ascii_lowercase();
+    all_palette_entries(state)
+        .into_iter()
+        .filter(|entry| query.is_empty() || entry.label.to_ascii_lowercase().contains(&query))
+        .take(MAX_PALETTE_RESULTS)
+        .collect()
+}
+
+/// The path of the active tab, if it's a `File` tab (not `Diff` or `Search`).
+pub fn active_file_path(state: &State) -> Option<PathBuf> {
+    match state.active_tab.as_ref()? {
+        TabKey::File(path) => Some(path.clone()),
+        _ => None,
+    }
+}
+
+pub fn find_editor<'a>(state: &'a State, path: &Path) -> Option<&'a EditorState> {
+    state.open_tabs.iter().find_map(|t| match t {
+        OpenTab::File(editor) if editor.path == path => Some(editor.as_ref()),
+        _ => None,
+    })
+}
+
+fn find_editor_mut<'a>(state: &'a mut State, path: &Path) -> Option<&'a mut EditorState> {
+    state.open_tabs.iter_mut().find_map(|t| match t {
+        OpenTab::File(editor) if editor.path == path => Some(editor.as_mut()),
+        _ => None,
+    })
+}
+
+/// The active tab's `EditorState`, if the active tab is a `File`.
+pub fn active_editor(state: &State) -> Option<&EditorState> {
+    find_editor(state, &active_file_path(state)?)
+}
+
+/// Every currently open `File` tab's path — used to replay `didOpen` for all
+/// of them once the LSP server becomes ready (it may become ready after
+/// files were already opened).
+fn open_file_paths(state: &State) -> Vec<PathBuf> {
+    state
+        .open_tabs
+        .iter()
+        .filter_map(|t| match t {
+            OpenTab::File(editor) => Some(editor.path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Opens `path` as a `File` tab, or focuses it if already open. Shared by
+/// `SelectFile`, `SearchResultSelected`, and the palette's file-open entries
+/// — this is what makes opening a second file additive instead of a replace.
+fn open_or_focus_file(state: &mut State, path: PathBuf) {
+    let key = TabKey::File(path.clone());
+    if state.open_tabs.iter().any(|t| t.key() == key) {
+        state.active_tab = Some(key);
+        return;
+    }
+    if let Ok(document) = Document::open(&path) {
+        state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(document, path.clone()))));
+        state.active_tab = Some(key);
+        send_did_open_for(state, &path);
+        recompute_diff_for(state, &path);
+    }
+}
+
+/// Opens a diff tab for `path`, or focuses it if already open. Always
+/// ensures a backing `File` tab exists first (opening one if needed) since
+/// that's where the actual `DiffStatus` is computed and cached.
+fn open_or_focus_diff(state: &mut State, path: PathBuf) {
+    open_or_focus_file(state, path.clone());
+    if find_editor(state, &path).is_none() {
+        // The file failed to open (e.g. deleted on disk) — nothing to diff.
+        return;
+    }
+    let key = TabKey::Diff(path.clone());
+    if !state.open_tabs.iter().any(|t| t.key() == key) {
+        state.open_tabs.push(OpenTab::Diff(path));
+    }
+    state.active_tab = Some(key);
+}
+
+/// Opens the (singleton) search tab, or focuses it if already open.
+fn focus_search(state: &mut State) {
+    state.active_tab = Some(TabKey::Search);
+}
+
+/// Closes the tab matching `key`. Closing a `File` tab also closes its diff
+/// tab, if any (a `Diff` tab has no content without its backing `File`
+/// tab), and notifies the LSP server. If the active tab was closed, focuses
+/// the tab that's now in its place, or `None` if that was the last one.
+fn close_tab(state: &mut State, key: &TabKey) {
+    let Some(pos) = state.open_tabs.iter().position(|t| &t.key() == key) else {
+        return;
+    };
+    let removed = state.open_tabs.remove(pos);
+    if let OpenTab::File(editor) = &removed {
+        if let Some(sender) = state.lsp_sender.as_mut() {
+            send_did_close(sender, &editor.path);
+        }
+        let diff_key = TabKey::Diff(editor.path.clone());
+        state.open_tabs.retain(|t| t.key() != diff_key);
+    }
+
+    // The active tab may no longer exist — either it was the one closed, or
+    // (if it was a `Diff` tab) it was closed as a side effect of its
+    // backing `File` tab closing just above.
+    let active_still_open = state
+        .active_tab
+        .as_ref()
+        .is_some_and(|active| state.open_tabs.iter().any(|t| &t.key() == active));
+    if !active_still_open {
+        state.active_tab = state
+            .open_tabs
+            .get(pos.min(state.open_tabs.len().saturating_sub(1)))
+            .map(|t| t.key());
+    }
+}
+
+/// Recomputes `path`'s diff against its `HEAD` version, if it's open.
+fn recompute_diff_for(state: &mut State, path: &Path) {
+    let Some(current_text) = find_editor(state, path).map(|e| e.document.text().to_string())
+    else {
+        return;
+    };
+
+    let status = match state.repo.as_ref().and_then(|repo| repo.head_text(path)) {
+        None if state.repo.is_none() => DiffStatus::NoRepo,
+        None => DiffStatus::Untracked,
+        Some(old) => {
+            let lines = devscribe_core::diff::diff_lines(&old, &current_text);
+            if lines.iter().all(|l| l.kind == devscribe_core::diff::DiffLineKind::Equal) {
+                DiffStatus::UpToDate
+            } else {
+                DiffStatus::Changed(lines)
+            }
+        }
+    };
+
+    if let Some(editor) = find_editor_mut(state, path) {
+        editor.diff = status;
+    }
+}
+
+/// Computes the sidebar's "CHANGES" panel contents: every file `repo`
+/// reports as differing from `HEAD`, with insertion/deletion counts from
+/// `devscribe_core::diff::diff_lines` run against `HEAD`'s blob and the
+/// file's current *on-disk* content — not the live buffer, so this covers
+/// files that aren't even open as a tab, matching `changed_files()` itself
+/// scanning the whole working tree rather than just open files.
+fn compute_changed_files(repo: Option<&Repo>) -> Vec<ChangesEntry> {
+    let Some(repo) = repo else {
+        return Vec::new();
+    };
+    repo.changed_files()
+        .into_iter()
+        .map(|file| {
+            let old = repo.head_text(&file.path).unwrap_or_default();
+            let new = std::fs::read_to_string(&file.path).unwrap_or_default();
+            let lines = devscribe_core::diff::diff_lines(&old, &new);
+            let insertions = lines
+                .iter()
+                .filter(|l| l.kind == devscribe_core::diff::DiffLineKind::Insert)
+                .count();
+            let deletions = lines
+                .iter()
+                .filter(|l| l.kind == devscribe_core::diff::DiffLineKind::Delete)
+                .count();
+            ChangesEntry {
+                path: file.path,
+                kind: file.kind,
+                insertions,
+                deletions,
+            }
+        })
+        .collect()
+}
+
+/// Re-scans the working tree for `state.changed_files`. Not run on every
+/// keystroke — a full `gix` status walk plus a per-file diff isn't cheap —
+/// only after actions known to change the working tree, i.e. saving a file.
+/// Edits made outside DevScribe won't be reflected until the next save;
+/// there's no file-watcher wired up yet (same limitation `tree`/`fs_tree`
+/// already has for the file browser).
+fn refresh_changed_files(state: &mut State) {
+    state.changed_files = compute_changed_files(state.repo.as_ref());
+}
+
+/// Naive project-wide search: reads every file the sidebar already walked
+/// and scans it. Capped so a broad query on a large project can't stall the
+/// UI thread indefinitely — see `devscribe_core::search` for the "start
+/// naive, index later if slow" rationale.
+const MAX_SEARCH_RESULTS: usize = 200;
+
+fn recompute_search(state: &mut State) {
+    state.search_results.clear();
+    if state.search_query.is_empty() {
+        state.search_elapsed = Duration::ZERO;
+        return;
+    }
+    let query_len_chars = state.search_query.chars().count();
+    let started = Instant::now();
+
+    'files: for path in fs_tree::flatten_files(&state.tree) {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let hits = search::search_text(&content, &state.search_query);
+        if hits.is_empty() {
+            continue;
+        }
+
+        // Highlight the whole file once per file with results, not once per
+        // match — reuses the same `Highlighter` the editor canvas uses.
+        let language = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(syntax::Language::from_extension);
+        let file_spans = language.map(|lang| {
+            let mut highlighter = syntax::Highlighter::new();
+            highlighter.highlight(lang, &content)
+        });
+        let document = Document::from_str(&content);
+
+        for hit in hits {
+            let segments = file_spans
+                .as_ref()
+                .map(|spans| line_segments(&document, spans, hit.line))
+                .unwrap_or_default();
+            state.search_results.push(SearchResult {
+                path: path.to_path_buf(),
+                hit,
+                segments,
+                query_len_chars,
+            });
+            if state.search_results.len() >= MAX_SEARCH_RESULTS {
+                break 'files;
+            }
+        }
+    }
+
+    state.search_elapsed = started.elapsed();
+}
+
+/// The syntax-colored runs covering `line`'s full text, in order — the same
+/// span-slicing `editor_canvas.rs` does per visible line, reused here for
+/// one search-result preview line instead of a whole open buffer.
+fn line_segments(document: &Document, spans: &[Span], line: usize) -> Vec<(String, syntax::HighlightKind)> {
+    let line_text = document.line_text(line);
+    if line_text.is_empty() {
+        return Vec::new();
+    }
+    let line_start_byte = document.text().line_to_byte(line);
+    let line_end_byte = line_start_byte + line_text.len();
+
+    let mut out = Vec::new();
+    for span in spans {
+        if span.end <= line_start_byte || span.start >= line_end_byte {
+            continue;
+        }
+        let seg_start = span.start.max(line_start_byte) - line_start_byte;
+        let seg_end = (span.end.min(line_end_byte) - line_start_byte).min(line_text.len());
+        if seg_start < seg_end {
+            out.push((line_text[seg_start..seg_end].to_string(), span.kind));
+        }
+    }
+    out
+}
+
+fn lsp_uri(path: &Path) -> Option<lsp::Url> {
+    lsp::Url::from_file_path(path).ok()
+}
+
+fn is_lsp_language(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(lsp::LspLanguage::from_extension)
+        .is_some()
+}
+
+fn send_did_open_for(state: &mut State, path: &Path) {
+    if !is_lsp_language(path) {
+        return;
+    }
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    let Some(text) = find_editor(state, path).map(|e| e.document.text().to_string()) else {
+        return;
+    };
+    if let Some(sender) = state.lsp_sender.as_mut() {
+        let _ = sender.try_send(LspCommand::DidOpen { uri, text });
+    }
+}
+
+fn send_did_change_for(state: &mut State, path: &Path) {
+    if !is_lsp_language(path) {
+        return;
+    }
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    let Some(text) = find_editor(state, path).map(|e| e.document.text().to_string()) else {
+        return;
+    };
+    if let Some(sender) = state.lsp_sender.as_mut() {
+        let _ = sender.try_send(LspCommand::DidChange { uri, text });
+    }
+}
+
+fn send_did_close(sender: &mut mpsc::Sender<LspCommand>, path: &Path) {
+    if !is_lsp_language(path) {
+        return;
+    }
+    if let Some(uri) = lsp_uri(path) {
+        let _ = sender.try_send(LspCommand::DidClose { uri });
+    }
+}
+
+/// Converts `lsp_types::Diagnostic`s (UTF-16 positions) into char-based
+/// `EditorDiagnostic`s against the document's *current* text. If edits have
+/// raced ahead of a stale diagnostics batch, positions are clamped rather
+/// than panicking — see `Document::line_text`.
+fn convert_diagnostics(document: &Document, diagnostics: Vec<lsp::Diagnostic>) -> Vec<EditorDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|d| {
+            let start_line = d.range.start.line as usize;
+            let end_line = d.range.end.line as usize;
+            let start_col =
+                utf16_col_to_char_col(&document.line_text(start_line), d.range.start.character as usize);
+            let end_col =
+                utf16_col_to_char_col(&document.line_text(end_line), d.range.end.character as usize);
+            EditorDiagnostic {
+                start: CursorPos { line: start_line, col: start_col },
+                end: CursorPos { line: end_line, col: end_col },
+                severity: d.severity.unwrap_or(lsp::DiagnosticSeverity::ERROR),
+                message: d.message,
+            }
+        })
+        .collect()
+}
+
+fn utf16_col_to_char_col(line: &str, utf16_col: usize) -> usize {
+    let mut utf16_count = 0usize;
+    for (char_idx, ch) in line.chars().enumerate() {
+        if utf16_count >= utf16_col {
+            return char_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    line.chars().count()
+}
+
+/// Zero-arg by design: `Subscription::run` needs a plain `fn` pointer (no
+/// captures), and DevScribe doesn't support changing the project root at
+/// runtime yet, so rediscovering it here (same as `State::default`) is
+/// simpler than threading it through as subscription data.
+fn lsp_worker() -> impl iced::futures::Stream<Item = LspEvent> {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    iced::stream::channel(32, async move |output| {
+        lsp::run(root, output).await;
+    })
+}
+
+/// Ctrl/Cmd+K (palette), Ctrl/Cmd+S (save), and Escape (close whatever
+/// overlay is open) — global shortcuts that work regardless of which widget
+/// has focus. `keyboard::listen()` only sees events no focused widget
+/// captured, so this never steals a keystroke the editor canvas wants (e.g.
+/// typing a literal "k").
+fn global_keys(event: keyboard::Event) -> Message {
+    if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
+        if modifiers.command()
+            && let keyboard::Key::Character(c) = key.as_ref()
+        {
+            if c.eq_ignore_ascii_case("k") {
+                return Message::TogglePalette;
+            }
+            if c.eq_ignore_ascii_case("s") {
+                return Message::EditorSave;
+            }
+            if c.eq_ignore_ascii_case("f") {
+                return if modifiers.shift() {
+                    Message::FocusSearchTab
+                } else {
+                    Message::ToggleFind
+                };
+            }
+            if c.eq_ignore_ascii_case("w") {
+                return Message::CloseActiveTab;
+            }
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+            return Message::EscapePressed;
+        }
+        // The editor canvas captures these itself while focused (see
+        // `editor_canvas::handle_key`), so these only fire when something
+        // else has focus — harmless no-ops unless the palette is open.
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::ArrowUp)) {
+            return Message::PaletteMove(-1);
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::ArrowDown)) {
+            return Message::PaletteMove(1);
+        }
+    }
+    Message::Noop
+}
+
 pub fn subscription(_state: &State) -> iced::Subscription<Message> {
-    iced::time::every(std::time::Duration::from_millis(530)).map(|_| Message::CaretTick)
+    iced::Subscription::batch([
+        iced::time::every(std::time::Duration::from_millis(530)).map(|_| Message::CaretTick),
+        iced::time::every(Duration::from_secs(1)).map(|_| Message::PruneToasts),
+        iced::Subscription::run(lsp_worker).map(Message::Lsp),
+        iced::keyboard::listen().map(global_keys),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch dir with two files, for tests that need real paths
+    /// `Document::open` can read. Cleaned up on drop.
+    struct TempFiles {
+        dir: PathBuf,
+        pub a: PathBuf,
+        pub b: PathBuf,
+    }
+
+    impl TempFiles {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "devscribe-tabs-test-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id(),
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            let b = dir.join("b.txt");
+            std::fs::write(&a, "a").unwrap();
+            std::fs::write(&b, "b").unwrap();
+            Self { dir, a, b }
+        }
+    }
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn open_or_focus_file_dedups_and_is_additive() {
+        let files = TempFiles::new("dedup");
+        let mut state = State::default();
+
+        open_or_focus_file(&mut state, files.a.clone());
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())));
+
+        open_or_focus_file(&mut state, files.b.clone());
+        assert_eq!(state.open_tabs.len(), 2, "opening a second file should be additive, not a replace");
+        assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())));
+
+        open_or_focus_file(&mut state, files.a.clone());
+        assert_eq!(state.open_tabs.len(), 2, "reopening an already-open file must not duplicate its tab");
+        assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())));
+    }
+
+    #[test]
+    fn close_tab_also_closes_its_diff_tab_and_refocuses() {
+        let files = TempFiles::new("close");
+        let mut state = State::default();
+
+        open_or_focus_file(&mut state, files.a.clone());
+        open_or_focus_file(&mut state, files.b.clone());
+        open_or_focus_diff(&mut state, files.a.clone());
+        assert_eq!(state.open_tabs.len(), 3);
+        assert_eq!(state.active_tab, Some(TabKey::Diff(files.a.clone())));
+
+        close_tab(&mut state, &TabKey::File(files.a.clone()));
+
+        assert_eq!(
+            state.open_tabs.iter().map(OpenTab::key).collect::<Vec<_>>(),
+            vec![TabKey::File(files.b.clone())],
+            "closing a file tab must also close its now-orphaned diff tab"
+        );
+        assert_eq!(
+            state.active_tab,
+            Some(TabKey::File(files.b.clone())),
+            "closing the active tab (even indirectly, via its diff tab) must refocus a remaining tab"
+        );
+    }
+
+    #[test]
+    fn closing_last_tab_clears_active_tab() {
+        let files = TempFiles::new("last");
+        let mut state = State::default();
+
+        open_or_focus_file(&mut state, files.a.clone());
+        close_tab(&mut state, &TabKey::File(files.a.clone()));
+
+        assert!(state.open_tabs.is_empty());
+        assert_eq!(state.active_tab, None);
+    }
+
+    #[test]
+    fn utf16_col_ascii_matches_char_col() {
+        assert_eq!(utf16_col_to_char_col("let x = 1;", 4), 4);
+        assert_eq!(utf16_col_to_char_col("let x = 1;", 0), 0);
+    }
+
+    #[test]
+    fn utf16_col_past_end_clamps_to_line_length() {
+        assert_eq!(utf16_col_to_char_col("abc", 99), 3);
+    }
+
+    #[test]
+    fn utf16_col_bmp_multibyte_char_counts_as_one_unit() {
+        // 'é' is 1 UTF-16 code unit but 2 UTF-8 bytes — this must track
+        // chars/UTF-16 units, not bytes.
+        let line = "café!";
+        assert_eq!(utf16_col_to_char_col(line, 4), 4);
+    }
+
+    #[test]
+    fn utf16_col_surrogate_pair_counts_as_two_units() {
+        // An emoji outside the BMP is 1 char but 2 UTF-16 code units, so an
+        // LSP column pointing just past it is offset by 2, not 1.
+        let line = "a\u{1F600}b";
+        assert_eq!(utf16_col_to_char_col(line, 0), 0);
+        assert_eq!(utf16_col_to_char_col(line, 1), 1);
+        assert_eq!(utf16_col_to_char_col(line, 3), 2);
+    }
+
+    #[test]
+    fn line_segments_matches_real_highlighter_output() {
+        let source = "fn main() {\n    let x = 1;\n}\n";
+        let document = Document::from_str(source);
+        let mut highlighter = syntax::Highlighter::new();
+        let spans = highlighter.highlight(syntax::Language::Rust, source);
+
+        // Line 1 is `    let x = 1;` — `let` should come back as its own
+        // Keyword-colored segment, not merged into the surrounding text.
+        let segments = line_segments(&document, &spans, 1);
+        let joined: String = segments.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(joined, document.line_text(1), "segments must reconstruct the full line with no gaps");
+
+        let let_segment = segments
+            .iter()
+            .find(|(text, _)| text == "let")
+            .expect("`let` should be its own segment");
+        assert_eq!(let_segment.1, syntax::HighlightKind::Keyword);
+    }
 }

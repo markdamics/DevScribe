@@ -94,7 +94,7 @@ fn tint(c: Rgba, alpha: f32) -> Color {
 
 #[derive(Debug, Clone)]
 pub enum Node {
-    Dir { name: String, children: Vec<Node> },
+    Dir { name: String, path: PathBuf, children: Vec<Node> },
     File { name: String, path: PathBuf, lang: Lang },
 }
 
@@ -140,6 +140,7 @@ pub fn walk(root: &Path) -> Vec<Node> {
         .map(|(name, path)| Node::Dir {
             children: walk(&path),
             name,
+            path,
         })
         .collect();
 
@@ -149,4 +150,35 @@ pub fn walk(root: &Path) -> Vec<Node> {
     }));
 
     nodes
+}
+
+/// Every file path under `nodes`, depth-first — used by project-wide search.
+pub fn flatten_files(nodes: &[Node]) -> Vec<&Path> {
+    let mut files = Vec::new();
+    fn walk<'a>(nodes: &'a [Node], out: &mut Vec<&'a Path>) {
+        for node in nodes {
+            match node {
+                Node::Dir { children, .. } => walk(children, out),
+                Node::File { path, .. } => out.push(path.as_path()),
+            }
+        }
+    }
+    walk(nodes, &mut files);
+    files
+}
+
+/// Every directory path under `nodes`, at every depth — used to seed
+/// `State.collapsed_dirs` so the sidebar tree starts fully collapsed.
+pub fn flatten_dirs(nodes: &[Node]) -> Vec<&Path> {
+    let mut dirs = Vec::new();
+    fn walk<'a>(nodes: &'a [Node], out: &mut Vec<&'a Path>) {
+        for node in nodes {
+            if let Node::Dir { path, children, .. } = node {
+                out.push(path.as_path());
+                walk(children, out);
+            }
+        }
+    }
+    walk(nodes, &mut dirs);
+    dirs
 }

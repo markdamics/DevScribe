@@ -1,22 +1,25 @@
 //! A from-scratch code editor pane: `ropey`-backed text on a monospace grid,
 //! drawn directly with `iced::widget::canvas` (gutter, selection, caret,
-//! tree-sitter-driven per-span coloring) and driven by real mouse/keyboard
-//! input — no LSP diagnostics yet (milestone 5).
+//! tree-sitter-driven per-span coloring, LSP diagnostics) and driven by real
+//! mouse/keyboard input.
+use devscribe_core::lsp::DiagnosticSeverity;
 use devscribe_core::syntax::{HighlightKind, Span};
 use devscribe_core::theme::{Palette, Rgba};
 use devscribe_core::Document;
 use iced::alignment::Vertical;
-use iced::widget::canvas::{self, Frame, Geometry, Path, Text};
+use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Style, Text};
 use iced::widget::text::{Alignment, LineHeight};
 use iced::{keyboard, mouse, Color, Pixels, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{CursorPos, Direction, Message};
+use crate::state::{CursorPos, Direction, EditorDiagnostic, Message};
 
-const LINE_HEIGHT: f32 = 22.0;
-const FONT_SIZE: f32 = 13.0;
-const CHAR_WIDTH: f32 = FONT_SIZE * 0.6;
+/// The font-size-to-`line_height`/`char_width` ratios the original static
+/// design used (22/13 and 0.6 respectively) — kept fixed so the editor's
+/// proportions stay the same as `font_size` changes via the settings panel.
+const LINE_HEIGHT_RATIO: f32 = 22.0 / 13.0;
+const CHAR_WIDTH_RATIO: f32 = 0.6;
 const GUTTER_WIDTH: f32 = 52.0;
 const TEXT_INSET: f32 = 4.0;
 const TOP_PAD: f32 = 12.0;
@@ -31,6 +34,18 @@ pub struct EditorCanvas {
     /// `devscribe_core::syntax`. Empty for files with no wired grammar,
     /// in which case lines fall back to a single flat color.
     pub highlights: Vec<Span>,
+    pub diagnostics: Vec<EditorDiagnostic>,
+    /// Toggled from the settings panel. Only hides the inline `// message`
+    /// annotation — the wavy underline stays either way.
+    pub problem_lens_enabled: bool,
+    /// Set from the settings panel's font-size stepper.
+    pub font_size: f32,
+    /// In-file find (Ctrl+F) match ranges, as absolute char ranges — same
+    /// coordinate space as `selection`. Empty when find is closed.
+    pub find_matches: Vec<(usize, usize)>,
+    /// Index into `find_matches` of the current (more prominently
+    /// highlighted) match. Meaningless when `find_matches` is empty.
+    pub find_current: usize,
 }
 
 /// Purely local interaction state — never synced back into `State` directly.
@@ -44,15 +59,24 @@ pub struct CanvasState {
 }
 
 impl EditorCanvas {
+    fn line_height(&self) -> f32 {
+        self.font_size * LINE_HEIGHT_RATIO
+    }
+
+    fn char_width(&self) -> f32 {
+        self.font_size * CHAR_WIDTH_RATIO
+    }
+
     fn hit_test(&self, position: Point) -> (usize, usize) {
-        let line = ((position.y - TOP_PAD) / LINE_HEIGHT).floor();
+        let line_height = self.line_height();
+        let line = ((position.y - TOP_PAD) / line_height).floor();
         let line = (line.max(0.0) as usize).min(self.document.line_count().saturating_sub(1));
 
         let x = position.x - GUTTER_WIDTH - TEXT_INSET;
         let col = if x <= 0.0 {
             0
         } else {
-            (x / CHAR_WIDTH).round() as usize
+            (x / self.char_width()).round() as usize
         };
         let col = col.min(self.document.line_len_chars(line));
         (line, col)
@@ -169,11 +193,9 @@ impl canvas::Program<Message> for EditorCanvas {
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let p = self.palette;
-
-        frame.fill(
-            &Path::rectangle(Point::ORIGIN, Size::new(GUTTER_WIDTH, bounds.height)),
-            color(p.bg_panel),
-        );
+        let font_size = self.font_size;
+        let line_height = self.line_height();
+        let char_width = self.char_width();
 
         let mono = fonts::mono(iced::font::Weight::Normal);
 
@@ -182,32 +204,70 @@ impl canvas::Program<Message> for EditorCanvas {
         let mut span_cursor = 0usize;
 
         for line in 0..self.document.line_count() {
-            let y = TOP_PAD + line as f32 * LINE_HEIGHT;
+            let y = TOP_PAD + line as f32 * line_height;
+            let is_cursor_line = line == self.cursor.line;
 
-            if let Some((start, end)) = self.selection {
-                let line_start_idx = self.document.char_index(line, 0);
-                let line_len = self.document.line_len_chars(line);
-                let line_end_idx = line_start_idx + line_len;
-                // Treat the line terminator as one extra selectable column so a
-                // selection spanning multiple lines visibly covers each line's end.
-                let selectable_end = line_end_idx + 1;
-
-                if start < selectable_end && end > line_start_idx {
-                    let sel_start_col = start.saturating_sub(line_start_idx);
-                    let sel_end_col = (end.saturating_sub(line_start_idx)).min(line_len + 1);
-                    let x0 = GUTTER_WIDTH + TEXT_INSET + sel_start_col as f32 * CHAR_WIDTH;
-                    let x1 = GUTTER_WIDTH + TEXT_INSET + sel_end_col as f32 * CHAR_WIDTH;
-                    frame.fill(
-                        &Path::rectangle(
-                            Point::new(x0, y),
-                            Size::new((x1 - x0).max(CHAR_WIDTH * 0.4), LINE_HEIGHT),
-                        ),
-                        tint(p.accent, 0.22),
-                    );
-                }
+            if is_cursor_line {
+                frame.fill(
+                    &Path::rectangle(
+                        Point::new(GUTTER_WIDTH, y),
+                        Size::new(bounds.width - GUTTER_WIDTH, line_height),
+                    ),
+                    tint(p.accent, 0.08),
+                );
             }
 
-            let is_cursor_line = line == self.cursor.line;
+            let line_start_idx = self.document.char_index(line, 0);
+            let line_len = self.document.line_len_chars(line);
+            let line_end_idx = line_start_idx + line_len;
+            // Treat the line terminator as one extra selectable column so a
+            // selection spanning multiple lines visibly covers each line's end.
+            let selectable_end = line_end_idx + 1;
+
+            if let Some((start, end)) = self.selection
+                && start < selectable_end
+                && end > line_start_idx
+            {
+                let sel_start_col = start.saturating_sub(line_start_idx);
+                let sel_end_col = (end.saturating_sub(line_start_idx)).min(line_len + 1);
+                let x0 = GUTTER_WIDTH + TEXT_INSET + sel_start_col as f32 * char_width;
+                let x1 = GUTTER_WIDTH + TEXT_INSET + sel_end_col as f32 * char_width;
+                frame.fill(
+                    &Path::rectangle(
+                        Point::new(x0, y),
+                        Size::new((x1 - x0).max(char_width * 0.4), line_height),
+                    ),
+                    tint(p.accent, 0.22),
+                );
+            }
+
+            for (i, (start, end)) in self.find_matches.iter().enumerate() {
+                if *start >= line_end_idx || *end <= line_start_idx {
+                    continue;
+                }
+                let is_current = i == self.find_current;
+                let match_start_col = start.saturating_sub(line_start_idx);
+                let match_end_col = (end.saturating_sub(line_start_idx)).min(line_len);
+                let x0 = GUTTER_WIDTH + TEXT_INSET + match_start_col as f32 * char_width;
+                let x1 = GUTTER_WIDTH + TEXT_INSET + match_end_col as f32 * char_width;
+                let rect = Path::rectangle(
+                    Point::new(x0, y + 1.0),
+                    Size::new((x1 - x0).max(char_width * 0.4), line_height - 2.0),
+                );
+                if is_current {
+                    frame.fill(&rect, tint(p.status_warn, 0.35));
+                    frame.stroke(
+                        &rect,
+                        Stroke {
+                            style: Style::Solid(color(p.status_warn)),
+                            width: 1.0,
+                            ..Stroke::default()
+                        },
+                    );
+                } else {
+                    frame.fill(&rect, tint(p.status_warn, 0.16));
+                }
+            }
 
             frame.fill_text(Text {
                 content: (line + 1).to_string(),
@@ -218,7 +278,7 @@ impl canvas::Program<Message> for EditorCanvas {
                     tint(p.text_muted, 0.6)
                 },
                 size: Pixels(11.0),
-                line_height: LineHeight::Absolute(Pixels(LINE_HEIGHT)),
+                line_height: LineHeight::Absolute(Pixels(line_height)),
                 font: mono,
                 align_x: Alignment::Right,
                 align_y: Vertical::Top,
@@ -241,8 +301,8 @@ impl canvas::Program<Message> for EditorCanvas {
                         content: text,
                         position: Point::new(GUTTER_WIDTH + TEXT_INSET, y),
                         color: color(p.text_secondary),
-                        size: Pixels(FONT_SIZE),
-                        line_height: LineHeight::Absolute(Pixels(LINE_HEIGHT)),
+                        size: Pixels(font_size),
+                        line_height: LineHeight::Absolute(Pixels(line_height)),
                         font: mono,
                         align_y: Vertical::Top,
                         ..Text::default()
@@ -259,12 +319,12 @@ impl canvas::Program<Message> for EditorCanvas {
                             frame.fill_text(Text {
                                 content,
                                 position: Point::new(
-                                    GUTTER_WIDTH + TEXT_INSET + start_col as f32 * CHAR_WIDTH,
+                                    GUTTER_WIDTH + TEXT_INSET + start_col as f32 * char_width,
                                     y,
                                 ),
                                 color: highlight_color(span.kind, p),
-                                size: Pixels(FONT_SIZE),
-                                line_height: LineHeight::Absolute(Pixels(LINE_HEIGHT)),
+                                size: Pixels(font_size),
+                                line_height: LineHeight::Absolute(Pixels(line_height)),
                                 font: mono,
                                 align_y: Vertical::Top,
                                 ..Text::default()
@@ -275,10 +335,48 @@ impl canvas::Program<Message> for EditorCanvas {
                 }
             }
 
+            let mut lens: Option<(&str, Rgba)> = None;
+            for diag in &self.diagnostics {
+                if diag.start.line > line || diag.end.line < line {
+                    continue;
+                }
+                let seg_start_col = if diag.start.line == line { diag.start.col } else { 0 };
+                let line_len = self.document.line_len_chars(line);
+                let seg_end_col = if diag.end.line == line {
+                    diag.end.col.max(seg_start_col + 1)
+                } else {
+                    line_len.max(seg_start_col + 1)
+                };
+                let sev_color = severity_color(diag.severity, p);
+                let x0 = GUTTER_WIDTH + TEXT_INSET + seg_start_col as f32 * char_width;
+                let x1 = GUTTER_WIDTH + TEXT_INSET + seg_end_col as f32 * char_width;
+                draw_wavy_underline(&mut frame, x0, x1, y + line_height - 5.0, color(sev_color));
+
+                if self.problem_lens_enabled && lens.is_none() {
+                    lens = Some((diag.message.as_str(), sev_color));
+                }
+            }
+            if let Some((message, sev_color)) = lens {
+                let lens_col = self.document.line_len_chars(line) + 3;
+                frame.fill_text(Text {
+                    content: format!("// {message}"),
+                    position: Point::new(
+                        GUTTER_WIDTH + TEXT_INSET + lens_col as f32 * char_width,
+                        y,
+                    ),
+                    color: tint(sev_color, 0.65),
+                    size: Pixels(font_size - 1.0),
+                    line_height: LineHeight::Absolute(Pixels(line_height)),
+                    font: mono,
+                    align_y: Vertical::Top,
+                    ..Text::default()
+                });
+            }
+
             if is_cursor_line && self.caret_visible {
-                let x = GUTTER_WIDTH + TEXT_INSET + self.cursor.col as f32 * CHAR_WIDTH;
+                let x = GUTTER_WIDTH + TEXT_INSET + self.cursor.col as f32 * char_width;
                 frame.fill(
-                    &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, LINE_HEIGHT - 4.0)),
+                    &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
                     color(p.accent),
                 );
             }
@@ -305,10 +403,50 @@ fn tint(c: Rgba, alpha: f32) -> Color {
     color(Rgba { a: alpha, ..c })
 }
 
+fn severity_color(severity: DiagnosticSeverity, p: Palette) -> Rgba {
+    if severity == DiagnosticSeverity::ERROR {
+        p.status_danger
+    } else if severity == DiagnosticSeverity::WARNING {
+        p.status_warn
+    } else if severity == DiagnosticSeverity::INFORMATION {
+        p.status_info
+    } else {
+        p.text_muted
+    }
+}
+
+/// A small squiggle under `[x0, x1)` at baseline `y`, in the rustc/VS Code
+/// "wavy underline" style the mockup uses for inline diagnostics.
+fn draw_wavy_underline(frame: &mut Frame, x0: f32, x1: f32, y: f32, color: Color) {
+    const AMPLITUDE: f32 = 1.6;
+    const PERIOD: f32 = 4.0;
+
+    let path = Path::new(|p| {
+        p.move_to(Point::new(x0, y));
+        let mut x = x0;
+        let mut up = true;
+        while x < x1 {
+            let next_x = (x + PERIOD).min(x1);
+            let next_y = if up { y - AMPLITUDE } else { y + AMPLITUDE };
+            p.line_to(Point::new(next_x, next_y));
+            x = next_x;
+            up = !up;
+        }
+    });
+    frame.stroke(
+        &path,
+        Stroke {
+            style: Style::Solid(color),
+            width: 1.2,
+            ..Stroke::default()
+        },
+    );
+}
+
 /// Maps a syntax category onto the current theme's tokens. Chosen to match
 /// the original mockup's static Rust code sample exactly (keyword→accent,
 /// type→status-info, string→status-ok, constant→status-warn, comment→muted).
-fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
+pub(crate) fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
     match kind {
         HighlightKind::Default => color(p.text_secondary),
         HighlightKind::Keyword => color(p.accent),
@@ -324,8 +462,8 @@ fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
     }
 }
 
-/// Total content height for `line_count` lines — used to size the `Canvas`
-/// so it can sit inside a `scrollable` for vertical scrolling.
-pub fn content_height(line_count: usize) -> f32 {
-    TOP_PAD * 2.0 + line_count as f32 * LINE_HEIGHT
+/// Total content height for `line_count` lines at `font_size` — used to size
+/// the `Canvas` so it can sit inside a `scrollable` for vertical scrolling.
+pub fn content_height(line_count: usize, font_size: f32) -> f32 {
+    TOP_PAD * 2.0 + line_count as f32 * font_size * LINE_HEIGHT_RATIO
 }
