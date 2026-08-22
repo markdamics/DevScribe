@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "devscribe"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "devscribe-core",
  "iced",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "devscribe-core"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "async-lsp",
  "async-process",
