@@ -72,11 +72,24 @@ pub fn micro<'a, Message: 'a>(content: &'a str, color: Color) -> Element<'a, Mes
         .into()
 }
 
-/// A 1px hairline, horizontal by default.
+/// A 1px horizontal hairline, filling its parent's width.
 pub fn hline<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
     container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
         .width(Length::Fill)
         .height(Length::Fixed(1.0))
+        .style(move |_theme| container::Style {
+            background: Some(color.into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A 1px vertical hairline, filling its parent's height — e.g. the divider
+/// between the settings modal's category nav and its content pane.
+pub fn vline<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
+        .width(Length::Fixed(1.0))
+        .height(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(color.into()),
             ..container::Style::default()

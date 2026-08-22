@@ -132,6 +132,88 @@ pub struct Toast {
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 
+/// A lighter, non-stacking confirmation pill (`ui/flash.rs`) for immediate
+/// direct-action feedback (file/folder created, renamed, path copied, tree
+/// collapsed) — distinct from the `Toast` stack above, which is reserved for
+/// LSP-readiness and save-result events. Only one shows at a time; starting
+/// a new one replaces whatever's currently showing.
+#[derive(Debug, Clone)]
+pub struct Flash {
+    pub text: String,
+    created_at: Instant,
+}
+
+const FLASH_LIFETIME: Duration = Duration::from_millis(1800);
+
+/// What kind of inline tree draft is open: a new file, a new folder, or an
+/// in-place rename of an existing entry. Drives both the draft row's glyph/
+/// placeholder (`sidebar.rs`) and how `commit_draft` interprets `text`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+/// The sidebar tree's single in-progress inline edit — either a "new file"/
+/// "new folder" draft row inserted under `dir`, or a rename of `target` in
+/// place. Only one draft can be open at a time (starting a new one replaces
+/// it), matching the mockup's single `draft` field.
+#[derive(Debug, Clone)]
+pub struct Draft {
+    pub kind: DraftKind,
+    /// Parent directory a `NewFile`/`NewFolder` draft is created in. Unused
+    /// for `Rename` (the target's existing parent is used instead).
+    pub dir: PathBuf,
+    /// The path being renamed, for `Rename` drafts only.
+    pub target: Option<PathBuf>,
+    pub text: String,
+}
+
+/// The tree's right-click context menu: `target = None` means the tree
+/// background/root was right-clicked (New file/New folder only, no Rename/
+/// Copy path); `Some(path)` means a specific entry.
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub target: Option<PathBuf>,
+}
+
+/// The settings modal's left-nav categories. Only `Explorer` and `Editor`
+/// have real content — `Toolchains`/`Keymap`/`Advanced` are honest
+/// "not available yet" placeholders rather than settings that would do
+/// nothing (there's no toolchain installer, keymap remapping, or advanced
+/// config in DevScribe to back them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsCategory {
+    #[default]
+    Explorer,
+    Editor,
+    Toolchains,
+    Keymap,
+    Advanced,
+}
+
+impl SettingsCategory {
+    pub const ALL: [SettingsCategory; 5] = [
+        SettingsCategory::Explorer,
+        SettingsCategory::Editor,
+        SettingsCategory::Toolchains,
+        SettingsCategory::Keymap,
+        SettingsCategory::Advanced,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsCategory::Explorer => "Explorer",
+            SettingsCategory::Editor => "Editor",
+            SettingsCategory::Toolchains => "Toolchains",
+            SettingsCategory::Keymap => "Keymap",
+            SettingsCategory::Advanced => "Advanced",
+        }
+    }
+
+}
+
 /// A runnable entry in the command palette: file to open, theme to switch
 /// to, action to run.
 #[derive(Debug, Clone)]
@@ -458,8 +540,13 @@ pub struct State {
     pub palette_query: String,
     pub palette_selected: usize,
     pub settings_open: bool,
+    pub settings_category: SettingsCategory,
     pub density: Density,
     pub problem_lens_enabled: bool,
+    /// Gates the file tree's per-file `ChangeKind` badges (`sidebar.rs`).
+    /// Doesn't affect the separate "CHANGES" panel, which has its own
+    /// collapse toggle.
+    pub git_status_in_tree: bool,
     pub editor_font_size: f32,
     /// Multiplies every chrome text size (sidebar, tabs, status bar, title
     /// bar, palette, settings, toasts). Independent of `editor_font_size` —
@@ -467,7 +554,21 @@ pub struct State {
     pub ui_font_scale: f32,
     pub toasts: Vec<Toast>,
     next_toast_id: u64,
+    /// Non-`None` while the sidebar tree has an inline new-file/new-folder/
+    /// rename draft open. See `Draft`.
+    pub draft: Option<Draft>,
+    /// Non-`None` while the tree's right-click context menu is open.
+    pub ctx_menu: Option<ContextMenu>,
+    /// The single current "flash" confirmation pill, if any. See `Flash`.
+    pub flash: Option<Flash>,
+    /// LIFO stack of tabs closed via `Message::CloseTab`/`CloseActiveTab`/
+    /// `CloseOtherTabs` (not tabs closed only as a side effect, e.g. a
+    /// `Diff` tab auto-closed with its backing `File` tab) — `ReopenClosedTab`
+    /// pops and reopens the most recent. Capped at `MAX_CLOSED_TABS`.
+    pub closed_tabs: Vec<TabKey>,
 }
+
+const MAX_CLOSED_TABS: usize = 20;
 
 pub const EDITOR_FONT_SIZE_MIN: f32 = 10.0;
 pub const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
@@ -504,7 +605,7 @@ impl Default for State {
             lsp_sender: None,
             repo,
             changed_files,
-            changes_panel_open: true,
+            changes_panel_open: false,
             search_query: String::new(),
             search_results: Vec::new(),
             search_elapsed: Duration::ZERO,
@@ -512,12 +613,18 @@ impl Default for State {
             palette_query: String::new(),
             palette_selected: 0,
             settings_open: false,
+            settings_category: SettingsCategory::default(),
+            git_status_in_tree: false,
             density: Density::default(),
             problem_lens_enabled: true,
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             ui_font_scale: UI_FONT_SCALE_DEFAULT,
             toasts: Vec::new(),
             next_toast_id: 0,
+            draft: None,
+            ctx_menu: None,
+            flash: None,
+            closed_tabs: Vec::new(),
         }
     }
 }
@@ -560,6 +667,8 @@ pub enum Message {
     CloseSettings,
     SetDensity(Density),
     ToggleProblemLens,
+    SetSettingsCategory(SettingsCategory),
+    ToggleGitStatusInTree,
     SetEditorFontSize(f32),
     SetUiFontScale(f32),
     DismissToast(u64),
@@ -571,6 +680,29 @@ pub enum Message {
     FindNext,
     FindPrev,
     EscapePressed,
+    /// Starts a new-file/new-folder draft in the project root — the
+    /// Explorer header buttons and the global Ctrl/Cmd+N / Ctrl/Cmd+Shift+N
+    /// shortcuts.
+    BeginDraft(DraftKind),
+    /// Starts a new-file/new-folder draft in a specific directory — the
+    /// tree's right-click context menu, which already knows its target.
+    BeginDraftIn(DraftKind, PathBuf),
+    /// Starts an in-place rename draft for `path` — context menu only.
+    BeginRename(PathBuf),
+    DraftTextChanged(String),
+    CommitDraft,
+    CancelDraft,
+    /// Collapses every directory in the tree (real, not decorative — see
+    /// `Phase 5` writeup).
+    CollapseAllDirs,
+    /// Opens the tree's right-click context menu. `None` targets the tree
+    /// background/root.
+    OpenTreeContext(Option<PathBuf>),
+    CloseTreeContext,
+    CopyPath(PathBuf),
+    CloseOtherTabs,
+    RevealActiveInTree,
+    ReopenClosedTab,
     Noop,
 }
 
@@ -727,6 +859,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::CloseSettings => state.settings_open = false,
         Message::SetDensity(density) => state.density = density,
         Message::ToggleProblemLens => state.problem_lens_enabled = !state.problem_lens_enabled,
+        Message::SetSettingsCategory(category) => state.settings_category = category,
+        Message::ToggleGitStatusInTree => state.git_status_in_tree = !state.git_status_in_tree,
         Message::SetEditorFontSize(size) => {
             state.editor_font_size = size.clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         }
@@ -734,7 +868,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.ui_font_scale = scale.clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
         }
         Message::DismissToast(id) => state.toasts.retain(|t| t.id != id),
-        Message::PruneToasts => state.toasts.retain(|t| t.created_at.elapsed() < TOAST_LIFETIME),
+        Message::PruneToasts => {
+            state.toasts.retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
+            if state.flash.as_ref().is_some_and(|f| f.created_at.elapsed() >= FLASH_LIFETIME) {
+                state.flash = None;
+            }
+        }
         Message::EditorSave => save_current_file(state),
         Message::ToggleFind => {
             if let Some(path) = active_file_path(state)
@@ -776,6 +915,44 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::FindNext => find_step(state, 1),
         Message::FindPrev => find_step(state, -1),
+        Message::BeginDraft(kind) => return begin_draft(state, kind, state.root.clone()),
+        Message::BeginDraftIn(kind, dir) => return begin_draft(state, kind, dir),
+        Message::BeginRename(path) => return begin_rename(state, path),
+        Message::DraftTextChanged(text) => {
+            if let Some(draft) = state.draft.as_mut() {
+                draft.text = text;
+            }
+        }
+        Message::CommitDraft => commit_draft(state),
+        Message::CancelDraft => state.draft = None,
+        Message::CollapseAllDirs => {
+            state.collapsed_dirs = fs_tree::flatten_dirs(&state.tree).into_iter().map(Path::to_path_buf).collect();
+            push_flash(state, "TREE COLLAPSED");
+        }
+        Message::OpenTreeContext(target) => {
+            state.ctx_menu = Some(ContextMenu { target });
+            state.overflow_open = false;
+            state.projects_open = false;
+        }
+        Message::CloseTreeContext => state.ctx_menu = None,
+        Message::CopyPath(path) => {
+            state.ctx_menu = None;
+            let label = path.strip_prefix(&state.root).unwrap_or(&path).display().to_string();
+            push_flash(state, format!("PATH COPIED // {label}"));
+            return iced::clipboard::write(path.display().to_string());
+        }
+        Message::CloseOtherTabs => {
+            state.overflow_open = false;
+            close_other_tabs(state);
+        }
+        Message::RevealActiveInTree => {
+            state.overflow_open = false;
+            reveal_active_in_tree(state);
+        }
+        Message::ReopenClosedTab => {
+            state.overflow_open = false;
+            reopen_closed_tab(state);
+        }
         Message::EscapePressed => {
             let find_open = active_file_path(state)
                 .and_then(|path| find_editor(state, &path))
@@ -786,6 +963,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 {
                     editor.find = None;
                 }
+            } else if state.draft.is_some() {
+                state.draft = None;
+            } else if state.ctx_menu.is_some() {
+                state.ctx_menu = None;
+            } else if state.overflow_open {
+                state.overflow_open = false;
             } else if state.palette_open {
                 state.palette_open = false;
             } else if state.settings_open {
@@ -868,6 +1051,13 @@ fn push_toast(state: &mut State, kind: ToastKind, message: impl Into<String>) {
     });
 }
 
+fn push_flash(state: &mut State, text: impl Into<String>) {
+    state.flash = Some(Flash {
+        text: text.into(),
+        created_at: Instant::now(),
+    });
+}
+
 /// A stable id for the command palette's search box, so `update()` can focus
 /// it (via `iced::widget::operation::focus`) the moment the palette opens.
 pub fn palette_query_id() -> iced::widget::Id {
@@ -878,6 +1068,200 @@ pub fn palette_query_id() -> iced::widget::Id {
 /// focus it the moment Ctrl+F opens it.
 pub fn find_query_id() -> iced::widget::Id {
     iced::widget::Id::new("find-query")
+}
+
+/// A stable id for the sidebar tree's inline draft text input, so `update()`
+/// can focus it the moment a new-file/new-folder/rename draft opens.
+pub fn draft_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("tree-draft-input")
+}
+
+/// Re-scans `root` for the sidebar tree — the only way `state.tree` picks up
+/// filesystem changes (no watcher), so every draft commit that adds/removes
+/// an entry calls this. Deliberately doesn't touch `collapsed_dirs`: it's
+/// keyed by absolute path, so existing collapse state for untouched
+/// directories survives a re-walk unchanged.
+fn refresh_tree(state: &mut State) {
+    state.tree = fs_tree::walk(&state.root);
+}
+
+fn begin_draft(state: &mut State, kind: DraftKind, dir: PathBuf) -> iced::Task<Message> {
+    state.draft = Some(Draft {
+        kind,
+        dir,
+        target: None,
+        text: String::new(),
+    });
+    state.ctx_menu = None;
+    iced::widget::operation::focus(draft_input_id())
+}
+
+fn begin_rename(state: &mut State, path: PathBuf) -> iced::Task<Message> {
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| state.root.clone());
+    state.draft = Some(Draft {
+        kind: DraftKind::Rename,
+        dir,
+        target: Some(path),
+        text: String::new(),
+    });
+    state.ctx_menu = None;
+    iced::widget::operation::focus(draft_input_id())
+}
+
+/// Commits the open draft, if any and non-empty: writes the new file/folder
+/// to disk, or renames the target, then refreshes the tree and fires the
+/// matching "flash" confirmation. Errors (name collision, permission denied)
+/// surface as a regular toast rather than the flash pill — they're not the
+/// success case the flash is for.
+fn commit_draft(state: &mut State) {
+    let Some(draft) = state.draft.take() else {
+        return;
+    };
+    let name = draft.text.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+
+    match draft.kind {
+        DraftKind::NewFile => {
+            let path = draft.dir.join(&name);
+            if path.exists() {
+                push_toast(state, ToastKind::Error, format!("{name} already exists"));
+                return;
+            }
+            match std::fs::write(&path, b"") {
+                Ok(()) => {
+                    refresh_tree(state);
+                    refresh_changed_files(state);
+                    open_or_focus_file(state, path);
+                    push_flash(state, format!("FILE CREATED // {}", name.to_uppercase()));
+                }
+                Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't create {name}: {err}")),
+            }
+        }
+        DraftKind::NewFolder => {
+            let path = draft.dir.join(&name);
+            if path.exists() {
+                push_toast(state, ToastKind::Error, format!("{name} already exists"));
+                return;
+            }
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    refresh_tree(state);
+                    push_flash(state, format!("FOLDER CREATED // {}", name.to_uppercase()));
+                }
+                Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't create {name}: {err}")),
+            }
+        }
+        DraftKind::Rename => {
+            let Some(old_path) = draft.target else {
+                return;
+            };
+            let new_path = draft.dir.join(&name);
+            if new_path == old_path {
+                return;
+            }
+            if new_path.exists() {
+                push_toast(state, ToastKind::Error, format!("{name} already exists"));
+                return;
+            }
+            match std::fs::rename(&old_path, &new_path) {
+                Ok(()) => {
+                    rename_open_tab(state, &old_path, &new_path);
+                    refresh_tree(state);
+                    refresh_changed_files(state);
+                    push_flash(state, format!("RENAMED // {}", name.to_uppercase()));
+                }
+                Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't rename: {err}")),
+            }
+        }
+    }
+}
+
+/// Updates every open tab (`File` and its matching `Diff`, if any) and
+/// `active_tab` referencing `old_path` to `new_path` in place, instead of
+/// closing and reopening — that would lose unsaved edits, cursor position,
+/// and find state. Re-notifies the LSP server (`didClose` old URI, `didOpen`
+/// new URI) since a server keys documents by URI, not by identity.
+fn rename_open_tab(state: &mut State, old_path: &Path, new_path: &Path) {
+    if find_editor(state, old_path).is_none() {
+        return;
+    }
+    if let Some(sender) = state.lsp_sender.as_mut() {
+        send_did_close(sender, old_path);
+    }
+    if let Some(editor) = find_editor_mut(state, old_path) {
+        editor.document.set_path(new_path.to_path_buf());
+        editor.path = new_path.to_path_buf();
+    }
+    send_did_open_for(state, new_path);
+
+    let old_diff_key = TabKey::Diff(old_path.to_path_buf());
+    let new_diff_key = TabKey::Diff(new_path.to_path_buf());
+    let had_diff_tab = state.open_tabs.iter().any(|t| t.key() == old_diff_key);
+    if had_diff_tab {
+        state.open_tabs.retain(|t| t.key() != old_diff_key);
+        state.open_tabs.push(OpenTab::Diff(new_path.to_path_buf()));
+    }
+
+    let old_file_key = TabKey::File(old_path.to_path_buf());
+    let new_file_key = TabKey::File(new_path.to_path_buf());
+    match state.active_tab {
+        Some(ref key) if *key == old_file_key => state.active_tab = Some(new_file_key),
+        Some(ref key) if *key == old_diff_key => state.active_tab = Some(new_diff_key),
+        _ => {}
+    }
+}
+
+/// Closes every open tab except `active_tab` — the tab-bar overflow menu's
+/// "Close others". Reuses `close_tab` per key (rather than a bulk `retain`)
+/// so LSP `didClose` notifications and diff-tab cleanup still happen.
+fn close_other_tabs(state: &mut State) {
+    let Some(active) = state.active_tab.clone() else {
+        return;
+    };
+    let others: Vec<TabKey> = state.open_tabs.iter().map(|t| t.key()).filter(|k| *k != active).collect();
+    for key in others {
+        close_tab(state, &key);
+    }
+}
+
+/// Expands every ancestor directory of the active file so it's visible in
+/// the tree — the tab-bar overflow menu's "Reveal in tree". Doesn't scroll
+/// the tree to it: `sidebar.rs`'s tree `scrollable` has no stable `.id()`
+/// wired up yet, the same known gap as Ctrl+F's auto-scroll-to-match.
+fn reveal_active_in_tree(state: &mut State) {
+    let Some(path) = active_file_path(state) else {
+        return;
+    };
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if !d.starts_with(&state.root) || d == state.root {
+            break;
+        }
+        state.collapsed_dirs.remove(d);
+        dir = d.parent();
+    }
+}
+
+/// Pops and reopens the most recently closed tab — the tab-bar overflow
+/// menu's "Reopen closed tab". Only tabs explicitly closed via `close_tab`
+/// are on this stack (see `State::closed_tabs`), not ones closed only as a
+/// side effect (a `Diff` tab auto-closed with its backing `File` tab).
+fn reopen_closed_tab(state: &mut State) {
+    while let Some(key) = state.closed_tabs.pop() {
+        match key {
+            TabKey::File(path) => {
+                open_or_focus_file(state, path);
+                return;
+            }
+            TabKey::Diff(path) => {
+                open_or_focus_diff(state, path);
+                return;
+            }
+            TabKey::Search => {}
+        }
+    }
 }
 
 /// Moves the active file tab's find selection by `delta` (wrapping) and
@@ -1091,6 +1475,11 @@ fn close_tab(state: &mut State, key: &TabKey) {
     let Some(pos) = state.open_tabs.iter().position(|t| &t.key() == key) else {
         return;
     };
+    state.closed_tabs.retain(|k| k != key);
+    state.closed_tabs.push(key.clone());
+    if state.closed_tabs.len() > MAX_CLOSED_TABS {
+        state.closed_tabs.remove(0);
+    }
     let removed = state.open_tabs.remove(pos);
     if let OpenTab::File(editor) = &removed {
         if let Some(sender) = state.lsp_sender.as_mut() {
@@ -1385,7 +1774,24 @@ fn global_keys(event: keyboard::Event) -> Message {
                 };
             }
             if c.eq_ignore_ascii_case("w") {
-                return Message::CloseActiveTab;
+                return if modifiers.alt() {
+                    Message::CloseOtherTabs
+                } else {
+                    Message::CloseActiveTab
+                };
+            }
+            if c.eq_ignore_ascii_case("n") {
+                return Message::BeginDraft(if modifiers.shift() {
+                    DraftKind::NewFolder
+                } else {
+                    DraftKind::NewFile
+                });
+            }
+            if modifiers.shift() && c.eq_ignore_ascii_case("e") {
+                return Message::RevealActiveInTree;
+            }
+            if modifiers.shift() && c.eq_ignore_ascii_case("t") {
+                return Message::ReopenClosedTab;
             }
         }
         if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
@@ -1549,5 +1955,119 @@ mod tests {
             .find(|(text, _)| text == "let")
             .expect("`let` should be its own segment");
         assert_eq!(let_segment.1, syntax::HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn commit_draft_new_file_writes_to_disk_and_opens_tab() {
+        let files = TempFiles::new("draft-new-file");
+        let dir = files.a.parent().unwrap().to_path_buf();
+        let mut state = State {
+            draft: Some(Draft {
+                kind: DraftKind::NewFile,
+                dir: dir.clone(),
+                target: None,
+                text: "new.txt".to_string(),
+            }),
+            ..State::default()
+        };
+
+        commit_draft(&mut state);
+
+        assert!(state.draft.is_none(), "a successful commit should clear the draft");
+        let new_path = dir.join("new.txt");
+        assert!(new_path.exists(), "commit_draft should actually write the file to disk");
+        assert_eq!(state.active_tab, Some(TabKey::File(new_path)));
+        assert!(
+            state.flash.as_ref().is_some_and(|f| f.text.contains("FILE CREATED")),
+            "a successful new-file commit should fire the flash pill"
+        );
+    }
+
+    #[test]
+    fn commit_draft_rename_updates_open_tab_path_in_place() {
+        let files = TempFiles::new("draft-rename");
+        let mut state = State::default();
+        open_or_focus_file(&mut state, files.a.clone());
+        let new_path = files.a.with_file_name("renamed.txt");
+        state.draft = Some(Draft {
+            kind: DraftKind::Rename,
+            dir: files.a.parent().unwrap().to_path_buf(),
+            target: Some(files.a.clone()),
+            text: "renamed.txt".to_string(),
+        });
+
+        commit_draft(&mut state);
+
+        assert!(!files.a.exists(), "the old path should no longer exist after a rename");
+        assert!(new_path.exists());
+        assert_eq!(
+            state.active_tab,
+            Some(TabKey::File(new_path.clone())),
+            "the active tab's key should follow the rename, not go stale"
+        );
+        let editor = find_editor(&state, &new_path).expect("the renamed file's tab should still be open, under its new path");
+        assert_eq!(editor.path, new_path);
+        assert_eq!(
+            editor.document.path(),
+            Some(new_path.as_path()),
+            "the document's own path must be repointed too, or a later save would write to the old (now gone) path"
+        );
+    }
+
+    #[test]
+    fn close_other_tabs_keeps_only_the_active_tab() {
+        let files = TempFiles::new("close-others");
+        let mut state = State::default();
+        open_or_focus_file(&mut state, files.a.clone());
+        open_or_focus_file(&mut state, files.b.clone());
+        assert_eq!(state.open_tabs.len(), 2);
+        assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())));
+
+        close_other_tabs(&mut state);
+
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(
+            state.active_tab,
+            Some(TabKey::File(files.b.clone())),
+            "the active tab itself must survive Close Others"
+        );
+    }
+
+    #[test]
+    fn reopen_closed_tab_restores_the_most_recently_closed() {
+        let files = TempFiles::new("reopen");
+        let mut state = State::default();
+        open_or_focus_file(&mut state, files.a.clone());
+        close_tab(&mut state, &TabKey::File(files.a.clone()));
+        assert_eq!(state.open_tabs.len(), 0);
+
+        reopen_closed_tab(&mut state);
+
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())));
+    }
+
+    #[test]
+    fn reveal_active_in_tree_uncollapses_ancestor_dirs() {
+        let files = TempFiles::new("reveal");
+        let root = files.a.parent().unwrap().to_path_buf();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let nested = sub.join("nested.txt");
+        std::fs::write(&nested, "x").unwrap();
+
+        let mut state = State {
+            root: root.clone(),
+            ..State::default()
+        };
+        state.collapsed_dirs.insert(sub.clone());
+        open_or_focus_file(&mut state, nested.clone());
+
+        reveal_active_in_tree(&mut state);
+
+        assert!(
+            !state.collapsed_dirs.contains(&sub),
+            "the active file's parent directory should be expanded so it's actually visible"
+        );
     }
 }

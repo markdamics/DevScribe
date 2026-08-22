@@ -1,17 +1,20 @@
-//! The settings overlay: density and the problem-lens toggle, per the
-//! plan's milestone 8 scope. Rendered as a `stack!` layer over the shell,
-//! same backdrop-modal mechanism as `command_palette`.
+//! The settings overlay: a left-nav modal (`Explorer`/`Editor`/`Toolchains`/
+//! `Keymap`/`Advanced`) matching the mockup's 760x520 shell. Only Explorer
+//! and Editor have real content; the rest are honest placeholders — see
+//! `docs/differences-and-roadmap.md`'s Phase 4 writeup for why. Rendered as
+//! a `stack!` layer over the shell, same backdrop-modal mechanism as
+//! `command_palette`.
 use devscribe_core::theme::{Palette, ThemeName};
 use iced::font::Weight;
-use iced::widget::{button, column, container, mouse_area, row, text, Space};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
 use iced::{Alignment, Border, Color, Element, Length};
 
 use crate::color::color;
 use crate::density::Density;
 use crate::fonts;
 use crate::state::{
-    Message, State, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_STEP,
-    UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
+    Message, SettingsCategory, State, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
+    EDITOR_FONT_SIZE_STEP, UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
 };
 use crate::widgets;
 
@@ -197,12 +200,11 @@ fn density_row(state: &State, p: Palette) -> Element<'static, Message> {
     row(options).spacing(8.0).into()
 }
 
-fn problem_lens_row(state: &State, p: Palette) -> Element<'static, Message> {
-    let enabled = state.problem_lens_enabled;
+fn toggle_row(label: &'static str, enabled: bool, message: Message, p: Palette) -> Element<'static, Message> {
     button(
         row![
             widgets::dot(if enabled { color(p.accent) } else { color(p.text_muted) }, 6.0),
-            text("Show inline problem hints")
+            text(label)
                 .font(fonts::mono(Weight::Medium))
                 .size(crate::text_scale::px(12.0))
                 .color(color(p.text_primary)),
@@ -217,7 +219,7 @@ fn problem_lens_row(state: &State, p: Palette) -> Element<'static, Message> {
     )
     .width(Length::Fill)
     .padding([8.0, 10.0])
-    .on_press(Message::ToggleProblemLens)
+    .on_press(message)
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {
@@ -235,6 +237,111 @@ fn problem_lens_row(state: &State, p: Palette) -> Element<'static, Message> {
         }
     })
     .into()
+}
+
+fn category_nav_row(category: SettingsCategory, active: bool, p: Palette) -> Element<'static, Message> {
+    button(
+        text(category.label())
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(if active { color(p.text_primary) } else { color(p.text_secondary) })
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .padding([8.0, 12.0])
+    .on_press(Message::SetSettingsCategory(category))
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if active {
+                Some(color(p.surface_raised).into())
+            } else if hovered {
+                Some(color(p.surface_hover).into())
+            } else {
+                None
+            },
+            border: Border {
+                color: if active { color(p.line_accent) } else { Color::TRANSPARENT },
+                width: 1.0,
+                radius: 2.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
+fn category_nav(state: &State, p: Palette) -> Element<'static, Message> {
+    let rows: Vec<Element<'static, Message>> = SettingsCategory::ALL
+        .into_iter()
+        .map(|category| category_nav_row(category, state.settings_category == category, p))
+        .collect();
+
+    container(column(rows).spacing(2.0).padding(8.0))
+        .width(Length::Fixed(168.0))
+        .height(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(color(p.bg_void).into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Everything the mockup's "Explorer" category holds: appearance settings
+/// that aren't specific to the code editor itself (theme, chrome density,
+/// UI text scale) plus the two Phase-2/3 toggles the mockup places here too
+/// — "Git status in tree" and inline problem hints, the latter moved from
+/// DevScribe's old flat panel where it sat under an "Editor" label that
+/// didn't match the mockup's own categorization.
+fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
+    column![
+        column![section_label("THEME", p), theme_grid(state, p)].spacing(8.0),
+        column![section_label("ROW DENSITY", p), density_row(state, p)].spacing(8.0),
+        column![section_label("UI TEXT SIZE", p), ui_scale_row(state, p)].spacing(8.0),
+        column![
+            section_label("GIT", p),
+            toggle_row("Show git status in tree", state.git_status_in_tree, Message::ToggleGitStatusInTree, p),
+        ]
+        .spacing(8.0),
+        column![
+            section_label("DIAGNOSTICS", p),
+            toggle_row("Show inline problem hints", state.problem_lens_enabled, Message::ToggleProblemLens, p),
+        ]
+        .spacing(8.0),
+    ]
+    .spacing(20.0)
+    .into()
+}
+
+fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
+    column![column![section_label("FONT SIZE", p), font_size_row(state, p)].spacing(8.0)]
+        .spacing(20.0)
+        .into()
+}
+
+fn placeholder_content(category: SettingsCategory, p: Palette) -> Element<'static, Message> {
+    container(
+        text(format!("{} settings aren't available yet.", category.label()))
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_muted)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center(Length::Fill)
+    .into()
+}
+
+fn category_content(state: &State, p: Palette) -> Element<'static, Message> {
+    let content = match state.settings_category {
+        SettingsCategory::Explorer => explorer_content(state, p),
+        SettingsCategory::Editor => editor_content(state, p),
+        category => return placeholder_content(category, p),
+    };
+    scrollable(container(content).width(Length::Fill).padding(20.0))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 pub fn view(state: &State) -> Option<Element<'static, Message>> {
@@ -256,26 +363,17 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
             .on_press(Message::CloseSettings)
             .style(|_theme, _status| button::Style::default()),
     ]
-    .align_y(Alignment::Center);
+    .align_y(Alignment::Center)
+    .padding([12.0, 16.0]);
 
-    let body = column![
-        header,
-        widgets::hline(color(p.line_neutral)),
-        column![section_label("THEME", p), theme_grid(state, p)].spacing(8.0),
-        column![section_label("DENSITY", p), density_row(state, p)].spacing(8.0),
-        column![section_label("UI TEXT SIZE", p), ui_scale_row(state, p)].spacing(8.0),
-        column![
-            section_label("EDITOR", p),
-            font_size_row(state, p),
-            problem_lens_row(state, p),
-        ]
-        .spacing(8.0),
-    ]
-    .spacing(16.0)
-    .padding(16.0);
+    let split = row![category_nav(state, p), widgets::vline(color(p.line_neutral)), category_content(state, p)]
+        .height(Length::Fill);
+
+    let body = column![header, widgets::hline(color(p.line_neutral)), split];
 
     let panel = container(body)
-        .width(Length::Fixed(440.0))
+        .width(Length::Fixed(760.0))
+        .height(Length::Fixed(520.0))
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_panel).into()),
             border: Border {

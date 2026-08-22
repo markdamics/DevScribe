@@ -1,7 +1,9 @@
 pub mod command_palette;
+pub mod context_menu;
 pub mod diff_view;
 pub mod editor_canvas;
 pub mod find_bar;
+pub mod flash;
 pub mod json_view;
 pub mod logo_mark;
 pub mod search_icon;

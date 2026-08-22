@@ -61,6 +61,13 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// Repoints this document at `path` without touching its buffer —
+    /// used after a filesystem rename so a subsequent `save()` writes to the
+    /// new location instead of the (now nonexistent) old one.
+    pub fn set_path(&mut self, path: std::path::PathBuf) {
+        self.path = Some(path);
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

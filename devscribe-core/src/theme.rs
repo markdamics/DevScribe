@@ -46,10 +46,14 @@ pub enum ThemeName {
     Meridian,
     /// Achromatic. No hue except danger. Maximum contrast, e-ink and projection.
     Stark,
+    /// Ink black + vermillion / gold. Sumi-e ink wash, dark.
+    Sumi,
+    /// Washi paper + vermillion / indigo. Japanese stationery, light.
+    Washi,
 }
 
 impl ThemeName {
-    pub const ALL: [ThemeName; 8] = [
+    pub const ALL: [ThemeName; 10] = [
         ThemeName::NullGrid,
         ThemeName::Gantry,
         ThemeName::Abyssal,
@@ -58,6 +62,8 @@ impl ThemeName {
         ThemeName::Verdigris,
         ThemeName::Meridian,
         ThemeName::Stark,
+        ThemeName::Sumi,
+        ThemeName::Washi,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -70,6 +76,8 @@ impl ThemeName {
             ThemeName::Verdigris => "VERDIGRIS",
             ThemeName::Meridian => "MERIDIAN",
             ThemeName::Stark => "STARK",
+            ThemeName::Sumi => "SUMI",
+            ThemeName::Washi => "WASHI",
         }
     }
 }
@@ -454,6 +462,88 @@ pub const fn palette(theme: ThemeName) -> Palette {
 
             grid_line: Rgba::hex_a(0xffffff, 0.06),
             grid_dot: Rgba::hex_a(0xffffff, 0.16),
+        },
+        ThemeName::Sumi => Palette {
+            bg_void: Rgba::hex(0x0a0908),
+            bg_panel: Rgba::hex(0x121110),
+            bg_panel_2: Rgba::hex(0x1a1815),
+            bg_inset: Rgba::hex(0x0d0c0a),
+            bg_scrim: Rgba::hex_a(0x060504, 0.74),
+
+            surface_glass: Rgba::hex_a(0x1a1815, 0.64),
+            surface_raised: Rgba::hex(0x211e19),
+            surface_hover: Rgba::hex_a(0xd0462c, 0.08),
+
+            text_primary: Rgba::hex(0xece6dc),
+            text_secondary: Rgba::hex(0xa89a86),
+            text_muted: Rgba::hex(0x6e6255),
+            text_on_accent: Rgba::hex(0xfff3ec),
+
+            line_hair: Rgba::hex_a(0xd0462c, 0.12),
+            line_neutral: Rgba::hex_a(0xe0d4c0, 0.14),
+            line_strong: Rgba::hex_a(0xe0d4c0, 0.30),
+            line_accent: Rgba::hex_a(0xd0462c, 0.6),
+
+            accent: Rgba::hex(0xd0462c),
+            accent_dim: Rgba::hex(0xa3341f),
+            accent_soft: Rgba::hex_a(0xd0462c, 0.15),
+            accent_glow: Rgba::hex_a(0xd0462c, 0.36),
+            accent_2: Rgba::hex(0xc9a227),
+            accent_2_soft: Rgba::hex_a(0xc9a227, 0.14),
+
+            status_ok: Rgba::hex(0x6fae52),
+            status_warn: Rgba::hex(0xc9a227),
+            status_danger: Rgba::hex(0xe2432a),
+            status_info: Rgba::hex(0x5fa0c4),
+            status_idle: Rgba::hex(0x6e6255),
+            status_ok_soft: Rgba::hex_a(0x6fae52, 0.14),
+            status_warn_soft: Rgba::hex_a(0xc9a227, 0.14),
+            status_danger_soft: Rgba::hex_a(0xe2432a, 0.14),
+            status_info_soft: Rgba::hex_a(0x5fa0c4, 0.14),
+
+            grid_line: Rgba::hex_a(0xe0d4c0, 0.055),
+            grid_dot: Rgba::hex_a(0xe0d4c0, 0.13),
+        },
+        ThemeName::Washi => Palette {
+            bg_void: Rgba::hex(0xded5c0),
+            bg_panel: Rgba::hex(0xf4efe0),
+            bg_panel_2: Rgba::hex(0xe8e0cb),
+            bg_inset: Rgba::hex(0xdcd3bd),
+            bg_scrim: Rgba::hex_a(0x332a1c, 0.42),
+
+            surface_glass: Rgba::hex_a(0xf4efe0, 0.74),
+            surface_raised: Rgba::hex(0xfffaf0),
+            surface_hover: Rgba::hex_a(0xc9432c, 0.07),
+
+            text_primary: Rgba::hex(0x1c1712),
+            text_secondary: Rgba::hex(0x52493c),
+            text_muted: Rgba::hex(0x8a8067),
+            text_on_accent: Rgba::hex(0xfff6ee),
+
+            line_hair: Rgba::hex_a(0x1c1712, 0.10),
+            line_neutral: Rgba::hex_a(0x1c1712, 0.16),
+            line_strong: Rgba::hex_a(0x1c1712, 0.34),
+            line_accent: Rgba::hex_a(0xc9432c, 0.65),
+
+            accent: Rgba::hex(0xc9432c),
+            accent_dim: Rgba::hex(0x9c331f),
+            accent_soft: Rgba::hex_a(0xc9432c, 0.12),
+            accent_glow: Rgba::hex_a(0xc9432c, 0.20),
+            accent_2: Rgba::hex(0x2f5a86),
+            accent_2_soft: Rgba::hex_a(0x2f5a86, 0.12),
+
+            status_ok: Rgba::hex(0x1f7a4d),
+            status_warn: Rgba::hex(0x9a6a00),
+            status_danger: Rgba::hex(0xb3251d),
+            status_info: Rgba::hex(0x2a5a86),
+            status_idle: Rgba::hex(0x8a8067),
+            status_ok_soft: Rgba::hex_a(0x1f7a4d, 0.11),
+            status_warn_soft: Rgba::hex_a(0x9a6a00, 0.11),
+            status_danger_soft: Rgba::hex_a(0xb3251d, 0.11),
+            status_info_soft: Rgba::hex_a(0x2a5a86, 0.11),
+
+            grid_line: Rgba::hex_a(0x1c1712, 0.06),
+            grid_dot: Rgba::hex_a(0x1c1712, 0.16),
         },
     }
 }

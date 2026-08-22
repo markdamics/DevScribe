@@ -1,8 +1,8 @@
 use devscribe_core::theme::Palette;
 use iced::alignment::Vertical;
 use iced::font::Weight;
-use iced::widget::{button, canvas, container, row, text};
-use iced::{Alignment, Color, Element, Length, Padding};
+use iced::widget::{button, canvas, column, container, mouse_area, row, text, Space};
+use iced::{Alignment, Border, Color, Element, Length, Padding};
 
 use crate::color::color;
 use crate::density::Density;
@@ -233,4 +233,91 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+fn overflow_row(label: &'static str, shortcut: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    button(
+        row![
+            text(label)
+                .font(fonts::sans(Weight::Medium))
+                .size(crate::text_scale::px(12.0))
+                .color(color(p.text_primary))
+                .width(Length::Fill),
+            text(shortcut)
+                .font(fonts::mono(Weight::Medium))
+                .size(crate::text_scale::px(10.0))
+                .color(color(p.text_muted)),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([6.0, 8.0])
+    .on_press(message)
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered {
+                Some(color(p.bg_panel).into())
+            } else {
+                None
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
+/// The `⋯` button's dropdown: Close others / Reveal in tree / Reopen closed
+/// tab — real, undecorated actions (see `state.rs`'s `close_other_tabs`/
+/// `reveal_active_in_tree`/`reopen_closed_tab`). Deliberately omits the
+/// mockup's "Split right" row: no split-pane state exists anywhere, and the
+/// mockup's own `onClick` for it just closes the menu — same
+/// not-a-real-build-target treatment as the window control buttons (see the
+/// roadmap's item 7). Rendered as a top-level `stack!` layer, same
+/// backdrop-close pattern as `settings_panel`/`command_palette`/
+/// `context_menu`, positioned under the tab bar's own `⋯` button.
+pub fn overflow_menu(state: &State, p: Palette) -> Option<Element<'static, Message>> {
+    if !state.overflow_open {
+        return None;
+    }
+
+    let menu = container(
+        column![
+            overflow_row("Close others", "\u{2325}\u{2318}W", Message::CloseOtherTabs, p),
+            overflow_row("Reveal in tree", "\u{21e7}\u{2318}E", Message::RevealActiveInTree, p),
+            overflow_row("Reopen closed tab", "\u{21e7}\u{2318}T", Message::ReopenClosedTab, p),
+        ]
+        .spacing(2.0)
+        .padding(6.0),
+    )
+    .width(Length::Fixed(214.0))
+    .style(move |_theme| container::Style {
+        background: Some(color(p.surface_raised).into()),
+        border: Border {
+            color: color(p.line_neutral),
+            width: 1.0,
+            radius: 2.0.into(),
+        },
+        ..container::Style::default()
+    });
+
+    let positioned = container(menu)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_right(Length::Fill)
+        .padding(Padding {
+            top: state.density.title_bar_h() + state.density.tab_bar_h() + 4.0,
+            right: 8.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+
+    let backdrop = mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::ToggleOverflow);
+
+    Some(iced::widget::stack![backdrop, positioned].into())
 }
