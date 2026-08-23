@@ -9,7 +9,7 @@ use crate::state::{self, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
     command_palette, context_menu, diff_view, find_bar, flash, json_view, search_view,
-    settings_panel, sidebar, status_bar, tab_bar, title_bar, toast,
+    settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
 
@@ -135,6 +135,15 @@ pub fn view(state: &State) -> Element<'static, Message> {
 
     let p = palette(state.theme);
 
+    // No project open — the welcome screen replaces the whole editor
+    // (title bar included: the window still has default OS decorations,
+    // confirmed in `main.rs`, so this doesn't lose window-move/close
+    // controls), matching the mockup's own full-window
+    // `position:fixed;inset:0` welcome overlay.
+    if state.welcome_open {
+        return welcome::view(state, p);
+    }
+
     let main_column = column![
         tab_bar::view(state, p),
         content_area(state, p),
@@ -164,6 +173,7 @@ pub fn view(state: &State) -> Element<'static, Message> {
     layers.extend(command_palette::view(state));
     layers.extend(settings_panel::view(state));
     layers.extend(tab_bar::overflow_menu(state, p));
+    layers.extend(sidebar::projects_menu(state, p));
     layers.extend(context_menu::view(state, p));
     layers.extend(toast::view(state));
     layers.extend(flash::view(state));

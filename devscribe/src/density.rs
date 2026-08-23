@@ -4,8 +4,8 @@
 //! setting's job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Density {
-    Spacious,
     #[default]
+    Spacious,
     Comfortable,
     Compact,
 }

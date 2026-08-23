@@ -7,27 +7,54 @@
 pub struct SearchHit {
     /// 0-based line number.
     pub line: usize,
-    /// 0-based char column of the match's start — in both the original line
-    /// (for placing a cursor in the real buffer) *and* `preview` (for
-    /// highlighting the match within it). Only safe because `preview` keeps
-    /// leading whitespace; see its doc.
+    /// 0-based char column of the match's start in the **original line** —
+    /// for placing a cursor in the real buffer (`SearchResultSelected`).
+    /// Not an offset into `preview` — see `preview_col` for that. A real
+    /// project can have a line with hundreds of thousands or millions of
+    /// characters (a minified bundle, a huge generated/embedded blob — this
+    /// crate's own design mockup is one such file), so `preview` is
+    /// deliberately *not* "the whole line" the way `col` still refers to
+    /// the whole line; the two used to share one offset back when preview
+    /// always was the full line, but that made a single match on a
+    /// pathological line render as a text widget with over a million
+    /// characters in it — no text-shaping/layout engine handles that
+    /// gracefully, GPU-accelerated or not.
     pub col: usize,
-    /// The matched line, with trailing whitespace trimmed but leading
-    /// whitespace kept — deliberately, so `col` indexes correctly into both
-    /// this and the original line without two different offsets.
+    /// A short, render-safe snippet of the line *around* the match — never
+    /// the whole line — with leading whitespace kept and trailing
+    /// whitespace trimmed. Truncated ends get a `…` marker.
     pub preview: String,
+    /// 0-based char column of the match's start **within `preview`**
+    /// (distinct from `col` whenever the window doesn't start at the
+    /// original line's own start — i.e. almost always once a leading `…`
+    /// is involved). This is what actually indexes into `preview` for
+    /// highlighting; `col` no longer safely does.
+    pub preview_col: usize,
 }
 
+/// Chars of context kept on each side of the match within `preview` — small
+/// enough that even a worst-case line (all 4-byte UTF-8 chars either side)
+/// keeps `preview` at a few hundred bytes, not a few hundred thousand.
+const PREVIEW_CONTEXT_CHARS: usize = 60;
+
 /// Case-insensitive (ASCII-only, to keep byte/char offsets in lockstep)
-/// substring search across every line of `text`.
-pub fn search_text(text: &str, query: &str) -> Vec<SearchHit> {
-    if query.is_empty() {
+/// substring search across every line of `text`, stopping once `max_hits`
+/// matches have been found.
+///
+/// `max_hits` isn't just a nicety for a huge project — it bounds the *work*
+/// this function does, not merely how many results a caller keeps. Without
+/// a cap applied *during* the scan, one large file matched many times would
+/// fully materialize every match before a caller's own results cap ever
+/// got a chance to apply — a real crash risk, not a hypothetical one,
+/// since this runs on every search.
+pub fn search_text(text: &str, query: &str, max_hits: usize) -> Vec<SearchHit> {
+    if query.is_empty() || max_hits == 0 {
         return Vec::new();
     }
     let query_lower = query.to_ascii_lowercase();
 
     let mut hits = Vec::new();
-    for (line_idx, line) in text.lines().enumerate() {
+    'lines: for (line_idx, line) in text.lines().enumerate() {
         let line_lower = line.to_ascii_lowercase();
         let mut start = 0;
         while start <= line_lower.len() {
@@ -36,64 +63,61 @@ pub fn search_text(text: &str, query: &str) -> Vec<SearchHit> {
             };
             let byte_col = start + pos;
             let col = line[..byte_col].chars().count();
-            hits.push(SearchHit {
-                line: line_idx,
-                col,
-                preview: line.trim_end().to_string(),
-            });
+            let (preview, preview_col) = windowed_preview(line, byte_col, query_lower.len());
+            hits.push(SearchHit { line: line_idx, col, preview, preview_col });
+            if hits.len() >= max_hits {
+                break 'lines;
+            }
             start = byte_col + query_lower.len().max(1);
         }
     }
     hits
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Builds a bounded `(preview, preview_col)` around the match at byte
+/// offset `match_start`/length `match_len` in `line` — up to
+/// `PREVIEW_CONTEXT_CHARS` of context on each side, with a `…` marker
+/// wherever a side got cut. Windowing happens in *bytes* first (cheap: no
+/// scan of the whole line needed, just nudging two candidate offsets to the
+/// nearest valid UTF-8 boundary), which already upper-bounds the resulting
+/// char count — a byte-bounded slice can never contain more chars than
+/// bytes — so there's no separate char-length pass needed after.
+fn windowed_preview(line: &str, match_start: usize, match_len: usize) -> (String, usize) {
+    // 4 bytes/char covers every UTF-8 scalar value, so this many bytes of
+    // context can never be trimmed down to fewer than `PREVIEW_CONTEXT_CHARS`
+    // chars by the boundary-nudging below.
+    let context_bytes = PREVIEW_CONTEXT_CHARS * 4;
 
-    #[test]
-    fn finds_single_match() {
-        let hits = search_text("fn main() {\n    let x = 1;\n}\n", "let");
-        assert_eq!(hits, vec![SearchHit { line: 1, col: 4, preview: "    let x = 1;".into() }]);
+    let mut window_start = match_start.saturating_sub(context_bytes);
+    while window_start < match_start && !line.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let mut window_end = (match_start + match_len + context_bytes).min(line.len());
+    while window_end < line.len() && !line.is_char_boundary(window_end) {
+        window_end += 1;
     }
 
-    #[test]
-    fn col_indexes_correctly_into_preview() {
-        // `preview` must keep leading whitespace so `col` (measured against
-        // the original line, for cursor placement) also correctly indexes
-        // into `preview` (for highlighting the match within it) — a single
-        // offset serving both consumers, not two that happen to agree only
-        // when there's no leading whitespace. `col` is a *char* offset (see
-        // its doc), so this indexes char-wise, not by byte — the safe way
-        // for any consumer, since line content isn't guaranteed ASCII even
-        // though query-matching is.
-        let hits = search_text("\t\t  let x = 1;", "let");
-        let hit = &hits[0];
-        let matched: String = hit.preview.chars().skip(hit.col).take(3).collect();
-        assert_eq!(matched, "let");
+    let truncated_start = window_start > 0;
+    // Trimming trailing whitespace can only move this earlier, never past
+    // `window_end`, so it can't undo the truncation check above.
+    let slice = line[window_start..window_end].trim_end();
+    let truncated_end = window_end < line.len();
+
+    let mut preview = String::with_capacity(slice.len() + 6);
+    let mut preview_col = 0;
+    if truncated_start {
+        preview.push('\u{2026}');
+        preview_col += 1;
+    }
+    preview_col += line[window_start..match_start].chars().count();
+    preview.push_str(slice);
+    if truncated_end {
+        preview.push('\u{2026}');
     }
 
-    #[test]
-    fn is_case_insensitive() {
-        let hits = search_text("Hello World", "world");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].col, 6);
-    }
-
-    #[test]
-    fn finds_multiple_matches_on_one_line() {
-        let hits = search_text("aa aa aa", "aa");
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits.iter().map(|h| h.col).collect::<Vec<_>>(), vec![0, 3, 6]);
-    }
-
-    #[test]
-    fn empty_query_matches_nothing() {
-        assert!(search_text("anything", "").is_empty());
-    }
-
-    #[test]
-    fn no_match_returns_empty() {
-        assert!(search_text("hello", "xyz").is_empty());
-    }
+    (preview, preview_col)
 }
+
+#[cfg(test)]
+#[path = "tests/search.rs"]
+mod tests;

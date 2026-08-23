@@ -1,8 +1,18 @@
 //! Project-wide text search: results grouped by file, each match line
-//! syntax-colored with the matched term highlighted, plus a stats line.
-//! Naive (re-scans every file in the sidebar tree on submit) — see
+//! shown plain with the matched term itself highlighted, plus a stats
+//! line. Naive (re-scans every file in the sidebar tree) — see
 //! `devscribe_core::search` for why that's an acceptable starting point.
-use devscribe_core::syntax::HighlightKind;
+//! Debounced and backgrounded, VSCode-style: typing schedules a search a
+//! short pause later (`state::SEARCH_DEBOUNCE_DELAY`) rather than running
+//! one per keystroke or waiting on Enter, and it runs on its own thread
+//! (`state::start_search`) so it can never freeze this UI, no matter how
+//! slow the underlying file reads turn out to be.
+//!
+//! Deliberately *not* syntax-colored (an earlier version ran the full
+//! syntax highlighter once per matching file) — that was real, uncapped
+//! CPU cost that scaled with how many files a broad query touched, capable
+//! of making a single search hang the UI thread on a large project. See
+//! `docs/differences-and-roadmap.md`'s search bug-fix writeup.
 use devscribe_core::theme::Palette;
 use iced::font::Weight;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
@@ -12,7 +22,6 @@ use std::path::Path;
 use crate::color::color;
 use crate::fonts;
 use crate::state::{Message, SearchResult, State};
-use crate::ui::editor_canvas;
 use crate::widgets;
 
 fn query_box(p: Palette, query: &str) -> Element<'static, Message> {
@@ -52,7 +61,7 @@ fn stats_row(state: &State, p: Palette) -> Element<'static, Message> {
     let ms = state.search_elapsed.as_millis();
 
     row![
-        text(format!("Results for \u{201c}{}\u{201d}", state.search_query))
+        text(format!("Results for \u{201c}{}\u{201d}", state.search_last_query))
             .font(fonts::sans(Weight::Semibold))
             .size(crate::text_scale::px(14.0))
             .color(color(p.text_primary)),
@@ -66,59 +75,34 @@ fn stats_row(state: &State, p: Palette) -> Element<'static, Message> {
     .into()
 }
 
-/// Splits `segments` (or, if empty, `preview` as one flat run) at the
-/// `[match_start, match_start + match_len)` char range, resolving each
-/// piece's syntax color and wrapping the matched piece in an
-/// accent-tinted background — reuses `editor_canvas`'s highlight→color
-/// mapping so search previews and the editor agree on token colors.
-fn match_line_runs(
-    segments: &[(String, HighlightKind)],
-    preview: &str,
-    match_start: usize,
-    match_len: usize,
-    p: Palette,
-) -> Vec<Element<'static, Message>> {
-    let owned;
-    let base: &[(String, HighlightKind)] = if segments.is_empty() {
-        owned = vec![(preview.to_string(), HighlightKind::Default)];
-        &owned
-    } else {
-        segments
-    };
+/// Splits `preview` into up to three plain runs at the
+/// `[match_start, match_start + match_len)` char range, wrapping the
+/// matched piece in an accent-tinted background. `match_start`/`match_len`
+/// are char offsets (see `SearchHit::col`'s doc), so this indexes
+/// char-wise via a collected `Vec<char>`, not by byte.
+fn match_line_runs(preview: &str, match_start: usize, match_len: usize, p: Palette) -> Vec<Element<'static, Message>> {
+    let chars: Vec<char> = preview.chars().collect();
+    let len = chars.len();
+    let run_color = color(p.text_secondary);
 
-    let match_end = match_start + match_len;
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-
-    for (seg_text, kind) in base {
-        let seg_len = seg_text.chars().count();
-        let seg_start = cursor;
-        let seg_end = cursor + seg_len;
-        cursor = seg_end;
-
-        let run_color = editor_canvas::highlight_color(*kind, p);
-
-        if match_len == 0 || match_end <= seg_start || match_start >= seg_end {
-            out.push(plain_run(seg_text.clone(), run_color));
-            continue;
-        }
-
-        let chars: Vec<char> = seg_text.chars().collect();
-        let local_start = match_start.saturating_sub(seg_start).min(seg_len);
-        let local_end = match_end.saturating_sub(seg_start).min(seg_len);
-
-        if local_start > 0 {
-            out.push(plain_run(chars[..local_start].iter().collect(), run_color));
-        }
-        if local_end > local_start {
-            let matched: String = chars[local_start..local_end].iter().collect();
-            out.push(matched_run(matched, run_color, p));
-        }
-        if local_end < seg_len {
-            out.push(plain_run(chars[local_end..].iter().collect(), run_color));
-        }
+    if match_len == 0 {
+        return vec![plain_run(preview.to_string(), run_color)];
     }
 
+    let local_start = match_start.min(len);
+    let local_end = (match_start + match_len).min(len);
+
+    let mut out = Vec::new();
+    if local_start > 0 {
+        out.push(plain_run(chars[..local_start].iter().collect(), run_color));
+    }
+    if local_end > local_start {
+        let matched: String = chars[local_start..local_end].iter().collect();
+        out.push(matched_run(matched, color(p.text_primary), p));
+    }
+    if local_end < len {
+        out.push(plain_run(chars[local_end..].iter().collect(), run_color));
+    }
     out
 }
 
@@ -162,13 +146,11 @@ fn match_row(result: &SearchResult, p: Palette) -> Element<'static, Message> {
         })
         .width(Length::Fixed(28.0));
 
-    let runs = match_line_runs(
-        &result.segments,
-        &result.hit.preview,
-        result.hit.col,
-        result.query_len_chars,
-        p,
-    );
+    // `preview_col`, not `col` — `col` is the match's position in the real
+    // (possibly enormous) line, for cursor placement below; `preview` is a
+    // windowed, possibly-truncated snippet of it, and only `preview_col`
+    // indexes correctly into that. See `SearchHit`'s doc.
+    let runs = match_line_runs(&result.hit.preview, result.hit.preview_col, result.query_len_chars, p);
 
     let content = row![gutter, row(runs)].spacing(12.0).align_y(Alignment::Center);
 
@@ -243,8 +225,21 @@ fn group_by_file(results: &[SearchResult]) -> Vec<(&Path, Vec<&SearchResult>)> {
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     let input = container(query_box(p, &state.search_query)).padding(12.0);
 
+    // Search is debounced and backgrounded (see this module's doc), so
+    // `search_results`/`search_last_query` can lag behind whatever's
+    // currently typed — these extra arms cover that gap. Without them,
+    // editing past a query that had results would either show those stale
+    // results under the *new* query's label, or (once cleared) claim "No
+    // matches" for a query that was never actually searched — both
+    // actively misleading, not just stale.
     let body: Element<'static, Message> = if state.search_query.is_empty() {
-        widgets::placeholder("Type a query and press Enter", p)
+        widgets::placeholder("Type to search project files", p)
+    } else if state.search_in_progress {
+        widgets::placeholder(format!("Searching for \u{201c}{}\u{201d}\u{2026}", state.search_query), p)
+    } else if state.search_query != state.search_last_query {
+        // Typed, but the debounce window hasn't fired yet — Enter jumps
+        // straight there instead of waiting it out.
+        widgets::placeholder(format!("Press Enter to search for \u{201c}{}\u{201d} now", state.search_query), p)
     } else if state.search_results.is_empty() {
         widgets::placeholder(format!("No matches for \u{201c}{}\u{201d}", state.search_query), p)
     } else {

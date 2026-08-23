@@ -9,6 +9,7 @@ use iced::{Alignment, Border, Element, Length, Padding};
 use crate::color::color;
 use crate::fonts;
 use crate::state::{Message, State, Toast, ToastKind};
+use crate::widgets;
 
 fn toast_card(toast: &Toast, p: Palette) -> Element<'static, Message> {
     let accent = match toast.kind {
@@ -17,11 +18,13 @@ fn toast_card(toast: &Toast, p: Palette) -> Element<'static, Message> {
         ToastKind::Error => p.status_danger,
     };
 
-    let dismiss = button(text("\u{2715}").size(crate::text_scale::px(10.0)).color(color(p.text_muted)))
-        .padding(0.0)
-        .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0))
-        .on_press(Message::DismissToast(toast.id))
+    let dismiss = button(widgets::center_fill(
+        text("\u{2715}").size(crate::text_scale::px(10.0)).color(color(p.text_muted)),
+    ))
+    .padding(0.0)
+    .width(Length::Fixed(16.0))
+    .height(Length::Fixed(16.0))
+    .on_press(Message::DismissToast(toast.id))
         .style(|_theme, _status| button::Style::default());
 
     let content = row![

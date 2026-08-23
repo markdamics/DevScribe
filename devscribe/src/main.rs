@@ -2,6 +2,9 @@ mod color;
 mod density;
 mod fonts;
 mod fs_tree;
+mod logging;
+mod recent_projects;
+mod settings;
 mod state;
 mod text_scale;
 mod ui;
@@ -25,12 +28,15 @@ fn window_icon() -> window::Icon {
 }
 
 pub fn main() -> iced::Result {
+    logging::init();
+
     let mut app = iced::application(State::default, state::update, view)
         .title("DevScribe")
         .default_font(fonts::sans(Weight::Normal))
         .subscription(state::subscription)
         .window(window::Settings {
             icon: Some(window_icon()),
+            maximized: true,
             ..window::Settings::default()
         })
         .window_size((1280.0, 800.0));

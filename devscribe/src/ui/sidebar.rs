@@ -2,7 +2,7 @@ use devscribe_core::git::ChangeKind;
 use devscribe_core::theme::{Palette, Rgba};
 use iced::alignment::Vertical;
 use iced::font::Weight;
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Border, Color, Element, Length, Padding};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::color::color;
 use crate::fonts;
 use crate::fs_tree::Node;
-use crate::state::{ChangesEntry, Draft, DraftKind, Message, State};
+use crate::state::{self, ChangesEntry, Draft, DraftKind, Message, State};
 use crate::widgets;
 
 fn tint(c: Rgba, alpha: f32) -> Color {
@@ -76,7 +76,7 @@ fn draft_editor_row(draft: &Draft, depth: usize, row_h: f32, p: Palette) -> Elem
             selection: tint(p.accent, 0.35),
         });
 
-    let cancel = button(text("\u{2715}").size(crate::text_scale::px(9.0)))
+    let cancel = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(9.0))))
         .padding(0.0)
         .width(Length::Fixed(15.0))
         .height(Length::Fixed(15.0))
@@ -266,22 +266,50 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
     }
 }
 
-fn shorten_home(path: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME")
-        && let Ok(rest) = path.strip_prefix(&home)
-    {
-        return format!("~/{}", rest.display());
+/// The branch name (+ `▲a ▼b` ahead/behind, when there's an upstream to
+/// compare against) or, when `state.repo` is `None`, a "No repository" row
+/// — replacing what used to be nothing at all here (the only place a
+/// repo-less project said so was the footer and the status bar).
+fn git_status_row(state: &State, p: Palette) -> Element<'static, Message> {
+    let Some(repo) = state.repo.as_ref() else {
+        return text("No repository")
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(10.0))
+            .color(color(p.text_muted))
+            .into();
+    };
+
+    let branch = repo.branch_name().unwrap_or_else(|| "detached HEAD".to_string());
+    let mut contents = row![
+        text(branch)
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(10.0))
+            .color(color(p.text_muted))
+            .width(Length::Fill),
+    ]
+    .spacing(6.0)
+    .align_y(Alignment::Center);
+
+    if let Some((ahead, behind)) = state.ahead_behind {
+        contents = contents.push(
+            text(format!("\u{25b2}{ahead} \u{25bc}{behind}"))
+                .font(fonts::mono(Weight::Medium))
+                .size(crate::text_scale::px(10.0))
+                .color(color(p.text_muted)),
+        );
     }
-    path.display().to_string()
+
+    contents.into()
 }
 
-fn project_switcher(p: Palette, root: &Path) -> Element<'static, Message> {
+fn project_switcher(state: &State, p: Palette) -> Element<'static, Message> {
+    let root = &state.root;
     let (badge_fg, badge_bg) = (color(p.accent), tint(p.accent, 0.18));
     let name = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".into());
-    let path_label = shorten_home(root);
+    let path_label = state::shorten_home(root);
 
     let header = button(
         row![
@@ -318,7 +346,9 @@ fn project_switcher(p: Palette, root: &Path) -> Element<'static, Message> {
         }
     });
 
-    let block = column![header].spacing(4.0).padding([12.0, 12.0]);
+    let git_row = container(git_status_row(state, p)).padding([0.0, 4.0]);
+
+    let block = column![header, git_row].spacing(6.0).padding([12.0, 12.0]);
 
     container(block)
         .width(Length::Fill)
@@ -331,6 +361,143 @@ fn project_switcher(p: Palette, root: &Path) -> Element<'static, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+fn project_row(row_data: &state::WelcomeRow, is_current: bool, p: Palette) -> Element<'static, Message> {
+    let (fg, bg) = row_data.lang.badge(p);
+    let right: Element<'static, Message> = if is_current {
+        text("open")
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(10.0))
+            .color(color(p.accent))
+            .into()
+    } else {
+        text(row_data.last_opened_label.clone())
+            .font(fonts::mono(Weight::Light))
+            .size(crate::text_scale::px(10.0))
+            .color(color(p.text_muted))
+            .into()
+    };
+
+    let content = row![
+        widgets::lang_badge(row_data.lang.code(&row_data.path), fg, bg),
+        text(row_data.name.clone())
+            .font(fonts::sans(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_primary))
+            .width(Length::Fill),
+        right,
+    ]
+    .spacing(8.0)
+    .align_y(Alignment::Center);
+
+    let path = row_data.path.clone();
+    button(content)
+        .width(Length::Fill)
+        .padding([6.0, 8.0])
+        .on_press(Message::RecentProjectPicked(path))
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if is_current {
+                    Some(tint(p.accent, 0.16).into())
+                } else if hovered {
+                    Some(color(p.bg_panel).into())
+                } else {
+                    None
+                },
+                text_color: color(p.text_primary),
+                border: Border { color: color(p.line_neutral), width: 0.0, radius: 2.0.into() },
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
+fn projects_menu_row(glyph: &'static str, label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    button(
+        row![
+            text(glyph).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(11.0)).width(Length::Fixed(18.0)),
+            text(label).font(fonts::sans(Weight::Medium)).size(crate::text_scale::px(12.0)),
+        ]
+        .spacing(8.0)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([6.0, 8.0])
+    .on_press(message)
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered { Some(color(p.bg_panel).into()) } else { None },
+            text_color: if hovered { color(p.text_primary) } else { color(p.text_muted) },
+            border: Border { color: color(p.line_neutral), width: 0.0, radius: 2.0.into() },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
+/// The project switcher header's dropdown: every recent project (current
+/// one pinned first, marked "open"; picking another switches straight to
+/// it), then "Open folder…" and "Close project" (back to the welcome
+/// screen) — matches the mockup's `PROJECTS` dropdown. Same backdrop +
+/// positioned-`container` pattern as `tab_bar::overflow_menu`, anchored
+/// top-left under this header instead of top-right under the tab bar's
+/// `⋯` button.
+pub fn projects_menu(state: &State, p: Palette) -> Option<Element<'static, Message>> {
+    if !state.projects_open {
+        return None;
+    }
+
+    let mut rows: Vec<Element<'static, Message>> = Vec::new();
+    if !state.root.as_os_str().is_empty() {
+        let current_name = state.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
+        let current = state::WelcomeRow {
+            path: state.root.clone(),
+            name: current_name,
+            lang: crate::recent_projects::detect_lang(&state.root),
+            subtitle: String::new(),
+            last_opened_label: String::new(),
+        };
+        rows.push(project_row(&current, true, p));
+    }
+    for row_data in state.welcome_rows.iter().filter(|r| r.path != state.root).take(5) {
+        rows.push(project_row(row_data, false, p));
+    }
+
+    let menu = container(
+        column![
+            text("PROJECTS")
+                .font(fonts::mono(Weight::Medium))
+                .size(crate::text_scale::px(9.0))
+                .color(color(p.text_muted)),
+            column(rows).spacing(2.0),
+            widgets::hline(color(p.line_neutral)),
+            projects_menu_row("+", "Open folder\u{2026}", Message::OpenFolderDialog, p),
+            projects_menu_row("\u{21a9}", "Close project", Message::CloseProject, p),
+        ]
+        .spacing(6.0)
+        .padding(6.0),
+    )
+    .width(Length::Fixed(260.0))
+    .style(move |_theme| container::Style {
+        background: Some(color(p.surface_raised).into()),
+        border: Border { color: color(p.line_neutral), width: 1.0, radius: 2.0.into() },
+        ..container::Style::default()
+    });
+
+    let positioned = container(menu).width(Length::Fill).height(Length::Fill).padding(Padding {
+        top: state.density.title_bar_h() + 78.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 12.0,
+    });
+
+    let backdrop = mouse_area(container(Space::new().width(Length::Fill).height(Length::Fill)).width(Length::Fill).height(Length::Fill))
+        .on_press(Message::ToggleProjects);
+
+    Some(iced::widget::stack![backdrop, positioned].into())
 }
 
 fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static, Message> {
@@ -399,6 +566,23 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
             ..button::Style::default()
         }
     })
+    .into()
+}
+
+/// Shown in place of the (hidden-when-empty) CHANGES section for a git repo
+/// with nothing changed — otherwise a clean tree just left a gap there with
+/// no indication of *why* CHANGES wasn't showing.
+fn clean_tree_row(p: Palette) -> Element<'static, Message> {
+    row![
+        widgets::dot(color(p.status_ok), 6.0),
+        text("Working tree clean")
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(10.0))
+            .color(color(p.text_muted)),
+    ]
+    .spacing(7.0)
+    .align_y(Alignment::Center)
+    .padding([8.0, 12.0])
     .into()
 }
 
@@ -479,13 +663,7 @@ fn changes_rows(state: &State, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-fn footer(p: Palette, branch: Option<&str>) -> Element<'static, Message> {
-    let hint = text(branch.map(str::to_string).unwrap_or_else(|| "not a git repo".into()))
-        .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(10.0))
-        .color(color(p.text_muted))
-        .width(Length::Fill);
-
+fn footer(p: Palette) -> Element<'static, Message> {
     let settings = button(widgets::center_fill(text("⚙").size(crate::text_scale::px(14.0))))
         .width(Length::Fixed(26.0))
         .height(Length::Fixed(26.0))
@@ -509,7 +687,7 @@ fn footer(p: Palette, branch: Option<&str>) -> Element<'static, Message> {
         });
 
     container(
-        row![hint, settings]
+        row![Space::new().width(Length::Fill), settings]
             .spacing(8.0)
             .align_y(Alignment::Center),
     )
@@ -624,19 +802,22 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         } else {
             middle = middle.push(widgets::hline(color(p.line_neutral)));
         }
+    } else if state.repo.is_some() {
+        // A git repo with nothing to show in CHANGES — say so, rather than
+        // just leaving a gap where that section would otherwise be.
+        middle = middle.push(clean_tree_row(p)).push(widgets::hline(color(p.line_neutral)));
     }
     middle = middle
         .push(explorer_header(p))
         .push(widgets::hline(color(p.line_neutral)))
         .push(container(tree_view).height(Length::Fill));
 
-    let branch = state.repo.as_ref().and_then(|repo| repo.branch_name());
     let body = column![
-        project_switcher(p, &state.root),
+        project_switcher(state, p),
         widgets::hline(color(p.line_neutral)),
         middle.height(Length::Fill),
         widgets::hline(color(p.line_neutral)),
-        footer(p, branch.as_deref()),
+        footer(p),
     ];
 
     container(body)

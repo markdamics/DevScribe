@@ -10,6 +10,7 @@ use crate::color::color;
 use crate::fonts;
 use crate::state::{self, EditorState, Message};
 use crate::ui::search_icon::SearchIcon;
+use crate::widgets;
 
 fn nav_button(
     label: &'static str,
@@ -17,11 +18,11 @@ fn nav_button(
     enabled: bool,
     p: devscribe_core::theme::Palette,
 ) -> Element<'static, Message> {
-    let mut b = button(
+    let mut b = button(widgets::center_fill(
         text(label)
             .font(fonts::mono(Weight::Medium))
             .size(crate::text_scale::px(11.0)),
-    )
+    ))
     .width(Length::Fixed(22.0))
     .height(Length::Fixed(22.0))
     .padding(0.0)
@@ -86,7 +87,7 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
             },
         });
 
-    let close = button(text("\u{2715}").size(crate::text_scale::px(10.0)))
+    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(10.0))))
         .width(Length::Fixed(22.0))
         .height(Length::Fixed(22.0))
         .padding(0.0)

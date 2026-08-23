@@ -117,7 +117,7 @@ fn tab_shell(
             }
         });
 
-    let close = button(text("\u{2715}").size(crate::text_scale::px(10.0)))
+    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(10.0))))
         .padding(0.0)
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(tab_h))
@@ -150,8 +150,19 @@ fn tab_shell(
 }
 
 fn file_tab_label(editor: &EditorState, p: Palette) -> Element<'static, Message> {
-    let lang = crate::fs_tree::Lang::from_path(&editor.path);
-    let (fg, bg) = lang.badge(p);
+    // An untitled buffer (no file on disk yet — `editor.path` is a
+    // synthetic "Untitled-N", see `state::begin_untitled_buffer`) gets the
+    // mockup's accent-tinted `TXT` glyph rather than a language badge:
+    // `Lang::from_path` would otherwise fall through to `Lang::Other`'s
+    // generic "no extension" glyph, indistinguishable from any other
+    // unrecognized real file.
+    let (fg, bg, code) = if editor.document.path().is_none() {
+        (color(p.accent), Color { a: 0.22, ..color(p.accent) }, "TXT".to_string())
+    } else {
+        let lang = crate::fs_tree::Lang::from_path(&editor.path);
+        let (fg, bg) = lang.badge(p);
+        (fg, bg, lang.code(&editor.path))
+    };
     let name = editor
         .path
         .file_name()
@@ -159,7 +170,7 @@ fn file_tab_label(editor: &EditorState, p: Palette) -> Element<'static, Message>
         .unwrap_or_default();
 
     let mut contents = row![
-        widgets::lang_badge(lang.code(&editor.path), fg, bg),
+        widgets::lang_badge(code, fg, bg),
         text(name)
             .font(fonts::sans(Weight::Medium))
             .size(crate::text_scale::px(12.0)),

@@ -23,7 +23,11 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .size(crate::text_scale::px(14.0))
         .color(color(p.text_primary));
 
-    let version = widgets::micro("V1.4.0", color(p.text_muted));
+    // The real crate version, not the mockup's static "V1.4.0" — Phase 7
+    // added a real version readout to Settings → About, and having the
+    // title bar show a *different, fake* number right next to it would be
+    // its own new inconsistency.
+    let version = widgets::micro(concat!("V", env!("CARGO_PKG_VERSION")), color(p.text_muted));
 
     let brand = row![logo, wordmark, version]
         .spacing(8.0)

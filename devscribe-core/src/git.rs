@@ -39,6 +39,16 @@ impl Repo {
         })
     }
 
+    /// Initializes `root` as a fresh git repository ("New project"'s
+    /// git-init step). Returns whether it succeeded — the one caller
+    /// (`state::start_loading_project`) treats this as best-effort and
+    /// opens the folder either way, so there's no use for `gix::init`'s
+    /// real error beyond that (and it's a large type not worth exposing
+    /// just to be discarded).
+    pub fn init(root: &Path) -> bool {
+        gix::init(root).is_ok()
+    }
+
     /// The current branch's short name, or a short commit hash on a detached
     /// `HEAD`. `None` on a repository with no commits yet.
     pub fn branch_name(&self) -> Option<String> {
@@ -59,6 +69,38 @@ impl Repo {
         let entry = tree.lookup_entry_by_path(relative).ok()??;
         let object = entry.object().ok()?;
         String::from_utf8(object.data.clone()).ok()
+    }
+
+    /// Commits the current branch is ahead/behind its upstream (remote-
+    /// tracking) branch by — e.g. for a sidebar `▲2 ▼0` indicator. `None`
+    /// when there's no upstream to compare against (no remote configured,
+    /// the branch isn't tracking one, or `HEAD` is detached) — an expected
+    /// state, not an error, same treatment `branch_name()` gives a
+    /// commits-free repo. Computed the standard way: the merge-base between
+    /// the two tips splits history into "ahead" (reachable from local, not
+    /// from the merge-base) and "behind" (reachable from upstream, not from
+    /// the merge-base), each counted via `with_hidden([base])` — the
+    /// traversal equivalent of `git rev-list <tip> ^<base>`.
+    pub fn ahead_behind(&self) -> Option<(usize, usize)> {
+        let head_name = self.inner.head_name().ok()??;
+        let upstream_name = self
+            .inner
+            .branch_remote_tracking_ref_name(head_name.as_ref(), gix::remote::Direction::Fetch)?
+            .ok()?;
+
+        let local_id = self.inner.head_id().ok()?;
+        let upstream_id = self.inner.find_reference(upstream_name.as_ref()).ok()?.into_fully_peeled_id().ok()?;
+
+        if local_id == upstream_id {
+            return Some((0, 0));
+        }
+
+        let base = self.inner.merge_base(local_id, upstream_id).ok()?.detach();
+
+        let ahead = local_id.ancestors().with_hidden([base]).all().ok()?.filter_map(Result::ok).count();
+        let behind = upstream_id.ancestors().with_hidden([base]).all().ok()?.filter_map(Result::ok).count();
+
+        Some((ahead, behind))
     }
 
     /// A coarse, one-badge-per-file working-tree status scan: `HEAD` vs. the
@@ -141,59 +183,5 @@ impl Repo {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::Command;
-
-    /// Drives the real `git` CLI to build a small fixture repo — simplest
-    /// way to get a realistic index/worktree/HEAD combination without
-    /// hand-assembling `gix` plumbing objects. `changed_files()` itself
-    /// stays pure `gix`; only the test fixture shells out.
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .status()
-            .expect("git must be on PATH for this test");
-        assert!(status.success(), "`git {args:?}` failed");
-    }
-
-    fn kind_of<'a>(files: &'a [ChangedFile], name: &str) -> Option<&'a ChangeKind> {
-        files.iter().find(|f| f.path.file_name().unwrap() == name).map(|f| &f.kind)
-    }
-
-    #[test]
-    fn detects_modified_added_untracked_and_deleted() {
-        let dir = std::env::temp_dir().join(format!("devscribe-git-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        git(&dir, &["init", "-q"]);
-        std::fs::write(dir.join("keep.txt"), "unchanged\n").unwrap();
-        std::fs::write(dir.join("edit.txt"), "original\n").unwrap();
-        std::fs::write(dir.join("gone.txt"), "will be deleted\n").unwrap();
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
-
-        std::fs::write(dir.join("edit.txt"), "changed\n").unwrap();
-        std::fs::remove_file(dir.join("gone.txt")).unwrap();
-        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
-        git(&dir, &["add", "edit.txt", "new.txt"]);
-        std::fs::write(dir.join("also_new.txt"), "untracked\n").unwrap();
-
-        let repo = Repo::open(&dir).expect("just-initialized dir is a repo");
-        let files = repo.changed_files();
-
-        assert_eq!(kind_of(&files, "edit.txt"), Some(&ChangeKind::Modified));
-        assert_eq!(kind_of(&files, "new.txt"), Some(&ChangeKind::Added));
-        assert_eq!(kind_of(&files, "also_new.txt"), Some(&ChangeKind::Untracked));
-        assert_eq!(kind_of(&files, "gone.txt"), Some(&ChangeKind::Deleted));
-        assert_eq!(kind_of(&files, "keep.txt"), None);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+#[path = "tests/git.rs"]
+mod tests;

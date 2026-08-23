@@ -5,5 +5,12 @@ edition.workspace = true
 
 [dependencies]
 devscribe-core = { path = "../devscribe-core" }
+dirs = "6.0.0"
 iced = { version = "0.14", features = ["canvas", "tokio"] }
+# Only for `task::blocking` — runs project search on its own OS thread so a
+# slow/stalled file read (network mount, cloud-sync placeholder) can never
+# freeze the UI, which `iced`'s own re-exports don't expose directly.
+iced_runtime = "0.14"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }

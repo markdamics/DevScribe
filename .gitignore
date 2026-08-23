@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Diagnostic log from devscribe/src/logging.rs — truncated fresh each run
+.devscribe.log
+docs/differences-and-roadmap.md

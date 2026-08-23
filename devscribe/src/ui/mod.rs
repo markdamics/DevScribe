@@ -15,3 +15,4 @@ pub mod status_bar;
 pub mod tab_bar;
 pub mod title_bar;
 pub mod toast;
+pub mod welcome;

@@ -14,6 +14,8 @@ use iced::keyboard;
 
 use crate::density::Density;
 use crate::fs_tree::{self, Node};
+use crate::recent_projects;
+use crate::settings;
 
 /// Identifies one open tab. Doubles as the dedup/focus key: opening a file
 /// or diff that's already open focuses the matching tab instead of opening
@@ -79,7 +81,8 @@ pub struct EditorDiagnostic {
 }
 
 /// Status of the language server for the currently supported language
-/// (Rust, via `rust-analyzer`). Surfaced in the status bar.
+/// (Rust, via `rust-analyzer`). Surfaced in the status bar and the
+/// settings panel's Toolchains category.
 #[derive(Debug, Clone, Default)]
 pub enum LspStatus {
     #[default]
@@ -88,20 +91,50 @@ pub enum LspStatus {
     Unavailable(String),
 }
 
+impl LspStatus {
+    /// (status-dot color, label) — the single source of truth both
+    /// `status_bar.rs` and `settings_panel.rs`'s Toolchains/About content
+    /// render from, so the two never drift apart.
+    pub fn describe(&self, p: devscribe_core::theme::Palette) -> (devscribe_core::theme::Rgba, String) {
+        match self {
+            LspStatus::Starting => (p.text_muted, "rust-analyzer starting\u{2026}".to_string()),
+            LspStatus::Ready => (p.status_ok, "rust-analyzer ready".to_string()),
+            LspStatus::Unavailable(reason) => (p.status_warn, format!("rust-analyzer unavailable ({reason})")),
+        }
+    }
+}
+
 /// One project-wide search hit, with the file it was found in.
+///
+/// Deliberately carries no per-token syntax-color data (`hit.preview`
+/// renders in one flat color, just the matched span itself tinted) —
+/// search used to run the full syntax highlighter once per matching file,
+/// which was real, uncapped CPU cost that scaled with how many files a
+/// broad query touched. Removed rather than capped: search's own results
+/// cap only ever bounded *how many hits got kept*, not how much
+/// highlighting work ran to produce them, so a query matching broadly
+/// across a large project could still highlight hundreds of whole files
+/// synchronously even with a small `MAX_SEARCH_RESULTS`.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: PathBuf,
     pub hit: SearchHit,
-    /// `hit.preview`, broken into syntax-colored runs — same highlighter
-    /// the editor canvas uses, run once per file rather than per match.
-    /// Empty when the file's language isn't recognized; the UI falls back
-    /// to rendering `hit.preview` in one flat color.
-    pub segments: Vec<(String, syntax::HighlightKind)>,
     /// `state.search_query`'s length in chars *at the time this result was
     /// computed* — snapshotted so a later, still-unsubmitted query edit
     /// can't desync it from `hit.col`.
     pub query_len_chars: usize,
+}
+
+/// A finished background search's payload — see `run_search` and
+/// `Message::SearchCompleted`. Carries `query` so the handler can tell a
+/// stale result (from a search that's since been superseded by further
+/// typing) apart from the one that's actually still relevant, instead of
+/// trusting arrival order.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    query: String,
+    results: Vec<SearchResult>,
+    elapsed: Duration,
 }
 
 /// One row in the sidebar's "CHANGES" panel: a working-tree change plus the
@@ -120,6 +153,30 @@ pub enum ToastKind {
     Success,
     Warning,
     Error,
+}
+
+/// One row in the welcome screen's recent-projects list and the sidebar's
+/// projects dropdown — display data derived live from a `RecentProject`
+/// (name, detected language glyph, `path // BRANCH // N CHANGES` /
+/// `path // NO REPOSITORY` subtitle, relative "12M"/"2D"/"3W" label).
+/// Recomputed whenever `State::recent_projects` changes (`compute_welcome_rows`)
+/// rather than persisted, since branch/change-count go stale between
+/// launches.
+#[derive(Debug, Clone)]
+pub struct WelcomeRow {
+    pub path: PathBuf,
+    pub name: String,
+    pub lang: fs_tree::Lang,
+    pub subtitle: String,
+    pub last_opened_label: String,
+}
+
+/// Drives the welcome screen's "Loading workspace" overlay while a
+/// background project load (`start_loading_project`) is in flight.
+#[derive(Debug, Clone)]
+pub struct LoadingProject {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +233,13 @@ pub struct Draft {
 #[derive(Debug, Clone)]
 pub struct ContextMenu {
     pub target: Option<PathBuf>,
+    /// `true` once "Delete" has been clicked once — the menu then shows a
+    /// confirm/cancel step instead of the normal rows, rather than
+    /// deleting on the first click. Deleting a file/directory here is
+    /// permanent (no OS trash/recycle-bin integration), so this is the one
+    /// destructive action in the whole app that needs a deliberate second
+    /// step before it touches disk.
+    pub confirm_delete: bool,
 }
 
 /// The settings modal's left-nav categories. Only `Explorer` and `Editor`
@@ -189,8 +253,8 @@ pub enum SettingsCategory {
     Explorer,
     Editor,
     Toolchains,
-    Keymap,
-    Advanced,
+    Shortcuts,
+    About,
 }
 
 impl SettingsCategory {
@@ -198,8 +262,8 @@ impl SettingsCategory {
         SettingsCategory::Explorer,
         SettingsCategory::Editor,
         SettingsCategory::Toolchains,
-        SettingsCategory::Keymap,
-        SettingsCategory::Advanced,
+        SettingsCategory::Shortcuts,
+        SettingsCategory::About,
     ];
 
     pub fn label(self) -> &'static str {
@@ -207,11 +271,10 @@ impl SettingsCategory {
             SettingsCategory::Explorer => "Explorer",
             SettingsCategory::Editor => "Editor",
             SettingsCategory::Toolchains => "Toolchains",
-            SettingsCategory::Keymap => "Keymap",
-            SettingsCategory::Advanced => "Advanced",
+            SettingsCategory::Shortcuts => "Shortcuts",
+            SettingsCategory::About => "About",
         }
     }
-
 }
 
 /// A runnable entry in the command palette: file to open, theme to switch
@@ -223,6 +286,11 @@ pub enum PaletteAction {
     FocusSearchTab,
     /// Opens (or focuses) a diff tab for the currently active file tab.
     ViewDiffOfActiveFile,
+    /// Opens (or focuses) a diff tab for "the" working-tree change: the
+    /// active file if one's open, else the first entry in `changed_files`.
+    /// Distinct from `ViewDiffOfActiveFile` — this one's reachable with
+    /// nothing open at all, as long as *something* in the tree has changed.
+    ViewWorkingTreeDiff,
     CloseActiveTab,
     ToggleAssist,
     ToggleProjects,
@@ -233,6 +301,12 @@ pub enum PaletteAction {
     DecreaseUiFontScale,
     OpenSettings,
     SaveFile,
+    /// Opens a blank tab with no file on disk yet ("Untitled-1", ...) — see
+    /// `begin_untitled_buffer`. Command-palette only: `⌘N`/`⇧⌘N` are
+    /// already the sidebar-draft new-file/new-folder shortcuts, and this is
+    /// a deliberately different thing (Phase 5's "New file" writes straight
+    /// to disk; this doesn't, until Save As gives it a real location).
+    NewUntitledFile,
 }
 
 #[derive(Debug, Clone)]
@@ -357,7 +431,11 @@ impl EditorState {
         } else {
             let text = self.document.text().to_string();
             let query_len = query.chars().count();
-            search::search_text(&text, &query)
+            // Same unbounded-memory risk `recompute_search` guards against
+            // (every match clones its whole line) — capped here too, even
+            // though a single already-open buffer is a smaller blast radius
+            // than the whole project.
+            search::search_text(&text, &query, MAX_SEARCH_RESULTS)
                 .into_iter()
                 .map(|hit| {
                     let start = self.document.char_index(hit.line, hit.col);
@@ -516,6 +594,25 @@ pub struct State {
     pub assist_on: bool,
     pub projects_open: bool,
     pub overflow_open: bool,
+    /// `true` while no project is open and the welcome screen ("Select a
+    /// project") is showing full-window in place of the whole editor —
+    /// `shell::view()` short-circuits to `welcome::view` before touching
+    /// `title_bar`/`sidebar`/the editor, so `root`/`tree`/etc. below are
+    /// meaningless placeholders whenever this is `true`.
+    pub welcome_open: bool,
+    /// Persisted "recently opened projects," most-recent-first. Loaded once
+    /// at startup (`recent_projects::load`) and updated via
+    /// `recent_projects::touch` every time a project successfully loads.
+    pub recent_projects: Vec<recent_projects::RecentProject>,
+    /// Live display data for `recent_projects` — recomputed by
+    /// `compute_welcome_rows` whenever it changes, not on every `view()`
+    /// (each row costs a `Repo::open` + status scan). Feeds both the
+    /// welcome screen's list and the sidebar's projects dropdown.
+    pub welcome_rows: Vec<WelcomeRow>,
+    /// `Some` only while a background project load (`start_loading_project`)
+    /// is in flight — drives the welcome screen's "Loading workspace"
+    /// overlay.
+    pub loading_project: Option<LoadingProject>,
     /// Project root the sidebar tree was walked from.
     pub root: PathBuf,
     /// Walked once at startup (filesystem walks are far too slow to redo on
@@ -532,8 +629,37 @@ pub struct State {
     /// `HEAD`, across the whole project (not just open tabs). Empty when
     /// `repo` is `None`. See `refresh_changed_files` for when this updates.
     pub changed_files: Vec<ChangesEntry>,
+    /// `(ahead, behind)` commit counts vs. the current branch's upstream —
+    /// the sidebar's `▲2 ▼0` indicator. `None` when `repo` is `None` *or*
+    /// there's simply no upstream configured (no remote, or the branch
+    /// isn't tracking one) — see `Repo::ahead_behind`. Refreshed alongside
+    /// `changed_files`.
+    pub ahead_behind: Option<(usize, usize)>,
     pub changes_panel_open: bool,
+    /// The live text in the search box — may be ahead of `search_last_query`
+    /// while the user is still typing. Search is debounced (see
+    /// `search_query_changed_at`) rather than run on every keystroke or
+    /// gated on Enter: it starts automatically a short pause after typing
+    /// stops, the same shape VSCode's search-as-you-type uses.
     pub search_query: String,
+    /// When the search box was last edited, so `Message::SearchDebounceTick`
+    /// can tell "the debounce window has elapsed" from "still typing" —
+    /// `None` once a search has actually started for the current text (no
+    /// point re-checking every tick after that).
+    search_query_changed_at: Option<Instant>,
+    /// `true` while a background search is in flight — drives the
+    /// "Searching…" state in `search_view.rs`.
+    pub search_in_progress: bool,
+    /// Cancels the in-flight background search, if any, the moment a newer
+    /// one starts (`start_search`) — see its doc for what "cancel" can and
+    /// can't actually guarantee here.
+    search_task_handle: Option<iced::task::Handle>,
+    /// The query `search_results` actually reflects, i.e. the query as of
+    /// the last completed search. Compared against `search_query` in
+    /// `search_view.rs` so a not-yet-searched edit doesn't show stale
+    /// results, or a misleading "No matches for {query}" for a query that
+    /// was never actually searched.
+    pub search_last_query: String,
     pub search_results: Vec<SearchResult>,
     pub search_elapsed: Duration,
     pub palette_open: bool,
@@ -547,6 +673,11 @@ pub struct State {
     /// Doesn't affect the separate "CHANGES" panel, which has its own
     /// collapse toggle.
     pub git_status_in_tree: bool,
+    /// When on, every dirty open file is saved as soon as the app window
+    /// loses focus (see `Message::WindowUnfocused`). Off by default —
+    /// unlike the other toggles in this struct, this one silently writes to
+    /// disk, so it shouldn't turn on a new behavior nobody asked for.
+    pub save_on_focus_loss: bool,
     pub editor_font_size: f32,
     /// Multiplies every chrome text size (sidebar, tabs, status bar, title
     /// bar, palette, settings, toasts). Independent of `editor_font_size` —
@@ -566,6 +697,11 @@ pub struct State {
     /// `Diff` tab auto-closed with its backing `File` tab) — `ReopenClosedTab`
     /// pops and reopens the most recent. Capped at `MAX_CLOSED_TABS`.
     pub closed_tabs: Vec<TabKey>,
+    /// Monotonic counter for naming untitled buffers ("Untitled-1",
+    /// "Untitled-2", ...) — see `begin_untitled_buffer`. Never reused, even
+    /// after the tab closes, so two buffers can never end up with the same
+    /// name/identity.
+    next_untitled_id: u64,
 }
 
 const MAX_CLOSED_TABS: usize = 20;
@@ -580,33 +716,202 @@ pub const UI_FONT_SCALE_MAX: f32 = 1.5;
 pub const UI_FONT_SCALE_DEFAULT: f32 = 1.0;
 pub const UI_FONT_SCALE_STEP: f32 = 0.1;
 
+/// A project root's derived data — tree, collapsed dirs, and git summary —
+/// everything `snapshot_project` computes. `Repo` itself is deliberately
+/// not part of this: it isn't `Clone` (wraps a `gix::Repository`), and this
+/// gets sent across a background thread as a `Message` payload
+/// (`start_loading_project`), which requires `Clone` project-wide. Wherever
+/// a snapshot is applied to `State`, `Repo::open` (cheap — just opens
+/// refs/HEAD, not a status walk) is called again synchronously alongside it.
+#[derive(Debug, Clone)]
+struct ProjectSnapshot {
+    tree: Vec<Node>,
+    collapsed_dirs: HashSet<PathBuf>,
+    changed_files: Vec<ChangesEntry>,
+    ahead_behind: Option<(usize, usize)>,
+}
+
+/// A finished background project load (`start_loading_project`), carried by
+/// `Message::ProjectLoaded`.
+#[derive(Debug, Clone)]
+pub struct LoadedProject {
+    root: PathBuf,
+    snapshot: ProjectSnapshot,
+}
+
+/// Walks `root`'s file tree and computes its git summary — the expensive
+/// part of "open a project," shared by `State::default()`'s startup
+/// auto-reopen and `start_loading_project`'s background loader.
+fn snapshot_project(root: &Path) -> ProjectSnapshot {
+    let tree = fs_tree::walk(root);
+    // Directories start collapsed — an uncollapsed default would dump the
+    // whole project tree open on first view.
+    let collapsed_dirs: HashSet<PathBuf> =
+        fs_tree::flatten_dirs(&tree).into_iter().map(Path::to_path_buf).collect();
+    let repo = Repo::open(root);
+    let changed_files = compute_changed_files(repo.as_ref());
+    let ahead_behind = repo.as_ref().and_then(Repo::ahead_behind);
+    ProjectSnapshot { tree, collapsed_dirs, changed_files, ahead_behind }
+}
+
+/// How many `recent_projects` entries get a live `WelcomeRow` — beyond
+/// what the welcome screen/sidebar dropdown ever show, each row is a
+/// `Repo::open` + status scan that would never get used.
+const MAX_WELCOME_ROWS: usize = 8;
+
+/// Computes live display data for up to `MAX_WELCOME_ROWS` of `recent`,
+/// via a transient `Repo::open` per entry (not the same handle as
+/// `State::repo` — this never touches the currently open project's repo).
+/// Called whenever `recent_projects` changes, not on every `view()` (see
+/// `WelcomeRow`'s doc).
+fn compute_welcome_rows(recent: &[recent_projects::RecentProject]) -> Vec<WelcomeRow> {
+    recent
+        .iter()
+        .take(MAX_WELCOME_ROWS)
+        .map(|entry| {
+            let path = entry.path.clone();
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            let lang = recent_projects::detect_lang(&path);
+            let subtitle = match Repo::open(&path) {
+                Some(repo) => {
+                    let branch = repo.branch_name().unwrap_or_else(|| "\u{2014}".to_string());
+                    let n = repo.changed_files().len();
+                    let changes = match n {
+                        0 => "CLEAN".to_string(),
+                        1 => "1 CHANGE".to_string(),
+                        n => format!("{n} CHANGES"),
+                    };
+                    format!("{} // {} // {}", shorten_home(&path), branch.to_uppercase(), changes)
+                }
+                None => format!("{} // NO REPOSITORY", shorten_home(&path)),
+            };
+            let last_opened_label = recent_projects::relative_label(entry.last_opened_ms);
+            WelcomeRow { path, name, lang, subtitle, last_opened_label }
+        })
+        .collect()
+}
+
+/// `~`-shortens a path under `$HOME` — shared by the welcome screen's
+/// recent-project subtitles and `sidebar.rs`'s project switcher.
+pub(crate) fn shorten_home(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
+}
+
+fn empty_project_snapshot() -> ProjectSnapshot {
+    ProjectSnapshot { tree: Vec::new(), collapsed_dirs: HashSet::new(), changed_files: Vec::new(), ahead_behind: None }
+}
+
+/// Everything `Default::default()` needs to seed a startup `State`: whether
+/// the welcome screen should show, and (if not) the project it auto-reopened.
+struct Startup {
+    welcome_open: bool,
+    root: PathBuf,
+    snapshot: ProjectSnapshot,
+    repo: Option<Repo>,
+    recent_projects: Vec<recent_projects::RecentProject>,
+    welcome_rows: Vec<WelcomeRow>,
+}
+
+/// Loads the real persisted recent-projects list and auto-reopens the most
+/// recently used one that still exists on disk (VSCode-style) — skipping
+/// any stale entries for projects since moved or deleted, rather than just
+/// failing on the very first one. First run (nothing recorded yet) or
+/// every recorded path having vanished both fall through to the welcome
+/// screen, same as explicitly closing a project.
+#[cfg(not(test))]
+fn startup() -> Startup {
+    let mut recent_projects = recent_projects::load();
+    let reopen = recent_projects.iter().find(|p| p.path.is_dir()).map(|p| p.path.clone());
+
+    match reopen {
+        Some(root) => {
+            recent_projects::touch(&mut recent_projects, root.clone());
+            let snapshot = snapshot_project(&root);
+            let repo = Repo::open(&root);
+            let welcome_rows = compute_welcome_rows(&recent_projects);
+            Startup { welcome_open: false, root, snapshot, repo, recent_projects, welcome_rows }
+        }
+        None => {
+            let welcome_rows = compute_welcome_rows(&recent_projects);
+            Startup { welcome_open: true, root: PathBuf::new(), snapshot: empty_project_snapshot(), repo: None, recent_projects, welcome_rows }
+        }
+    }
+}
+
+/// The test build never touches the real persisted recent-projects file —
+/// reading it would make every test using `State::default()` depend on
+/// whatever project this machine's user last had open in the real app
+/// (nondeterministic across machines and over time), and the auto-reopen
+/// path's `recent_projects::touch` would *write* to that same real file as
+/// a side effect of running `cargo test`, silently corrupting real user
+/// state. Every test gets a deterministic, disk-free "no project open" seed
+/// instead — consistent with existing tests already not trusting
+/// `State::default()`'s project fields (see e.g. the `changed_files`
+/// comment a few tests down) and overriding what they need explicitly.
+#[cfg(test)]
+fn startup() -> Startup {
+    Startup {
+        welcome_open: true,
+        root: PathBuf::new(),
+        snapshot: empty_project_snapshot(),
+        repo: None,
+        recent_projects: Vec::new(),
+        welcome_rows: Vec::new(),
+    }
+}
+
+/// The persisted theme (`settings::save_theme`, written on every
+/// `set_theme` call), or the default if nothing's saved yet. Global, not
+/// project-scoped, so this is independent of `startup()`/`Startup` above.
+#[cfg(not(test))]
+fn startup_theme() -> ThemeName {
+    settings::load().unwrap_or_default()
+}
+
+/// Never reads the real `~/.config/devscribe/settings.json` — same reason
+/// `startup()`'s test build never reads `recent_projects.json`: every test
+/// that constructs `State::default()` would otherwise depend on whatever
+/// theme this machine's user last picked in the real app.
+#[cfg(test)]
+fn startup_theme() -> ThemeName {
+    ThemeName::default()
+}
+
 impl Default for State {
     fn default() -> Self {
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let tree = fs_tree::walk(&root);
-        // Directories start collapsed — an uncollapsed default would dump
-        // the whole project tree open on first launch.
-        let collapsed_dirs: HashSet<PathBuf> =
-            fs_tree::flatten_dirs(&tree).into_iter().map(Path::to_path_buf).collect();
-        let repo = Repo::open(&root);
-        let changed_files = compute_changed_files(repo.as_ref());
+        let Startup { welcome_open, root, snapshot, repo, recent_projects, welcome_rows } = startup();
+
         Self {
-            theme: ThemeName::NullGrid,
+            theme: startup_theme(),
             open_tabs: Vec::new(),
             active_tab: None,
             assist_on: true,
             projects_open: false,
             overflow_open: false,
+            welcome_open,
+            recent_projects,
+            welcome_rows,
+            loading_project: None,
             root,
-            tree,
-            collapsed_dirs,
+            tree: snapshot.tree,
+            collapsed_dirs: snapshot.collapsed_dirs,
             caret_visible: true,
             lsp_status: LspStatus::default(),
             lsp_sender: None,
             repo,
-            changed_files,
+            changed_files: snapshot.changed_files,
+            ahead_behind: snapshot.ahead_behind,
             changes_panel_open: false,
             search_query: String::new(),
+            search_query_changed_at: None,
+            search_in_progress: false,
+            search_task_handle: None,
+            search_last_query: String::new(),
             search_results: Vec::new(),
             search_elapsed: Duration::ZERO,
             palette_open: false,
@@ -615,6 +920,7 @@ impl Default for State {
             settings_open: false,
             settings_category: SettingsCategory::default(),
             git_status_in_tree: false,
+            save_on_focus_loss: false,
             density: Density::default(),
             problem_lens_enabled: true,
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
@@ -625,6 +931,7 @@ impl Default for State {
             ctx_menu: None,
             flash: None,
             closed_tabs: Vec::new(),
+            next_untitled_id: 0,
         }
     }
 }
@@ -644,6 +951,9 @@ pub enum Message {
     /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
     /// targets the currently active tab.
     OpenDiffFor(PathBuf),
+    /// Global `⇧⌘D` — see `PaletteAction::ViewWorkingTreeDiff`, which this
+    /// shares a handler with.
+    ViewWorkingTreeDiff,
     SelectFile(PathBuf),
     EditorInsertText(String),
     EditorBackspace,
@@ -655,7 +965,16 @@ pub enum Message {
     JsonToggle(String),
     ToggleDirCollapsed(PathBuf),
     SearchQueryChanged(String),
+    /// Enter in the search box — starts a search immediately, bypassing
+    /// the debounce wait.
     SearchSubmit,
+    /// A recurring low-frequency tick (see `subscription`) checking whether
+    /// enough time has passed since the last `SearchQueryChanged` to start
+    /// searching automatically.
+    SearchDebounceTick,
+    /// A background search (`start_search`) finished — applied only if
+    /// its query still matches `state.search_query`; see `SearchOutcome`.
+    SearchCompleted(SearchOutcome),
     SearchResultSelected { path: PathBuf, line: usize, col: usize },
     TogglePalette,
     ClosePalette,
@@ -669,6 +988,14 @@ pub enum Message {
     ToggleProblemLens,
     SetSettingsCategory(SettingsCategory),
     ToggleGitStatusInTree,
+    ToggleSaveOnFocusLoss,
+    /// The window lost focus — saves every dirty open file if
+    /// `save_on_focus_loss` is on, else a no-op. Fired from
+    /// `iced::window::events()`, not a keybinding.
+    WindowUnfocused,
+    /// Global `⌘/` — opens Settings straight to the Shortcuts category, in
+    /// one step rather than `ToggleSettings` + `SetSettingsCategory`.
+    OpenShortcutsHelp,
     SetEditorFontSize(f32),
     SetUiFontScale(f32),
     DismissToast(u64),
@@ -700,15 +1027,46 @@ pub enum Message {
     OpenTreeContext(Option<PathBuf>),
     CloseTreeContext,
     CopyPath(PathBuf),
+    /// First click on the context menu's "Delete" row — shows the
+    /// confirm/cancel step (`ContextMenu::confirm_delete`) rather than
+    /// deleting immediately.
+    PromptDeletePath,
+    /// The confirm step's "Delete" button — actually removes `path` (file
+    /// or, recursively, directory) from disk. Permanent: no OS trash/
+    /// recycle-bin integration.
+    DeletePath(PathBuf),
     CloseOtherTabs,
     RevealActiveInTree,
     ReopenClosedTab,
+    /// "Open folder…" — welcome screen or the sidebar projects dropdown.
+    OpenFolderDialog,
+    /// "New project" — same picker as `OpenFolderDialog`, but the result
+    /// gets `git init`ed first if it isn't already a repo (see
+    /// `FolderDialogResult`'s second field).
+    NewProjectDialog,
+    /// The async folder-picker dialog finished. `None` means the user
+    /// cancelled it. The `bool` is `OpenFolderDialog` (`false`) vs.
+    /// `NewProjectDialog` (`true`) — whether to `git init` the result.
+    FolderDialogResult(Option<PathBuf>, bool),
+    /// A row in the welcome screen's recent list or the sidebar's projects
+    /// dropdown was clicked.
+    RecentProjectPicked(PathBuf),
+    /// "Close project" — returns to the welcome screen.
+    CloseProject,
+    /// A background project load (`start_loading_project`) finished.
+    /// Boxed since `LoadedProject` carries a whole `ProjectSnapshot`
+    /// (file tree included), and `Message` is `Clone` project-wide.
+    ProjectLoaded(Box<LoadedProject>),
+    /// The "Save As" dialog (`save_file_as`) finished for the tab currently
+    /// keyed by the first `PathBuf` (its old, possibly-synthetic-untitled
+    /// path) — `None` if the user cancelled, `Some(new_path)` otherwise.
+    SaveAsResult(PathBuf, Option<PathBuf>),
     Noop,
 }
 
 pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
     match message {
-        Message::SetTheme(theme) => state.theme = theme,
+        Message::SetTheme(theme) => set_theme(state, theme),
         Message::SelectOpenTab(key) => {
             if state.open_tabs.iter().any(|t| t.key() == key) {
                 state.active_tab = Some(key);
@@ -726,6 +1084,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ToggleOverflow => state.overflow_open = !state.overflow_open,
         Message::ToggleChangesPanel => state.changes_panel_open = !state.changes_panel_open,
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
+        Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
         Message::SelectFile(path) => open_or_focus_file(state, path),
         Message::EditorInsertText(text) => {
             if let Some(path) = active_file_path(state) {
@@ -807,11 +1166,56 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.json_collapsed.insert(key);
             }
         }
+        // Debounced, like VSCode's search-as-you-type: typing just records
+        // *when* (`search_query_changed_at`), not a search itself — the
+        // recurring `SearchDebounceTick` starts one once typing pauses.
+        // Never live-per-keystroke: `run_search` walks and reads every
+        // matching file in the project, and even off the UI thread (see
+        // `start_search`), starting that fresh on every single keystroke
+        // is wasted, cancelled-a-moment-later work.
         Message::SearchQueryChanged(query) => {
             state.search_query = query;
-            recompute_search(state);
+            if state.search_query.is_empty() {
+                // Nothing to debounce — clear immediately rather than
+                // waiting a tick to notice there's nothing to search.
+                state.search_query_changed_at = None;
+                state.search_results.clear();
+                state.search_last_query.clear();
+                state.search_elapsed = Duration::ZERO;
+                state.search_in_progress = false;
+                if let Some(handle) = state.search_task_handle.take() {
+                    handle.abort();
+                }
+            } else {
+                state.search_query_changed_at = Some(Instant::now());
+            }
         }
-        Message::SearchSubmit => focus_search(state),
+        Message::SearchSubmit => {
+            focus_search(state);
+            return start_search(state);
+        }
+        Message::SearchDebounceTick => {
+            let due = state.search_query_changed_at.is_some_and(|at| at.elapsed() >= SEARCH_DEBOUNCE_DELAY);
+            if due {
+                state.search_query_changed_at = None;
+                return start_search(state);
+            }
+        }
+        Message::SearchCompleted(outcome) => {
+            // A search superseded by further typing before it finished
+            // still runs to completion in the background (see
+            // `start_search`'s doc on what "cancel" can guarantee here) —
+            // this is what actually discards its result. `search_in_progress`/
+            // `search_task_handle` are deliberately untouched when stale:
+            // they belong to whatever search is *actually* still running.
+            if outcome.query == state.search_query {
+                state.search_results = outcome.results;
+                state.search_last_query = outcome.query;
+                state.search_elapsed = outcome.elapsed;
+                state.search_in_progress = false;
+                state.search_task_handle = None;
+            }
+        }
         Message::SearchResultSelected { path, line, col } => {
             open_or_focus_file(state, path.clone());
             if let Some(editor) = find_editor_mut(state, &path) {
@@ -841,14 +1245,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             };
         }
         Message::PaletteExecute => {
-            if let Some(entry) = filtered_palette_entries(state).get(state.palette_selected) {
-                run_palette_action(state, entry.action.clone());
-            }
             state.palette_open = false;
+            if let Some(entry) = filtered_palette_entries(state).get(state.palette_selected) {
+                return run_palette_action(state, entry.action.clone());
+            }
         }
         Message::PaletteRun(action) => {
-            run_palette_action(state, action);
             state.palette_open = false;
+            return run_palette_action(state, action);
         }
         Message::ToggleSettings => {
             state.settings_open = !state.settings_open;
@@ -861,6 +1265,17 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ToggleProblemLens => state.problem_lens_enabled = !state.problem_lens_enabled,
         Message::SetSettingsCategory(category) => state.settings_category = category,
         Message::ToggleGitStatusInTree => state.git_status_in_tree = !state.git_status_in_tree,
+        Message::ToggleSaveOnFocusLoss => state.save_on_focus_loss = !state.save_on_focus_loss,
+        Message::WindowUnfocused => {
+            if state.save_on_focus_loss {
+                save_all_dirty_files(state);
+            }
+        }
+        Message::OpenShortcutsHelp => {
+            state.settings_open = true;
+            state.settings_category = SettingsCategory::Shortcuts;
+            state.palette_open = false;
+        }
         Message::SetEditorFontSize(size) => {
             state.editor_font_size = size.clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         }
@@ -874,7 +1289,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.flash = None;
             }
         }
-        Message::EditorSave => save_current_file(state),
+        Message::EditorSave => return save_current_file(state),
         Message::ToggleFind => {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
@@ -915,7 +1330,17 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::FindNext => find_step(state, 1),
         Message::FindPrev => find_step(state, -1),
-        Message::BeginDraft(kind) => return begin_draft(state, kind, state.root.clone()),
+        Message::BeginDraft(kind) => {
+            // Pre-existing gap, fixed alongside this feature: `⌘N`/`⇧⌘N`
+            // (`global_keys`) aren't otherwise gated on a project being
+            // open. Without this, they'd start an invisible draft (the
+            // sidebar tree isn't rendered at all during `welcome_open`)
+            // targeting `state.root` — which at that point is `PathBuf::new()`,
+            // so committing it would write into the process's CWD.
+            if !state.welcome_open {
+                return begin_draft(state, kind, state.root.clone());
+            }
+        }
         Message::BeginDraftIn(kind, dir) => return begin_draft(state, kind, dir),
         Message::BeginRename(path) => return begin_rename(state, path),
         Message::DraftTextChanged(text) => {
@@ -930,7 +1355,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             push_flash(state, "TREE COLLAPSED");
         }
         Message::OpenTreeContext(target) => {
-            state.ctx_menu = Some(ContextMenu { target });
+            state.ctx_menu = Some(ContextMenu { target, confirm_delete: false });
             state.overflow_open = false;
             state.projects_open = false;
         }
@@ -941,6 +1366,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             push_flash(state, format!("PATH COPIED // {label}"));
             return iced::clipboard::write(path.display().to_string());
         }
+        Message::PromptDeletePath => {
+            if let Some(ctx) = state.ctx_menu.as_mut() {
+                ctx.confirm_delete = true;
+            }
+        }
+        Message::DeletePath(path) => delete_path(state, path),
         Message::CloseOtherTabs => {
             state.overflow_open = false;
             close_other_tabs(state);
@@ -952,6 +1383,38 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ReopenClosedTab => {
             state.overflow_open = false;
             reopen_closed_tab(state);
+        }
+        Message::OpenFolderDialog => {
+            state.projects_open = false;
+            if state.loading_project.is_some() {
+                return iced::Task::none();
+            }
+            return iced::Task::perform(pick_folder(), |path| Message::FolderDialogResult(path, false));
+        }
+        Message::NewProjectDialog => {
+            state.projects_open = false;
+            if state.loading_project.is_some() {
+                return iced::Task::none();
+            }
+            return iced::Task::perform(pick_folder(), |path| Message::FolderDialogResult(path, true));
+        }
+        Message::FolderDialogResult(path, init_git) => {
+            if let Some(path) = path {
+                return start_loading_project(state, path, init_git);
+            }
+        }
+        Message::RecentProjectPicked(path) => {
+            state.projects_open = false;
+            if state.loading_project.is_none() {
+                return start_loading_project(state, path, false);
+            }
+        }
+        Message::CloseProject => close_project(state),
+        Message::ProjectLoaded(loaded) => apply_loaded_project(state, *loaded),
+        Message::SaveAsResult(old_path, new_path) => {
+            if let Some(new_path) = new_path {
+                complete_save_as(state, old_path, new_path);
+            }
         }
         Message::EscapePressed => {
             let find_open = active_file_path(state)
@@ -969,6 +1432,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.ctx_menu = None;
             } else if state.overflow_open {
                 state.overflow_open = false;
+            } else if state.projects_open {
+                state.projects_open = false;
             } else if state.palette_open {
                 state.palette_open = false;
             } else if state.settings_open {
@@ -980,16 +1445,21 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
     iced::Task::none()
 }
 
-fn run_palette_action(state: &mut State, action: PaletteAction) {
+/// Returns a `Task` (rather than being `void` like most of `update`'s
+/// smaller handlers) only because `SaveFile`/`NewUntitledFile` can now
+/// trigger `save_current_file`'s async Save As dialog — every other arm
+/// still just mutates `state` and falls through to `Task::none()`.
+fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Message> {
     match action {
         PaletteAction::OpenFile(path) => open_or_focus_file(state, path),
-        PaletteAction::SetTheme(theme) => state.theme = theme,
+        PaletteAction::SetTheme(theme) => set_theme(state, theme),
         PaletteAction::FocusSearchTab => focus_search(state),
         PaletteAction::ViewDiffOfActiveFile => {
             if let Some(path) = active_file_path(state) {
                 open_or_focus_diff(state, path);
             }
         }
+        PaletteAction::ViewWorkingTreeDiff => view_working_tree_diff(state),
         PaletteAction::CloseActiveTab => {
             if let Some(key) = state.active_tab.clone() {
                 close_tab(state, &key);
@@ -1015,17 +1485,26 @@ fn run_palette_action(state: &mut State, action: PaletteAction) {
                 (state.ui_font_scale - UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
         }
         PaletteAction::OpenSettings => state.settings_open = true,
-        PaletteAction::SaveFile => save_current_file(state),
+        PaletteAction::SaveFile => return save_current_file(state),
+        PaletteAction::NewUntitledFile => begin_untitled_buffer(state),
     }
+    iced::Task::none()
 }
 
-fn save_current_file(state: &mut State) {
+/// `⌘S` / palette "Save File". An untitled buffer (`document.path()` still
+/// `None`) has nothing to write to yet, so this kicks off `save_file_as`
+/// (the native Save As dialog) instead of calling `document.save()` — which
+/// would just produce its existing "document has no path" error.
+fn save_current_file(state: &mut State) -> iced::Task<Message> {
     let Some(path) = active_file_path(state) else {
-        return;
+        return iced::Task::none();
     };
     let Some(editor) = find_editor_mut(state, &path) else {
-        return;
+        return iced::Task::none();
     };
+    if editor.document.path().is_none() {
+        return save_file_as(state, path);
+    }
     let name = editor
         .path
         .file_name()
@@ -1038,6 +1517,90 @@ fn save_current_file(state: &mut State) {
         }
         Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't save {name}: {err}")),
     }
+    iced::Task::none()
+}
+
+/// Triggers the native "Save As" dialog for the tab currently keyed by
+/// `old_path`, defaulting to the project root and the tab's current
+/// (possibly-synthetic-untitled) name — same `Task::perform`-wrapped
+/// async-fn shape as `pick_folder`/`save_file_as`'s sibling, the
+/// welcome-screen work's folder picker.
+fn save_file_as(state: &State, old_path: PathBuf) -> iced::Task<Message> {
+    let name = old_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = state.root.clone();
+    iced::Task::perform(save_file_dialog(dir, name), move |chosen| Message::SaveAsResult(old_path, chosen))
+}
+
+async fn save_file_dialog(dir: PathBuf, name: String) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_directory(dir)
+        .set_file_name(name)
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Saves every dirty open `File` tab — the "Save on focus loss" toggle's
+/// handler. Deliberately separate from `save_current_file` rather than
+/// looping it over every path: saving 5 files shouldn't stack 5 "Saved x"
+/// toasts, so successes are collapsed into one summary toast and only
+/// failures (rare — permission errors, a file deleted out from under an
+/// open tab) get their own.
+fn save_all_dirty_files(state: &mut State) {
+    // Untitled buffers are deliberately skipped here, not just "no path
+    // means save() would error" — this fires on a window-focus-loss
+    // background event, and popping a blocking native Save As dialog the
+    // moment the user alt-tabs away would be a genuinely bad surprise, not
+    // just a missed save. They're saved (via the dialog) whenever the user
+    // explicitly asks, same as any other dirty file.
+    let dirty_paths: Vec<PathBuf> = state
+        .open_tabs
+        .iter()
+        .filter_map(|t| match t {
+            OpenTab::File(editor) if editor.document.is_dirty() && editor.document.path().is_some() => {
+                Some(editor.path.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if dirty_paths.is_empty() {
+        return;
+    }
+
+    let mut saved = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for path in &dirty_paths {
+        let Some(editor) = find_editor_mut(state, path) else {
+            continue;
+        };
+        match editor.document.save() {
+            Ok(()) => saved += 1,
+            Err(err) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                errors.push(format!("{name}: {err}"));
+            }
+        }
+    }
+
+    if saved > 0 {
+        refresh_changed_files(state);
+        let summary = if saved == 1 { "Saved 1 file".to_string() } else { format!("Saved {saved} files") };
+        push_toast(state, ToastKind::Success, summary);
+    }
+    for err in errors {
+        push_toast(state, ToastKind::Error, format!("Couldn't save {err}"));
+    }
+}
+
+/// The single place `state.theme` gets changed — persists the choice
+/// (`settings::save_theme`) so it survives closing and reopening the app,
+/// same shape as `recent_projects::touch` persisting on every project
+/// load. Both `Message::SetTheme` (settings panel) and
+/// `PaletteAction::SetTheme` (command palette) go through this rather than
+/// setting the field directly, so neither path can silently forget to save.
+fn set_theme(state: &mut State, theme: ThemeName) {
+    state.theme = theme;
+    settings::save_theme(theme);
 }
 
 fn push_toast(state: &mut State, kind: ToastKind, message: impl Into<String>) {
@@ -1213,9 +1776,78 @@ fn rename_open_tab(state: &mut State, old_path: &Path, new_path: &Path) {
     }
 }
 
+/// Finishes a Save As (`save_file_as`'s dialog result): repoints the tab
+/// from `old_path` to `new_path` in place — no close/reopen, so no lost
+/// cursor/undo/find state — then actually writes the content, since
+/// (unlike a real on-disk rename) nothing existed at `new_path` before.
+///
+/// Reuses `rename_open_tab` for the repointing rather than duplicating it:
+/// it already does exactly "update `editor.path`/`editor.document`'s path,
+/// re-notify LSP old-close/new-open, fix up `active_tab`/any matching
+/// `Diff` tab key," which is precisely the bookkeeping "turn a
+/// synthetic-path tab into a real-path tab" needs too. The one thing it
+/// doesn't do — `EditorState::new` only derives `language`/`highlights`
+/// (and JSON parsing) once, at construction, from whatever path was
+/// current then — matters much more here than for an ordinary rename
+/// (going from no-extension-so-no-highlighting to a real language is the
+/// whole point of this flow), so those get explicitly recomputed after.
+fn complete_save_as(state: &mut State, old_path: PathBuf, new_path: PathBuf) {
+    rename_open_tab(state, &old_path, &new_path);
+    let Some(editor) = find_editor_mut(state, &new_path) else {
+        return;
+    };
+    editor.language = new_path.extension().and_then(|e| e.to_str()).and_then(syntax::Language::from_extension);
+    editor.rehighlight();
+    editor.reparse_json();
+
+    let name = new_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match editor.document.save() {
+        Ok(()) => {
+            refresh_tree(state);
+            refresh_changed_files(state);
+            push_toast(state, ToastKind::Success, format!("Saved {name}"));
+        }
+        Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't save {name}: {err}")),
+    }
+}
+
 /// Closes every open tab except `active_tab` — the tab-bar overflow menu's
 /// "Close others". Reuses `close_tab` per key (rather than a bulk `retain`)
 /// so LSP `didClose` notifications and diff-tab cleanup still happen.
+/// Removes `target` (file, or recursively for a directory) from disk —
+/// the confirmed "Delete" action. Closes every open tab under `target`
+/// first (reusing `close_tab`, so LSP `didClose`/diff-tab cleanup/
+/// `active_tab` reassignment all happen the same way `CloseActiveTab`
+/// already does), then does the actual removal.
+fn delete_path(state: &mut State, target: PathBuf) {
+    state.ctx_menu = None;
+    let is_dir = target.is_dir();
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+
+    let affected: Vec<TabKey> = state
+        .open_tabs
+        .iter()
+        .map(|t| t.key())
+        .filter(|key| match key {
+            TabKey::File(path) | TabKey::Diff(path) => path == &target || path.starts_with(&target),
+            TabKey::Search => false,
+        })
+        .collect();
+    for key in affected {
+        close_tab(state, &key);
+    }
+
+    let result = if is_dir { std::fs::remove_dir_all(&target) } else { std::fs::remove_file(&target) };
+    match result {
+        Ok(()) => {
+            refresh_tree(state);
+            refresh_changed_files(state);
+            push_flash(state, format!("DELETED // {}", name.to_uppercase()));
+        }
+        Err(err) => push_toast(state, ToastKind::Error, format!("Couldn't delete {name}: {err}")),
+    }
+}
+
 fn close_other_tabs(state: &mut State) {
     let Some(active) = state.active_tab.clone() else {
         return;
@@ -1324,6 +1956,18 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
             action: PaletteAction::ViewDiffOfActiveFile,
         });
     }
+    // Surfaces whenever the query happens to contain "diff" (plain substring
+    // filtering in `filtered_palette_entries` — no special-casing needed
+    // here), matching the mockup's contextual "Diff:" command row. Gated on
+    // there being something to actually diff, same as `ViewDiffOfActiveFile`
+    // above — an always-present entry that's usually a no-op would be a fake
+    // control.
+    if active_file_path(state).is_some() || !state.changed_files.is_empty() {
+        entries.push(PaletteEntry {
+            label: "Diff: open working tree changes".to_string(),
+            action: PaletteAction::ViewWorkingTreeDiff,
+        });
+    }
     if state.active_tab.is_some() {
         entries.push(PaletteEntry {
             label: "Close active tab".to_string(),
@@ -1372,6 +2016,10 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
             action: PaletteAction::SaveFile,
         });
     }
+    entries.push(PaletteEntry {
+        label: "New untitled file".to_string(),
+        action: PaletteAction::NewUntitledFile,
+    });
 
     entries
 }
@@ -1460,6 +2108,45 @@ fn open_or_focus_diff(state: &mut State, path: PathBuf) {
         state.open_tabs.push(OpenTab::Diff(path));
     }
     state.active_tab = Some(key);
+}
+
+/// Opens a blank tab with no file on disk yet — command palette's "New
+/// untitled file." Mirrors `open_or_focus_file`'s shape but starts from
+/// `Document::empty()` (already `path: None` internally) instead of
+/// `Document::open`.
+///
+/// `EditorState.path` still gets a real, unique `PathBuf` — just a
+/// synthetic one (`Untitled-N`, a bare name with no directory component,
+/// so it can never collide with a real project file: those are always
+/// absolute, from `fs_tree::walk(&state.root)`). This keeps every existing
+/// path-keyed mechanism (tab identity/lookup/close/reopen) working
+/// unchanged; "untitled-ness" is tracked separately, via
+/// `editor.document.path().is_none()`, checked only where it actually
+/// matters (`save_current_file`). No LSP `didOpen` (no extension ⇒
+/// `is_lsp_language` already says no) and no diff tab — both correctly
+/// inapplicable to a buffer with no disk identity yet.
+fn begin_untitled_buffer(state: &mut State) {
+    state.next_untitled_id += 1;
+    let name = format!("Untitled-{}", state.next_untitled_id);
+    let path = PathBuf::from(name);
+    let key = TabKey::File(path.clone());
+    state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(Document::empty(), path))));
+    state.active_tab = Some(key);
+}
+
+/// The global `⇧⌘D` / palette "Diff: open working tree changes" handler:
+/// diffs the active file if one's open, else falls back to the first entry
+/// in the sidebar's Changes list — so the command is reachable (and does
+/// something useful) even with no file tab open at all, not just a faster
+/// path to the same thing `ViewDiffOfActiveFile` already covers. A no-op
+/// when there's neither an active file nor any changed file to fall back to
+/// (clean tree, or no repo).
+fn view_working_tree_diff(state: &mut State) {
+    if let Some(path) = active_file_path(state) {
+        open_or_focus_diff(state, path);
+    } else if let Some(entry) = state.changed_files.first() {
+        open_or_focus_diff(state, entry.path.clone());
+    }
 }
 
 /// Opens the (singleton) search tab, or focuses it if already open.
@@ -1563,95 +2250,248 @@ fn compute_changed_files(repo: Option<&Repo>) -> Vec<ChangesEntry> {
         .collect()
 }
 
-/// Re-scans the working tree for `state.changed_files`. Not run on every
-/// keystroke — a full `gix` status walk plus a per-file diff isn't cheap —
-/// only after actions known to change the working tree, i.e. saving a file.
-/// Edits made outside DevScribe won't be reflected until the next save;
-/// there's no file-watcher wired up yet (same limitation `tree`/`fs_tree`
-/// already has for the file browser).
+/// Re-scans the working tree for `state.changed_files`, and the upstream
+/// comparison for `state.ahead_behind` alongside it — both are cheap-ish
+/// `gix` walks with the same staleness story, so one refresh point covers
+/// both. Not run on every keystroke — only after actions known to change
+/// the working tree, i.e. saving a file. Edits made outside DevScribe (a
+/// `git commit`/`git fetch` in another terminal, say) won't be reflected
+/// until the next save; there's no file-watcher wired up yet (same
+/// limitation `tree`/`fs_tree` already has for the file browser).
 fn refresh_changed_files(state: &mut State) {
     state.changed_files = compute_changed_files(state.repo.as_ref());
+    state.ahead_behind = state.repo.as_ref().and_then(Repo::ahead_behind);
 }
 
+/// How long the search box has to sit still before `SearchDebounceTick`
+/// starts a search for it — VSCode-style search-as-you-type, not a search
+/// per keystroke. `SearchSubmit` (Enter) bypasses this entirely.
+const SEARCH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
+
 /// Naive project-wide search: reads every file the sidebar already walked
-/// and scans it. Capped so a broad query on a large project can't stall the
-/// UI thread indefinitely — see `devscribe_core::search` for the "start
-/// naive, index later if slow" rationale.
+/// and scans it. Capped so even one search can't run away — see
+/// `devscribe_core::search` for the "start naive, index later if slow"
+/// rationale. Briefly lowered to 50 while chasing what turned out to be an
+/// unrelated, now-fixed root cause (see `SearchHit::preview`'s doc and the
+/// roadmap's search bug-fix writeup, "ninth pass") — restored to 200 now
+/// that every result's render cost is genuinely bounded regardless of the
+/// underlying line's real length, so there's no reason left to show fewer.
 const MAX_SEARCH_RESULTS: usize = 200;
 
-fn recompute_search(state: &mut State) {
-    state.search_results.clear();
-    if state.search_query.is_empty() {
-        state.search_elapsed = Duration::ZERO;
-        return;
-    }
-    let query_len_chars = state.search_query.chars().count();
-    let started = Instant::now();
+/// Files larger than this are skipped entirely rather than read and
+/// scanned. This is naive search — unlike an indexed tool (ripgrep, an
+/// LSP), it has no way to bound the cost of one huge file (a lockfile, a
+/// bundle, a log) other than not reading it. `MAX_SEARCH_RESULTS`/
+/// `search_text`'s own `max_hits` cap the *match count*, but a
+/// many-megabyte file that matches nothing would still pay the full
+/// read+scan cost without this.
+const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-    'files: for path in fs_tree::flatten_files(&state.tree) {
+/// Hard ceiling on how many files a single search examines (read + scanned
+/// — not just how many are *skipped* by the size check above), regardless
+/// of how many actually match. Without this, a query that's rare or absent
+/// across a very large project would still walk, stat, and read every file
+/// the sidebar tree has before `MAX_SEARCH_RESULTS` (which only counts
+/// *hits*) ever got a chance to end the search early. Now runs on a
+/// background thread (`start_search`), so this no longer bounds UI-thread
+/// latency directly — it still matters, since an unbounded scan is still
+/// real work an abandoned/cancelled search's thread keeps doing, and still
+/// real wall-clock time before a *relevant* search's own results land.
+const MAX_SEARCH_FILES_SCANNED: usize = 3_000;
+
+/// The actual file-reading/scanning work, decoupled from `State` so it can
+/// run on a background thread (see `start_search`) — takes owned inputs
+/// and returns an owned outcome instead of borrowing app state, since
+/// nothing here can hold a reference across a thread boundary.
+fn run_search(files: &[PathBuf], query: &str) -> SearchOutcome {
+    let query_len_chars = query.chars().count();
+    let started = Instant::now();
+    let mut results = Vec::new();
+
+    for path in files.iter().take(MAX_SEARCH_FILES_SCANNED) {
+        let remaining = MAX_SEARCH_RESULTS - results.len();
+        if remaining == 0 {
+            break;
+        }
+
+        let is_small_enough =
+            std::fs::metadata(path).map(|meta| meta.len() <= MAX_SEARCH_FILE_BYTES).unwrap_or(false);
+        if !is_small_enough {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        let hits = search::search_text(&content, &state.search_query);
-        if hits.is_empty() {
-            continue;
-        }
-
-        // Highlight the whole file once per file with results, not once per
-        // match — reuses the same `Highlighter` the editor canvas uses.
-        let language = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .and_then(syntax::Language::from_extension);
-        let file_spans = language.map(|lang| {
-            let mut highlighter = syntax::Highlighter::new();
-            highlighter.highlight(lang, &content)
-        });
-        let document = Document::from_str(&content);
+        // Bounded by `remaining`, not just `MAX_SEARCH_RESULTS` overall — a
+        // single file can't out-allocate the rest of the search budget
+        // combined. See `search_text`'s own doc for why this matters: every
+        // hit clones its whole line, so an uncapped scan of one large file
+        // with many matches on long lines is an unbounded-memory risk, not
+        // just a slow one.
+        let hits = search::search_text(&content, query, remaining);
 
         for hit in hits {
-            let segments = file_spans
-                .as_ref()
-                .map(|spans| line_segments(&document, spans, hit.line))
-                .unwrap_or_default();
-            state.search_results.push(SearchResult {
-                path: path.to_path_buf(),
+            results.push(SearchResult {
+                path: path.clone(),
                 hit,
-                segments,
                 query_len_chars,
             });
-            if state.search_results.len() >= MAX_SEARCH_RESULTS {
-                break 'files;
-            }
         }
     }
 
-    state.search_elapsed = started.elapsed();
+    SearchOutcome { query: query.to_string(), results, elapsed: started.elapsed() }
 }
 
-/// The syntax-colored runs covering `line`'s full text, in order — the same
-/// span-slicing `editor_canvas.rs` does per visible line, reused here for
-/// one search-result preview line instead of a whole open buffer.
-fn line_segments(document: &Document, spans: &[Span], line: usize) -> Vec<(String, syntax::HighlightKind)> {
-    let line_text = document.line_text(line);
-    if line_text.is_empty() {
-        return Vec::new();
+/// Starts a background search for `state.search_query`, cancelling
+/// whatever search was already in flight first. Runs on its own OS thread
+/// (`iced_runtime::task::blocking`) rather than as ordinary `async` work,
+/// so a stalled `std::fs::read_to_string` (a network mount, a cloud-sync
+/// placeholder file that has to download on open) blocks only that thread
+/// — the UI stays responsive no matter how long, or whether, it returns.
+///
+/// "Cancelling" the previous search only ever means aborting its `Task` —
+/// the `Handle::abort()` in `state.search_task_handle` — which stops its
+/// eventual `SearchCompleted` from ever being delivered/applied. It does
+/// *not*, and structurally can't, kill the OS thread already running that
+/// search: `std` has no safe way to interrupt a thread mid-syscall. An
+/// abandoned search's thread keeps running until its current file read
+/// returns (or, in the stalled-mount case, potentially never), just
+/// harmlessly discarding its result into a channel nothing reads anymore
+/// instead of freezing anything.
+fn start_search(state: &mut State) -> iced::Task<Message> {
+    if let Some(handle) = state.search_task_handle.take() {
+        handle.abort();
     }
-    let line_start_byte = document.text().line_to_byte(line);
-    let line_end_byte = line_start_byte + line_text.len();
+    if state.search_query.is_empty() {
+        state.search_in_progress = false;
+        return iced::Task::none();
+    }
 
-    let mut out = Vec::new();
-    for span in spans {
-        if span.end <= line_start_byte || span.start >= line_end_byte {
-            continue;
+    let query = state.search_query.clone();
+    let files: Vec<PathBuf> = fs_tree::flatten_files(&state.tree).into_iter().map(Path::to_path_buf).collect();
+    state.search_in_progress = true;
+
+    let (task, handle) = iced_runtime::task::blocking(move |mut sender| {
+        // Belt-and-suspenders alongside `logging::init`'s process-wide panic
+        // hook: that hook already logs *that* a panic happened on this
+        // thread, but `catch_unwind` here lets this specific call site say
+        // *what it was doing* (a plain "search thread panicked" beats
+        // hunting for which of several background threads a hook fired on).
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_search(&files, &query))) {
+            Ok(outcome) => {
+                let _ = sender.try_send(outcome);
+            }
+            Err(_) => {
+                crate::logging::error("start_search: run_search panicked — see the panic hook's log line above for details");
+            }
         }
-        let seg_start = span.start.max(line_start_byte) - line_start_byte;
-        let seg_end = (span.end.min(line_end_byte) - line_start_byte).min(line_text.len());
-        if seg_start < seg_end {
-            out.push((line_text[seg_start..seg_end].to_string(), span.kind));
+    })
+    .map(Message::SearchCompleted)
+    .abortable();
+    state.search_task_handle = Some(handle);
+    task
+}
+
+/// The native async folder picker behind `OpenFolderDialog`/`NewProjectDialog`.
+/// `rfd`'s dialog needs no parent-window handle for this basic case — it
+/// just appears as its own top-level window.
+async fn pick_folder() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new().pick_folder().await.map(|handle| handle.path().to_path_buf())
+}
+
+/// Starts a background project load: optionally `git init`s `path` (for
+/// "New project", when it isn't already a repo), then computes a full
+/// `snapshot_project`. Guarded by the caller checking `loading_project` is
+/// already `None` — unlike search, this is a one-shot action with no
+/// cancel-and-restart behavior, so a simple "ignore while one's in flight"
+/// guard is enough (no `Handle`/`abortable` needed).
+fn start_loading_project(state: &mut State, path: PathBuf, init_git: bool) -> iced::Task<Message> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    state.loading_project = Some(LoadingProject { name, path: path.clone() });
+
+    iced_runtime::task::blocking(move |mut sender| {
+        // Same belt-and-suspenders `catch_unwind` as `start_search`, on top
+        // of `logging::init`'s process-wide panic hook.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if init_git && Repo::open(&path).is_none() {
+                // Best-effort: if `git init` fails, still open the folder
+                // as a non-repo project rather than losing the pick.
+                Repo::init(&path);
+            }
+            LoadedProject { root: path.clone(), snapshot: snapshot_project(&path) }
+        }));
+        match outcome {
+            Ok(loaded) => {
+                let _ = sender.try_send(loaded);
+            }
+            Err(_) => {
+                crate::logging::error("start_loading_project: panicked — see the panic hook's log line above for details");
+            }
         }
+    })
+    .map(|loaded| Message::ProjectLoaded(Box::new(loaded)))
+}
+
+/// Resets every field scoped to the *previous* project — open tabs, search,
+/// transient UI, LSP handle — shared by `apply_loaded_project` (switching to
+/// a new root) and `close_project` (returning to the welcome screen with no
+/// root at all). No confirm-before-discard prompt: the app has no
+/// dirty-file guard anywhere else either (`close_tab` already discards
+/// silently), so this matches existing precedent rather than introducing a
+/// new one.
+fn reset_project_scoped_state(state: &mut State) {
+    state.open_tabs.clear();
+    state.active_tab = None;
+    state.closed_tabs.clear();
+    state.draft = None;
+    state.ctx_menu = None;
+    state.changes_panel_open = false;
+    state.search_query.clear();
+    state.search_query_changed_at = None;
+    state.search_in_progress = false;
+    if let Some(handle) = state.search_task_handle.take() {
+        handle.abort();
     }
-    out
+    state.search_last_query.clear();
+    state.search_results.clear();
+    state.search_elapsed = Duration::ZERO;
+    state.toasts.clear();
+    state.flash = None;
+    state.projects_open = false;
+    // The LSP subscription is keyed on `state.root` (`run_with` in
+    // `subscription`), so changing it below tears down the old worker and
+    // spawns a fresh one automatically — these just clear the stale handle/
+    // status in the meantime.
+    state.lsp_sender = None;
+    state.lsp_status = LspStatus::default();
+}
+
+fn apply_loaded_project(state: &mut State, loaded: LoadedProject) {
+    let LoadedProject { root, snapshot } = loaded;
+    reset_project_scoped_state(state);
+    state.repo = Repo::open(&root);
+    state.root = root.clone();
+    state.tree = snapshot.tree;
+    state.collapsed_dirs = snapshot.collapsed_dirs;
+    state.changed_files = snapshot.changed_files;
+    state.ahead_behind = snapshot.ahead_behind;
+    state.welcome_open = false;
+    state.loading_project = None;
+    recent_projects::touch(&mut state.recent_projects, root);
+    state.welcome_rows = compute_welcome_rows(&state.recent_projects);
+}
+
+fn close_project(state: &mut State) {
+    reset_project_scoped_state(state);
+    state.repo = None;
+    state.root = PathBuf::new();
+    state.tree = Vec::new();
+    state.collapsed_dirs = HashSet::new();
+    state.changed_files = Vec::new();
+    state.ahead_behind = None;
+    state.welcome_open = true;
+    state.loading_project = None;
+    state.welcome_rows = compute_welcome_rows(&state.recent_projects);
 }
 
 fn lsp_uri(path: &Path) -> Option<lsp::Url> {
@@ -1739,12 +2579,22 @@ fn utf16_col_to_char_col(line: &str, utf16_col: usize) -> usize {
     line.chars().count()
 }
 
-/// Zero-arg by design: `Subscription::run` needs a plain `fn` pointer (no
-/// captures), and DevScribe doesn't support changing the project root at
-/// runtime yet, so rediscovering it here (same as `State::default`) is
-/// simpler than threading it through as subscription data.
-fn lsp_worker() -> impl iced::futures::Stream<Item = LspEvent> {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+/// Keyed on `root` via `Subscription::run_with` (see `subscription`) rather
+/// than the zero-arg `Subscription::run` this used before project-switching
+/// existed: `run_with`'s data is part of the subscription's identity, so a
+/// project switch changing `state.root` makes the runtime tear down the old
+/// LSP worker and spawn a fresh one for the new root automatically — no
+/// manual kill/respawn bookkeeping needed beyond `reset_project_scoped_state`
+/// clearing the stale `lsp_sender`/`lsp_status` in the meantime.
+///
+/// `&PathBuf`, not `&Path` as clippy would otherwise want: `run_with<D,
+/// S>(data: D, builder: fn(&D) -> S)` requires this to be exactly
+/// `fn(&PathBuf) -> S` since `D = PathBuf` (`state.root`'s type) — a raw
+/// `fn` pointer type isn't interchangeable with `fn(&Path) -> S` the way an
+/// ordinary call-site argument would be.
+#[allow(clippy::ptr_arg)]
+fn lsp_worker(root: &PathBuf) -> impl iced::futures::Stream<Item = LspEvent> + use<> {
+    let root = root.clone();
     iced::stream::channel(32, async move |output| {
         lsp::run(root, output).await;
     })
@@ -1793,6 +2643,15 @@ fn global_keys(event: keyboard::Event) -> Message {
             if modifiers.shift() && c.eq_ignore_ascii_case("t") {
                 return Message::ReopenClosedTab;
             }
+            if modifiers.shift() && c.eq_ignore_ascii_case("d") {
+                return Message::ViewWorkingTreeDiff;
+            }
+            if c.eq_ignore_ascii_case("i") {
+                return Message::ToggleAssist;
+            }
+            if c.eq_ignore_ascii_case("/") {
+                return Message::OpenShortcutsHelp;
+            }
         }
         if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
             return Message::EscapePressed;
@@ -1810,264 +2669,46 @@ fn global_keys(event: keyboard::Event) -> Message {
     Message::Noop
 }
 
-pub fn subscription(_state: &State) -> iced::Subscription<Message> {
-    iced::Subscription::batch([
+/// Maps `iced::window::events()` to `Message::WindowUnfocused` on the one
+/// variant `save_on_focus_loss` cares about — every other window event
+/// (resize, move, redraw…) is a no-op here.
+fn window_events((_id, event): (iced::window::Id, iced::window::Event)) -> Message {
+    match event {
+        iced::window::Event::Unfocused => Message::WindowUnfocused,
+        _ => Message::Noop,
+    }
+}
+
+pub fn subscription(state: &State) -> iced::Subscription<Message> {
+    let mut subs = vec![
         iced::time::every(std::time::Duration::from_millis(530)).map(|_| Message::CaretTick),
         iced::time::every(Duration::from_secs(1)).map(|_| Message::PruneToasts),
-        iced::Subscription::run(lsp_worker).map(Message::Lsp),
         iced::keyboard::listen().map(global_keys),
-    ])
+        iced::window::events().map(window_events),
+    ];
+    // No LSP worker while no project is open (`welcome_open`) — there's no
+    // meaningful root to spawn one for. Once one is, keying on `state.root`
+    // via `run_with` (see `lsp_worker`'s doc) restarts it on every project
+    // switch for free.
+    if !state.welcome_open {
+        subs.push(iced::Subscription::run_with(state.root.clone(), lsp_worker).map(Message::Lsp));
+    }
+    // Only ticks while there's an actual pending debounce to check
+    // (`search_query_changed_at` goes back to `None` the moment a search
+    // starts — see `Message::SearchDebounceTick`/`SearchSubmit`), *not* a
+    // permanent 10Hz subscription. A found-and-fixed regression from the
+    // debounce rewrite: an unconditional 100ms tick forces a full `view()`
+    // rebuild ten times a second for the *entire app*, forever, not just
+    // while search is in use — with a couple hundred result rows sitting on
+    // screen, that's real, sustained, unbounded-duration load, easily
+    // enough to look like the app hanging even though nothing is actually
+    // stuck (see the roadmap's search bug-fix writeup, "seventh pass").
+    if state.search_query_changed_at.is_some() {
+        subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::SearchDebounceTick));
+    }
+    iced::Subscription::batch(subs)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A scratch dir with two files, for tests that need real paths
-    /// `Document::open` can read. Cleaned up on drop.
-    struct TempFiles {
-        dir: PathBuf,
-        pub a: PathBuf,
-        pub b: PathBuf,
-    }
-
-    impl TempFiles {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "devscribe-tabs-test-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id(),
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let a = dir.join("a.txt");
-            let b = dir.join("b.txt");
-            std::fs::write(&a, "a").unwrap();
-            std::fs::write(&b, "b").unwrap();
-            Self { dir, a, b }
-        }
-    }
-
-    impl Drop for TempFiles {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    #[test]
-    fn open_or_focus_file_dedups_and_is_additive() {
-        let files = TempFiles::new("dedup");
-        let mut state = State::default();
-
-        open_or_focus_file(&mut state, files.a.clone());
-        assert_eq!(state.open_tabs.len(), 1);
-        assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())));
-
-        open_or_focus_file(&mut state, files.b.clone());
-        assert_eq!(state.open_tabs.len(), 2, "opening a second file should be additive, not a replace");
-        assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())));
-
-        open_or_focus_file(&mut state, files.a.clone());
-        assert_eq!(state.open_tabs.len(), 2, "reopening an already-open file must not duplicate its tab");
-        assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())));
-    }
-
-    #[test]
-    fn close_tab_also_closes_its_diff_tab_and_refocuses() {
-        let files = TempFiles::new("close");
-        let mut state = State::default();
-
-        open_or_focus_file(&mut state, files.a.clone());
-        open_or_focus_file(&mut state, files.b.clone());
-        open_or_focus_diff(&mut state, files.a.clone());
-        assert_eq!(state.open_tabs.len(), 3);
-        assert_eq!(state.active_tab, Some(TabKey::Diff(files.a.clone())));
-
-        close_tab(&mut state, &TabKey::File(files.a.clone()));
-
-        assert_eq!(
-            state.open_tabs.iter().map(OpenTab::key).collect::<Vec<_>>(),
-            vec![TabKey::File(files.b.clone())],
-            "closing a file tab must also close its now-orphaned diff tab"
-        );
-        assert_eq!(
-            state.active_tab,
-            Some(TabKey::File(files.b.clone())),
-            "closing the active tab (even indirectly, via its diff tab) must refocus a remaining tab"
-        );
-    }
-
-    #[test]
-    fn closing_last_tab_clears_active_tab() {
-        let files = TempFiles::new("last");
-        let mut state = State::default();
-
-        open_or_focus_file(&mut state, files.a.clone());
-        close_tab(&mut state, &TabKey::File(files.a.clone()));
-
-        assert!(state.open_tabs.is_empty());
-        assert_eq!(state.active_tab, None);
-    }
-
-    #[test]
-    fn utf16_col_ascii_matches_char_col() {
-        assert_eq!(utf16_col_to_char_col("let x = 1;", 4), 4);
-        assert_eq!(utf16_col_to_char_col("let x = 1;", 0), 0);
-    }
-
-    #[test]
-    fn utf16_col_past_end_clamps_to_line_length() {
-        assert_eq!(utf16_col_to_char_col("abc", 99), 3);
-    }
-
-    #[test]
-    fn utf16_col_bmp_multibyte_char_counts_as_one_unit() {
-        // 'é' is 1 UTF-16 code unit but 2 UTF-8 bytes — this must track
-        // chars/UTF-16 units, not bytes.
-        let line = "café!";
-        assert_eq!(utf16_col_to_char_col(line, 4), 4);
-    }
-
-    #[test]
-    fn utf16_col_surrogate_pair_counts_as_two_units() {
-        // An emoji outside the BMP is 1 char but 2 UTF-16 code units, so an
-        // LSP column pointing just past it is offset by 2, not 1.
-        let line = "a\u{1F600}b";
-        assert_eq!(utf16_col_to_char_col(line, 0), 0);
-        assert_eq!(utf16_col_to_char_col(line, 1), 1);
-        assert_eq!(utf16_col_to_char_col(line, 3), 2);
-    }
-
-    #[test]
-    fn line_segments_matches_real_highlighter_output() {
-        let source = "fn main() {\n    let x = 1;\n}\n";
-        let document = Document::from_str(source);
-        let mut highlighter = syntax::Highlighter::new();
-        let spans = highlighter.highlight(syntax::Language::Rust, source);
-
-        // Line 1 is `    let x = 1;` — `let` should come back as its own
-        // Keyword-colored segment, not merged into the surrounding text.
-        let segments = line_segments(&document, &spans, 1);
-        let joined: String = segments.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(joined, document.line_text(1), "segments must reconstruct the full line with no gaps");
-
-        let let_segment = segments
-            .iter()
-            .find(|(text, _)| text == "let")
-            .expect("`let` should be its own segment");
-        assert_eq!(let_segment.1, syntax::HighlightKind::Keyword);
-    }
-
-    #[test]
-    fn commit_draft_new_file_writes_to_disk_and_opens_tab() {
-        let files = TempFiles::new("draft-new-file");
-        let dir = files.a.parent().unwrap().to_path_buf();
-        let mut state = State {
-            draft: Some(Draft {
-                kind: DraftKind::NewFile,
-                dir: dir.clone(),
-                target: None,
-                text: "new.txt".to_string(),
-            }),
-            ..State::default()
-        };
-
-        commit_draft(&mut state);
-
-        assert!(state.draft.is_none(), "a successful commit should clear the draft");
-        let new_path = dir.join("new.txt");
-        assert!(new_path.exists(), "commit_draft should actually write the file to disk");
-        assert_eq!(state.active_tab, Some(TabKey::File(new_path)));
-        assert!(
-            state.flash.as_ref().is_some_and(|f| f.text.contains("FILE CREATED")),
-            "a successful new-file commit should fire the flash pill"
-        );
-    }
-
-    #[test]
-    fn commit_draft_rename_updates_open_tab_path_in_place() {
-        let files = TempFiles::new("draft-rename");
-        let mut state = State::default();
-        open_or_focus_file(&mut state, files.a.clone());
-        let new_path = files.a.with_file_name("renamed.txt");
-        state.draft = Some(Draft {
-            kind: DraftKind::Rename,
-            dir: files.a.parent().unwrap().to_path_buf(),
-            target: Some(files.a.clone()),
-            text: "renamed.txt".to_string(),
-        });
-
-        commit_draft(&mut state);
-
-        assert!(!files.a.exists(), "the old path should no longer exist after a rename");
-        assert!(new_path.exists());
-        assert_eq!(
-            state.active_tab,
-            Some(TabKey::File(new_path.clone())),
-            "the active tab's key should follow the rename, not go stale"
-        );
-        let editor = find_editor(&state, &new_path).expect("the renamed file's tab should still be open, under its new path");
-        assert_eq!(editor.path, new_path);
-        assert_eq!(
-            editor.document.path(),
-            Some(new_path.as_path()),
-            "the document's own path must be repointed too, or a later save would write to the old (now gone) path"
-        );
-    }
-
-    #[test]
-    fn close_other_tabs_keeps_only_the_active_tab() {
-        let files = TempFiles::new("close-others");
-        let mut state = State::default();
-        open_or_focus_file(&mut state, files.a.clone());
-        open_or_focus_file(&mut state, files.b.clone());
-        assert_eq!(state.open_tabs.len(), 2);
-        assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())));
-
-        close_other_tabs(&mut state);
-
-        assert_eq!(state.open_tabs.len(), 1);
-        assert_eq!(
-            state.active_tab,
-            Some(TabKey::File(files.b.clone())),
-            "the active tab itself must survive Close Others"
-        );
-    }
-
-    #[test]
-    fn reopen_closed_tab_restores_the_most_recently_closed() {
-        let files = TempFiles::new("reopen");
-        let mut state = State::default();
-        open_or_focus_file(&mut state, files.a.clone());
-        close_tab(&mut state, &TabKey::File(files.a.clone()));
-        assert_eq!(state.open_tabs.len(), 0);
-
-        reopen_closed_tab(&mut state);
-
-        assert_eq!(state.open_tabs.len(), 1);
-        assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())));
-    }
-
-    #[test]
-    fn reveal_active_in_tree_uncollapses_ancestor_dirs() {
-        let files = TempFiles::new("reveal");
-        let root = files.a.parent().unwrap().to_path_buf();
-        let sub = root.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let nested = sub.join("nested.txt");
-        std::fs::write(&nested, "x").unwrap();
-
-        let mut state = State {
-            root: root.clone(),
-            ..State::default()
-        };
-        state.collapsed_dirs.insert(sub.clone());
-        open_or_focus_file(&mut state, nested.clone());
-
-        reveal_active_in_tree(&mut state);
-
-        assert!(
-            !state.collapsed_dirs.contains(&sub),
-            "the active file's parent directory should be expanded so it's actually visible"
-        );
-    }
-}
+#[path = "tests/state.rs"]
+mod tests;

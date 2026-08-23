@@ -19,6 +19,63 @@ fn hint(label: &'static str, p: devscribe_core::theme::Palette) -> Element<'stat
         .into()
 }
 
+/// A non-interactive section label ("FILES") splitting the results list —
+/// only shown for the contextual "diff" grouping below.
+fn section_header(label: &'static str, p: devscribe_core::theme::Palette) -> Element<'static, Message> {
+    container(
+        text(label)
+            .font(fonts::mono(Weight::Semibold))
+            .size(crate::text_scale::px(10.0))
+            .color(color(p.text_muted)),
+    )
+    .padding(Padding {
+        top: 9.0,
+        right: 12.0,
+        bottom: 4.0,
+        left: 12.0,
+    })
+    .into()
+}
+
+fn entry_row(
+    i: usize,
+    entry: &state::PaletteEntry,
+    selected: usize,
+    p: devscribe_core::theme::Palette,
+) -> Element<'static, Message> {
+    let is_selected = i == selected;
+    let label = text(entry.label.clone())
+        .font(fonts::mono(Weight::Medium))
+        .size(crate::text_scale::px(12.0))
+        .color(if is_selected {
+            color(p.text_primary)
+        } else {
+            color(p.text_secondary)
+        });
+    button(label)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 8.0,
+            right: 12.0,
+            bottom: 8.0,
+            left: 12.0,
+        })
+        .on_press(Message::PaletteRun(entry.action.clone()))
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if is_selected || hovered {
+                    Some(color(p.surface_hover).into())
+                } else {
+                    None
+                },
+                text_color: color(p.text_primary),
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
 pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if !state.palette_open {
         return None;
@@ -28,43 +85,26 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let entries = state::filtered_palette_entries(state);
     let selected = state.palette_selected.min(entries.len().saturating_sub(1));
 
-    let rows: Vec<Element<'static, Message>> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let is_selected = i == selected;
-            let label = text(entry.label.clone())
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(12.0))
-                .color(if is_selected {
-                    color(p.text_primary)
-                } else {
-                    color(p.text_secondary)
-                });
-            button(label)
-                .width(Length::Fill)
-                .padding(Padding {
-                    top: 8.0,
-                    right: 12.0,
-                    bottom: 8.0,
-                    left: 12.0,
-                })
-                .on_press(Message::PaletteRun(entry.action.clone()))
-                .style(move |_theme, status| {
-                    let hovered = status == button::Status::Hovered;
-                    button::Style {
-                        background: if is_selected || hovered {
-                            Some(color(p.surface_hover).into())
-                        } else {
-                            None
-                        },
-                        text_color: color(p.text_primary),
-                        ..button::Style::default()
-                    }
-                })
-                .into()
-        })
-        .collect();
+    // Contextual "Diff:" grouping: whenever the query contains "diff", split
+    // results into commands (everything else) and a "FILES" section for the
+    // `Open: ...`-labeled file entries, instead of one flat list — matching
+    // the mockup's "Diff: open working tree changes" + FILES layout. Pure
+    // rendering: `entries`/`selected` (and thus keyboard nav and Enter-to-run)
+    // are untouched, indices just get visited in two passes instead of one.
+    let is_diff_query = !state.palette_query.is_empty() && state.palette_query.to_ascii_lowercase().contains("diff");
+    let rows: Vec<Element<'static, Message>> = if is_diff_query {
+        let (file_idx, command_idx): (Vec<usize>, Vec<usize>) =
+            (0..entries.len()).partition(|&i| entries[i].label.starts_with("Open: "));
+        let mut rows: Vec<Element<'static, Message>> =
+            command_idx.iter().map(|&i| entry_row(i, &entries[i], selected, p)).collect();
+        if !file_idx.is_empty() {
+            rows.push(section_header("FILES", p));
+            rows.extend(file_idx.iter().map(|&i| entry_row(i, &entries[i], selected, p)));
+        }
+        rows
+    } else {
+        entries.iter().enumerate().map(|(i, entry)| entry_row(i, entry, selected, p)).collect()
+    };
 
     let results: Element<'static, Message> = if rows.is_empty() {
         container(
@@ -165,6 +205,13 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         },
         ..container::Style::default()
     });
+
+    // Shields the panel from the backdrop below — the footer hints and
+    // "No matches" text are plain, non-capturing `text`/`container`, so
+    // without this a click on them (or any other dead space in the panel)
+    // would fall through to the backdrop's `on_press` and close the
+    // palette. Same fix as `settings_panel.rs`'s `panel` shield.
+    let panel = mouse_area(panel).on_press(Message::Noop);
 
     let backdrop = mouse_area(
         container(Space::new().width(Length::Fill).height(Length::Fill))

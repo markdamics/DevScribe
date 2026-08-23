@@ -10,12 +10,31 @@ use crate::state::{DraftKind, Message, State};
 use crate::widgets;
 
 fn menu_row(label: &'static str, shortcut: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    styled_menu_row(label, shortcut, message, color(p.text_primary), p)
+}
+
+/// "Delete"'s own row, in `status_danger` rather than the normal text
+/// color — the one destructive entry in this menu, colored to stand apart
+/// from New file/New folder/Rename/Copy path the way the mockup's other
+/// danger-tinted UI (e.g. the sidebar's `Deleted` change badge) already
+/// does.
+fn danger_menu_row(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    styled_menu_row(label, "", message, color(p.status_danger), p)
+}
+
+fn styled_menu_row(
+    label: &'static str,
+    shortcut: &'static str,
+    message: Message,
+    text_color: iced::Color,
+    p: Palette,
+) -> Element<'static, Message> {
     button(
         row![
             text(label)
                 .font(fonts::sans(iced::font::Weight::Medium))
                 .size(crate::text_scale::px(12.0))
-                .color(color(p.text_primary))
+                .color(text_color)
                 .width(Length::Fill),
             text(shortcut)
                 .font(fonts::mono(Weight::Medium))
@@ -41,6 +60,38 @@ fn menu_row(label: &'static str, shortcut: &'static str, message: Message, p: Pa
     .into()
 }
 
+/// The confirm/cancel step shown once "Delete" has been clicked once
+/// (`ContextMenu::confirm_delete`) — a plain-text warning plus two rows,
+/// replacing the normal New file/New folder/Rename/Copy path/Delete rows
+/// entirely rather than layering a second menu on top.
+fn confirm_delete_rows(target: &Path, p: Palette) -> Vec<Element<'static, Message>> {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let noun = if target.is_dir() { "folder and everything in it" } else { "file" };
+    vec![
+        text(format!("Delete this {noun}?"))
+            .font(fonts::sans(iced::font::Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_primary))
+            .into(),
+        text(name)
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(11.0))
+            .color(color(p.text_muted))
+            .into(),
+        text("This can't be undone.")
+            .font(fonts::sans(iced::font::Weight::Medium))
+            .size(crate::text_scale::px(11.0))
+            .color(color(p.status_danger))
+            .into(),
+        widgets::hline(color(p.line_neutral)),
+        menu_row("Cancel", "", Message::CloseTreeContext, p),
+        danger_menu_row("Delete permanently", Message::DeletePath(target.to_path_buf()), p),
+    ]
+}
+
 pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
     let ctx = state.ctx_menu.as_ref()?;
 
@@ -57,20 +108,27 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         None => state.root.clone(),
     };
 
-    let mut rows: Vec<Element<'static, Message>> = vec![
-        text(target_label.to_uppercase())
-            .font(fonts::mono(Weight::Semibold))
-            .size(crate::text_scale::px(10.0))
-            .color(color(p.text_muted))
-            .into(),
-        menu_row("New file", "\u{2318}N", Message::BeginDraftIn(DraftKind::NewFile, dir.clone()), p),
-        menu_row("New folder", "\u{21e7}\u{2318}N", Message::BeginDraftIn(DraftKind::NewFolder, dir), p),
-    ];
-    if let Some(target) = ctx.target.clone() {
-        rows.push(widgets::hline(color(p.line_neutral)));
-        rows.push(menu_row("Rename", "\u{21b5}", Message::BeginRename(target.clone()), p));
-        rows.push(menu_row("Copy path", "\u{2325}\u{2318}C", Message::CopyPath(target), p));
-    }
+    let rows: Vec<Element<'static, Message>> = if let Some(target) = ctx.target.as_ref().filter(|_| ctx.confirm_delete) {
+        confirm_delete_rows(target, p)
+    } else {
+        let mut rows: Vec<Element<'static, Message>> = vec![
+            text(target_label.to_uppercase())
+                .font(fonts::mono(Weight::Semibold))
+                .size(crate::text_scale::px(10.0))
+                .color(color(p.text_muted))
+                .into(),
+            menu_row("New file", "\u{2318}N", Message::BeginDraftIn(DraftKind::NewFile, dir.clone()), p),
+            menu_row("New folder", "\u{21e7}\u{2318}N", Message::BeginDraftIn(DraftKind::NewFolder, dir), p),
+        ];
+        if let Some(target) = ctx.target.clone() {
+            rows.push(widgets::hline(color(p.line_neutral)));
+            rows.push(menu_row("Rename", "\u{21b5}", Message::BeginRename(target.clone()), p));
+            rows.push(menu_row("Copy path", "\u{2325}\u{2318}C", Message::CopyPath(target), p));
+            rows.push(widgets::hline(color(p.line_neutral)));
+            rows.push(danger_menu_row("Delete", Message::PromptDeletePath, p));
+        }
+        rows
+    };
 
     let menu = container(column(rows).spacing(2.0).padding(6.0))
         .width(Length::Fixed(214.0))

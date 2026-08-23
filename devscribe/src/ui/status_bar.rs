@@ -7,7 +7,7 @@ use iced::{Alignment, Element, Length};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{LspStatus, Message, OpenTab, State};
+use crate::state::{Message, OpenTab, State};
 use crate::widgets;
 
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
@@ -52,11 +52,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     .spacing(6.0)
     .align_y(Alignment::Center);
 
-    let (lsp_color, lsp_label) = match &state.lsp_status {
-        LspStatus::Starting => (p.text_muted, "rust-analyzer starting\u{2026}".to_string()),
-        LspStatus::Ready => (p.status_ok, "rust-analyzer ready".to_string()),
-        LspStatus::Unavailable(reason) => (p.status_warn, format!("rust-analyzer unavailable ({reason})")),
-    };
+    let (lsp_color, lsp_label) = state.lsp_status.describe(p);
     let lsp = row![
         widgets::dot(color(lsp_color), 6.0),
         text(lsp_label)
@@ -67,21 +63,10 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     .spacing(6.0)
     .align_y(Alignment::Center);
 
-    let branch_label = state
-        .repo
-        .as_ref()
-        .and_then(|repo| repo.branch_name())
-        .unwrap_or_else(|| "no git repo".to_string());
-    let branch = text(branch_label)
-        .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(11.0))
-        .color(color(p.text_muted));
-
     let bar = row![
         problems,
         iced::widget::Space::new().width(Length::Fill),
         lsp,
-        branch,
     ]
     .spacing(16.0)
     .align_y(Alignment::Center)

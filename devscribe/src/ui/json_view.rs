@@ -43,11 +43,11 @@ fn key_label(key: Option<&str>, p: Palette) -> Option<Element<'static, Message>>
 }
 
 fn toggle(p: Palette, path: String, collapsed: bool) -> Element<'static, Message> {
-    button(
+    button(widgets::center_fill(
         text(if collapsed { "\u{25b8}" } else { "\u{25be}" })
             .size(crate::text_scale::px(9.0))
             .color(color(p.text_muted)),
-    )
+    ))
     .padding(0.0)
     .width(Length::Fixed(GUTTER))
     .height(Length::Fixed(16.0))

@@ -1,9 +1,12 @@
 //! The settings overlay: a left-nav modal (`Explorer`/`Editor`/`Toolchains`/
-//! `Keymap`/`Advanced`) matching the mockup's 760x520 shell. Only Explorer
-//! and Editor have real content; the rest are honest placeholders — see
-//! `docs/differences-and-roadmap.md`'s Phase 4 writeup for why. Rendered as
-//! a `stack!` layer over the shell, same backdrop-modal mechanism as
-//! `command_palette`.
+//! `Shortcuts`/`About`) matching the mockup's 760x520 shell. Every category
+//! has real content as of Phase 7 — see `docs/differences-and-roadmap.md`'s
+//! Phase 7 writeup for what "real" means for Toolchains (DevScribe only
+//! ever speaks to one language server, so that's all it claims) and
+//! Shortcuts (only currently-wired keybindings are listed, not the
+//! mockup's `New window`/`Open folder`/`Save as` rows — none of those
+//! actions exist in DevScribe). Rendered as a `stack!` layer over the
+//! shell, same backdrop-modal mechanism as `command_palette`.
 use devscribe_core::theme::{Palette, ThemeName};
 use iced::font::Weight;
 use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
@@ -25,12 +28,12 @@ use crate::widgets;
 /// that's the settings modal's backdrop `mouse_area`, which would close the
 /// whole panel on a click that was only ever meant to hit a floor/ceiling.
 fn stepper_button(label: &'static str, p: Palette, message: Message, enabled: bool) -> Element<'static, Message> {
-    button(
+    button(widgets::center_fill(
         text(label)
             .font(fonts::mono(Weight::Bold))
             .size(crate::text_scale::px(13.0))
             .color(if enabled { color(p.text_primary) } else { color(p.text_muted) }),
-    )
+    ))
     .width(Length::Fixed(28.0))
     .height(Length::Fixed(28.0))
     .padding(0.0)
@@ -313,22 +316,194 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
     .into()
 }
 
+/// Keeps DevScribe's existing font-size stepper (a real, working control)
+/// even though the mockup's refreshed Editor category dropped it in favor
+/// of just the two toggles below — a deliberate divergence, confirmed
+/// rather than assumed, since dropping it would make editor font size
+/// unreachable (no other control sets it). "Inline problem lens" duplicates
+/// the Explorer toggle of the same name (both drive the same
+/// `state.problem_lens_enabled`) — the mockup shows it in both places, and
+/// there's no reason to disallow that here.
 fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
-    column![column![section_label("FONT SIZE", p), font_size_row(state, p)].spacing(8.0)]
-        .spacing(20.0)
-        .into()
+    column![
+        column![section_label("FONT SIZE", p), font_size_row(state, p)].spacing(8.0),
+        column![
+            section_label("DIAGNOSTICS", p),
+            toggle_row("Show inline problem hints", state.problem_lens_enabled, Message::ToggleProblemLens, p),
+        ]
+        .spacing(8.0),
+        column![
+            section_label("SAVING", p),
+            toggle_row(
+                "Save on focus loss",
+                state.save_on_focus_loss,
+                Message::ToggleSaveOnFocusLoss,
+                p
+            ),
+        ]
+        .spacing(8.0),
+    ]
+    .spacing(20.0)
+    .into()
 }
 
-fn placeholder_content(category: SettingsCategory, p: Palette) -> Element<'static, Message> {
+/// A non-interactive status row: a colored dot, a name, and a status label
+/// pushed to the right — shared by Toolchains' language-server row and
+/// About's matching summary row, both driven by the same
+/// `LspStatus::describe`.
+fn status_row(name: &'static str, status_color: Color, status_label: String, p: Palette) -> Element<'static, Message> {
     container(
-        text(format!("{} settings aren't available yet.", category.label()))
-            .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_muted)),
+        row![
+            widgets::dot(status_color, 6.0),
+            text(name)
+                .font(fonts::mono(Weight::Semibold))
+                .size(crate::text_scale::px(12.0))
+                .color(color(p.text_primary))
+                .width(Length::Fill),
+            text(status_label)
+                .font(fonts::mono(Weight::Medium))
+                .size(crate::text_scale::px(11.0))
+                .color(status_color),
+        ]
+        .spacing(8.0)
+        .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fill)
-    .center(Length::Fill)
+    .padding([8.0, 10.0])
+    .style(move |_theme| container::Style {
+        border: Border {
+            color: color(p.line_neutral),
+            width: 1.0,
+            radius: 2.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// The one real toolchain DevScribe manages: `rust-analyzer`, via
+/// `state.lsp_status`. Deliberately doesn't list the mockup's clangd/jdtls/
+/// typescript-language-server rows — DevScribe has no integration with any
+/// of those, and fabricated "READY" statuses for servers that don't exist
+/// would be exactly the kind of fake control this project has consistently
+/// avoided (see e.g. Phase 4's "Install toolchains automatically").
+fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
+    let (status_color, status_label) = state.lsp_status.describe(p);
+    column![
+        section_label("LANGUAGE SERVERS", p),
+        status_row("RUST-ANALYZER", color(status_color), status_label, p),
+    ]
+    .spacing(8.0)
+    .into()
+}
+
+fn shortcut_row(label: &'static str, keys: &'static str, p: Palette) -> Element<'static, Message> {
+    row![
+        text(label)
+            .font(fonts::sans(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_secondary))
+            .width(Length::Fill),
+        text(keys)
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(11.0))
+            .color(color(p.text_primary)),
+    ]
+    .align_y(Alignment::Center)
+    .padding([7.0, 0.0])
+    .into()
+}
+
+/// A static reference table of every keybinding actually wired in
+/// `state::global_keys` (plus the two right-click-only ones at the bottom,
+/// clearly separated) — not the mockup's 10-row list verbatim. The mockup
+/// includes "New window"/"Open folder"/"Save as", none of which have a real
+/// handler in DevScribe (no multi-window support, no folder-picker
+/// dependency yet, no save-as flow), so listing them here would document
+/// shortcuts that don't work. Conversely this table includes several real
+/// shortcuts the mockup's illustrative list didn't happen to mention
+/// (Close tab, Close others, Reopen closed tab, Reveal in tree, Escape) —
+/// a keyboard reference is more useful complete than mockup-literal.
+fn shortcuts_content(p: Palette) -> Element<'static, Message> {
+    column![
+        column![
+            section_label("GENERAL", p),
+            column![
+                shortcut_row("Command palette", "\u{2318}K", p),
+                shortcut_row("Keyboard shortcuts", "\u{2318}/", p),
+                shortcut_row("Toggle assist", "\u{2318}I", p),
+                shortcut_row("Escape / close", "esc", p),
+            ]
+        ]
+        .spacing(8.0),
+        column![
+            section_label("FILES", p),
+            column![
+                shortcut_row("New file", "\u{2318}N", p),
+                shortcut_row("New folder", "\u{21e7}\u{2318}N", p),
+                shortcut_row("Save", "\u{2318}S", p),
+                shortcut_row("Copy path", "\u{2325}\u{2318}C", p),
+            ]
+        ]
+        .spacing(8.0),
+        column![
+            section_label("TABS & SEARCH", p),
+            column![
+                shortcut_row("Close tab", "\u{2318}W", p),
+                shortcut_row("Close other tabs", "\u{2325}\u{2318}W", p),
+                shortcut_row("Reopen closed tab", "\u{21e7}\u{2318}T", p),
+                shortcut_row("Reveal in tree", "\u{21e7}\u{2318}E", p),
+                shortcut_row("Find in file", "\u{2318}F", p),
+                shortcut_row("Find in project", "\u{21e7}\u{2318}F", p),
+                shortcut_row("Working tree diff", "\u{21e7}\u{2318}D", p),
+            ]
+        ]
+        .spacing(8.0),
+    ]
+    .spacing(20.0)
+    .into()
+}
+
+/// A real BUILD/PLATFORM/TOOLCHAIN table — not the mockup's BUILD/RUNTIME/
+/// TOOLCHAINS/LICENSE. `RUNTIME` (the compiling rustc's version) and
+/// `LICENSE` are dropped rather than faked: neither is tracked anywhere in
+/// this workspace (no `build.rs` capturing `rustc --version`, no `license`
+/// field in `Cargo.toml`), and inventing values for either would be exactly
+/// the kind of fabricated content this doc keeps calling out.
+fn about_content(state: &State, p: Palette) -> Element<'static, Message> {
+    let (status_color, status_label) = state.lsp_status.describe(p);
+    let banner = column![
+        text("DEVSCRIBE")
+            .font(fonts::display(Weight::ExtraBold))
+            .size(crate::text_scale::px(22.0))
+            .color(color(p.text_primary)),
+        text(concat!("v", env!("CARGO_PKG_VERSION")))
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(11.0))
+            .color(color(p.text_muted)),
+    ]
+    .spacing(2.0);
+
+    column![
+        banner,
+        column![
+            section_label("BUILD", p),
+            status_row("VERSION", color(p.text_primary), env!("CARGO_PKG_VERSION").to_string(), p),
+            status_row(
+                "PLATFORM",
+                color(p.text_primary),
+                format!("{} // {}", std::env::consts::OS, std::env::consts::ARCH),
+                p
+            ),
+        ]
+        .spacing(8.0),
+        column![
+            section_label("TOOLCHAIN", p),
+            status_row("RUST-ANALYZER", color(status_color), status_label, p),
+        ]
+        .spacing(8.0),
+    ]
+    .spacing(20.0)
     .into()
 }
 
@@ -336,7 +511,9 @@ fn category_content(state: &State, p: Palette) -> Element<'static, Message> {
     let content = match state.settings_category {
         SettingsCategory::Explorer => explorer_content(state, p),
         SettingsCategory::Editor => editor_content(state, p),
-        category => return placeholder_content(category, p),
+        SettingsCategory::Toolchains => toolchains_content(state, p),
+        SettingsCategory::Shortcuts => shortcuts_content(p),
+        SettingsCategory::About => about_content(state, p),
     };
     scrollable(container(content).width(Length::Fill).padding(20.0))
         .width(Length::Fill)
@@ -356,7 +533,9 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
             .size(crate::text_scale::px(12.0))
             .color(color(p.text_primary))
             .width(Length::Fill),
-        button(text("\u{2715}").size(crate::text_scale::px(11.0)).color(color(p.text_muted)))
+        button(widgets::center_fill(
+            text("\u{2715}").size(crate::text_scale::px(11.0)).color(color(p.text_muted)),
+        ))
             .padding(0.0)
             .width(Length::Fixed(18.0))
             .height(Length::Fixed(18.0))
@@ -383,6 +562,17 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
             },
             ..container::Style::default()
         });
+
+    // Shields the panel from the backdrop below: a plain `container`/`row`
+    // (e.g. `status_row`/`shortcut_row`'s reference content — most of
+    // Toolchains/Shortcuts/About) doesn't capture clicks on its own, so
+    // without this, clicking any non-button spot inside the panel — a
+    // status row, a shortcut's key label, blank space between sections —
+    // falls through all the way to the backdrop `mouse_area` below and
+    // closes the whole modal. Real buttons/inputs inside `panel` still
+    // capture their own presses first, so this only catches what they
+    // don't.
+    let panel = mouse_area(panel).on_press(Message::Noop);
 
     let backdrop = mouse_area(
         container(Space::new().width(Length::Fill).height(Length::Fill))
