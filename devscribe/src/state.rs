@@ -89,6 +89,10 @@ pub enum LspStatus {
     Starting,
     Ready,
     Unavailable(String),
+    /// Turned off via the settings panel's "Enable rust-analyzer" toggle —
+    /// distinct from `Unavailable` (a failed spawn/handshake) so the status
+    /// bar doesn't imply something went wrong when the user asked for this.
+    Disabled,
 }
 
 impl LspStatus {
@@ -100,6 +104,7 @@ impl LspStatus {
             LspStatus::Starting => (p.text_muted, "rust-analyzer starting\u{2026}".to_string()),
             LspStatus::Ready => (p.status_ok, "rust-analyzer ready".to_string()),
             LspStatus::Unavailable(reason) => (p.status_warn, format!("rust-analyzer unavailable ({reason})")),
+            LspStatus::Disabled => (p.text_muted, "rust-analyzer disabled".to_string()),
         }
     }
 }
@@ -629,6 +634,10 @@ pub struct State {
     pub caret_visible: bool,
     pub lsp_status: LspStatus,
     lsp_sender: Option<mpsc::Sender<LspCommand>>,
+    /// Off switches the LSP subscription off entirely (see `subscription`)
+    /// rather than just ignoring its output — no `rust-analyzer` process
+    /// gets spawned at all while this is `false`. On by default.
+    pub lsp_enabled: bool,
     /// `None` when `root` isn't a git repository — an expected, common case.
     pub repo: Option<Repo>,
     /// The sidebar's "CHANGES" panel contents — every file that differs from
@@ -909,6 +918,7 @@ impl Default for State {
             caret_visible: true,
             lsp_status: LspStatus::default(),
             lsp_sender: None,
+            lsp_enabled: true,
             repo,
             changed_files: snapshot.changed_files,
             ahead_behind: snapshot.ahead_behind,
@@ -998,6 +1008,11 @@ pub enum Message {
     SetSettingsCategory(SettingsCategory),
     ToggleGitStatusInTree,
     ToggleSaveOnFocusLoss,
+    /// Turns the `rust-analyzer` subscription on/off (see `subscription`).
+    /// Switching off drops the running worker (killing its child process,
+    /// `kill_on_drop`) and clears every open editor's diagnostics; switching
+    /// back on spawns a fresh one for the current project root.
+    ToggleLspEnabled,
     /// The window lost focus — saves every dirty open file if
     /// `save_on_focus_loss` is on, else a no-op. Fired from
     /// `iced::window::events()`, not a keybinding.
@@ -1282,6 +1297,27 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::SetSettingsCategory(category) => state.settings_category = category,
         Message::ToggleGitStatusInTree => state.git_status_in_tree = !state.git_status_in_tree,
         Message::ToggleSaveOnFocusLoss => state.save_on_focus_loss = !state.save_on_focus_loss,
+        Message::ToggleLspEnabled => {
+            state.lsp_enabled = !state.lsp_enabled;
+            if state.lsp_enabled {
+                // The subscription (gated on `lsp_enabled`, see
+                // `subscription`) picks this up and spawns a fresh worker;
+                // `Starting` holds until its `Ready`/`Unavailable` lands.
+                state.lsp_status = LspStatus::Starting;
+            } else {
+                // Dropping the subscription tears down the running worker
+                // (`kill_on_drop` kills its `rust-analyzer` child); clear
+                // the stale sender and every open editor's diagnostics so
+                // nothing lingers from before the server went away.
+                state.lsp_sender = None;
+                state.lsp_status = LspStatus::Disabled;
+                for tab in &mut state.open_tabs {
+                    if let OpenTab::File(editor) = tab {
+                        editor.diagnostics.clear();
+                    }
+                }
+            }
+        }
         Message::WindowUnfocused => {
             if state.save_on_focus_loss {
                 save_all_dirty_files(state);
@@ -2477,9 +2513,11 @@ fn reset_project_scoped_state(state: &mut State) {
     // The LSP subscription is keyed on `state.root` (`run_with` in
     // `subscription`), so changing it below tears down the old worker and
     // spawns a fresh one automatically — these just clear the stale handle/
-    // status in the meantime.
+    // status in the meantime. Unless the user has switched the server off
+    // entirely, in which case it stays `Disabled` rather than flashing back
+    // to `Starting` for a worker that `subscription` won't actually spawn.
     state.lsp_sender = None;
-    state.lsp_status = LspStatus::default();
+    state.lsp_status = if state.lsp_enabled { LspStatus::default() } else { LspStatus::Disabled };
 }
 
 fn apply_loaded_project(state: &mut State, loaded: LoadedProject) {
@@ -2703,10 +2741,11 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
         iced::window::events().map(window_events),
     ];
     // No LSP worker while no project is open (`welcome_open`) — there's no
-    // meaningful root to spawn one for. Once one is, keying on `state.root`
-    // via `run_with` (see `lsp_worker`'s doc) restarts it on every project
-    // switch for free.
-    if !state.welcome_open {
+    // meaningful root to spawn one for — or while the user has switched it
+    // off (`lsp_enabled`, see `Message::ToggleLspEnabled`). Once both hold,
+    // keying on `state.root` via `run_with` (see `lsp_worker`'s doc)
+    // restarts it on every project switch for free.
+    if !state.welcome_open && state.lsp_enabled {
         subs.push(iced::Subscription::run_with(state.root.clone(), lsp_worker).map(Message::Lsp));
     }
     // Only ticks while there's an actual pending debounce to check

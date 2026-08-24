@@ -4,6 +4,7 @@
 //! sync only (no incremental `TextDocumentContentChangeEvent` ranges) — same
 //! "reparse the whole thing" simplification as `syntax`, and always
 //! spec-legal regardless of what the server advertises.
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -165,6 +166,12 @@ pub async fn run(root: PathBuf, mut output: mpsc::Sender<LspEvent>) {
         return;
     }
 
+    // Per-document version counter: `didChange` versions must strictly
+    // increase (LSP spec, section 3.1.4) or rust-analyzer treats the
+    // notification as stale and drops it, silently freezing diagnostics
+    // after the first edit.
+    let mut doc_versions: HashMap<Url, i32> = HashMap::new();
+
     loop {
         futures::select! {
             diag = diagnostics_rx.next() => {
@@ -181,6 +188,7 @@ pub async fn run(root: PathBuf, mut output: mpsc::Sender<LspEvent>) {
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     LspCommand::DidOpen { uri, text } => {
+                        doc_versions.insert(uri.clone(), 0);
                         let _ = server.did_open(DidOpenTextDocumentParams {
                             text_document: TextDocumentItem {
                                 uri,
@@ -191,8 +199,10 @@ pub async fn run(root: PathBuf, mut output: mpsc::Sender<LspEvent>) {
                         });
                     }
                     LspCommand::DidChange { uri, text } => {
+                        let version = doc_versions.entry(uri.clone()).or_insert(0);
+                        *version += 1;
                         let _ = server.did_change(DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier { uri, version: 0 },
+                            text_document: VersionedTextDocumentIdentifier { uri, version: *version },
                             content_changes: vec![TextDocumentContentChangeEvent {
                                 range: None,
                                 range_length: None,
@@ -201,6 +211,7 @@ pub async fn run(root: PathBuf, mut output: mpsc::Sender<LspEvent>) {
                         });
                     }
                     LspCommand::DidClose { uri } => {
+                        doc_versions.remove(&uri);
                         let _ = server.did_close(DidCloseTextDocumentParams {
                             text_document: TextDocumentIdentifier { uri },
                         });

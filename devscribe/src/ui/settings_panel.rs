@@ -392,6 +392,7 @@ fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
     column![
         section_label("LANGUAGE SERVERS", p),
         status_row("RUST-ANALYZER", color(status_color), status_label, p),
+        toggle_row("Enable rust-analyzer", state.lsp_enabled, Message::ToggleLspEnabled, p),
     ]
     .spacing(8.0)
     .into()
