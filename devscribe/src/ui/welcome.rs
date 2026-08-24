@@ -173,7 +173,7 @@ fn recent_list(state: &State, p: Palette) -> Element<'static, Message> {
             background: Some(color(p.bg_panel).into()),
             border: Border {
                 color: color(p.line_neutral),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..container::Style::default()
@@ -199,7 +199,7 @@ fn action_button(glyph: &'static str, label: &'static str, message: Message, p: 
             text_color: if hovered { color(p.accent) } else { color(p.text_primary) },
             border: Border {
                 color: if hovered { color(p.accent) } else { color(p.line_strong) },
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()
@@ -291,7 +291,7 @@ fn loading_overlay(loading: &LoadingProject, p: Palette) -> Element<'static, Mes
     .padding(24.0)
     .style(move |_theme| container::Style {
         background: Some(color(p.surface_raised).into()),
-        border: Border { color: color(p.line_neutral), width: 1.0, radius: 2.0.into() },
+        border: Border { color: color(p.line_neutral), width: 1.5, radius: 2.0.into() },
         ..container::Style::default()
     });
 

@@ -1,6 +1,6 @@
 use devscribe_core::theme::{palette, Palette};
 use iced::font::Weight;
-use iced::widget::{button, canvas, column, container, row, scrollable, text};
+use iced::widget::{button, canvas, column, container, responsive, row, scrollable, text};
 use iced::{Alignment, Border, Element, Length};
 
 use crate::color::color;
@@ -21,25 +21,51 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
         .map(|f| f.matches.iter().map(|m| (m.start, m.end)).collect())
         .unwrap_or_default();
     let find_current = editor.find.as_ref().map(|f| f.current).unwrap_or(0);
-    let program = EditorCanvas {
-        document: editor.document.clone(),
-        cursor: editor.cursor,
-        selection: editor.selection(),
-        palette: p,
-        caret_visible: state.caret_visible,
-        highlights: editor.highlights.clone(),
-        diagnostics: editor.diagnostics.clone(),
-        problem_lens_enabled: state.problem_lens_enabled,
-        font_size: state.editor_font_size,
-        find_matches,
-        find_current,
-    };
 
-    let canvas_widget = canvas(program).width(Length::Fill).height(Length::Fixed(
-        editor_canvas::content_height(line_count, state.editor_font_size),
-    ));
+    let document = editor.document.clone();
+    let cursor = editor.cursor;
+    let selection = editor.selection();
+    let caret_visible = state.caret_visible;
+    let highlights = editor.highlights.clone();
+    let diagnostics = editor.diagnostics.clone();
+    let problem_lens_enabled = state.problem_lens_enabled;
+    let font_size = state.editor_font_size;
+    let scroll_offset = editor.scroll_offset;
 
-    let base = container(scrollable(canvas_widget).width(Length::Fill).height(Length::Fill))
+    // `responsive` hands us the pane's actual available height up front
+    // (rather than waiting for a scroll event to learn it), so the canvas
+    // knows which lines are visible from the very first frame.
+    let editor_pane = responsive(move |size| {
+        let program = EditorCanvas {
+            document: document.clone(),
+            cursor,
+            selection,
+            palette: p,
+            caret_visible,
+            highlights: highlights.clone(),
+            diagnostics: diagnostics.clone(),
+            problem_lens_enabled,
+            font_size,
+            find_matches: find_matches.clone(),
+            find_current,
+            scroll_offset,
+            viewport_height: size.height,
+        };
+
+        let canvas_widget = canvas(program)
+            .width(Length::Fill)
+            .height(Length::Fixed(editor_canvas::content_height(
+                line_count, font_size,
+            )));
+
+        scrollable(canvas_widget)
+            .on_scroll(|viewport| Message::EditorScrolled(viewport.absolute_offset().y))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    });
+
+    let base = container(editor_pane)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
@@ -78,7 +104,7 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
             },
             border: Border {
                 color: color(p.line_neutral),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()

@@ -61,7 +61,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
                 } else {
                     color(p.line_neutral)
                 },
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()
@@ -108,7 +108,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
                 } else {
                     color(p.line_neutral)
                 },
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()

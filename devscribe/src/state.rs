@@ -368,6 +368,11 @@ pub struct EditorState {
     pub diff: DiffStatus,
     /// `Some` while this tab's find widget (Ctrl+F) is open.
     pub find: Option<FindState>,
+    /// Vertical scroll offset (px from the top) of this tab's editor
+    /// canvas, last reported by the `scrollable`'s `on_scroll`. Used only
+    /// to virtualize `EditorCanvas::draw` (skip lines outside the visible
+    /// range) — not meaningful outside that.
+    pub scroll_offset: f32,
 }
 
 impl EditorState {
@@ -394,6 +399,7 @@ impl EditorState {
             json_collapsed: HashSet::new(),
             diff: DiffStatus::default(),
             find: None,
+            scroll_offset: 0.0,
         };
         this.reparse_json();
         this
@@ -960,6 +966,9 @@ pub enum Message {
     EditorDelete,
     EditorMove { dir: Direction, extend: bool },
     EditorClick { line: usize, col: usize, extend: bool },
+    /// The editor's `scrollable` reported a new vertical offset — stored so
+    /// `EditorCanvas::draw` can skip lines outside the visible range.
+    EditorScrolled(f32),
     CaretTick,
     Lsp(LspEvent),
     JsonToggle(String),
@@ -1125,6 +1134,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.click(line, col, extend);
+            }
+        }
+        Message::EditorScrolled(offset) => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.scroll_offset = offset;
             }
         }
         Message::CaretTick => state.caret_visible = !state.caret_visible,

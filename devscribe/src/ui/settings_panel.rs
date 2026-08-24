@@ -48,7 +48,7 @@ fn stepper_button(label: &'static str, p: Palette, message: Message, enabled: bo
             },
             border: Border {
                 color: color(p.line_neutral),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()
@@ -141,7 +141,7 @@ fn theme_grid(state: &State, p: Palette) -> Element<'static, Message> {
                             },
                             border: Border {
                                 color: if active { color(p.line_accent) } else { color(p.line_neutral) },
-                                width: 1.0,
+                                width: 1.5,
                                 radius: 2.0.into(),
                             },
                             ..button::Style::default()
@@ -190,7 +190,7 @@ fn density_row(state: &State, p: Palette) -> Element<'static, Message> {
                     },
                     border: Border {
                         color: if active { color(p.line_accent) } else { color(p.line_neutral) },
-                        width: 1.0,
+                        width: 1.5,
                         radius: 2.0.into(),
                     },
                     ..button::Style::default()
@@ -233,7 +233,7 @@ fn toggle_row(label: &'static str, enabled: bool, message: Message, p: Palette) 
             },
             border: Border {
                 color: color(p.line_neutral),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()
@@ -265,7 +265,7 @@ fn category_nav_row(category: SettingsCategory, active: bool, p: Palette) -> Ele
             },
             border: Border {
                 color: if active { color(p.line_accent) } else { Color::TRANSPARENT },
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..button::Style::default()
@@ -373,7 +373,7 @@ fn status_row(name: &'static str, status_color: Color, status_label: String, p: 
     .style(move |_theme| container::Style {
         border: Border {
             color: color(p.line_neutral),
-            width: 1.0,
+            width: 1.5,
             radius: 2.0.into(),
         },
         ..container::Style::default()
@@ -553,11 +553,20 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let panel = container(body)
         .width(Length::Fixed(760.0))
         .height(Length::Fixed(520.0))
+        // Padding matching the border's own width — without it, `category_nav`'s
+        // full-height `bg_void` fill (the left nav rail's distinct background,
+        // zero-inset since `body`/`split` carry no padding of their own) sits
+        // flush against this container's true left edge and paints over the
+        // border stroke there, since children draw on top of their parent's
+        // own background+border quad. The other three edges look fine only
+        // because nothing else here has an opaque background reaching that far
+        // out — this one child did.
+        .padding(1.5)
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_panel).into()),
             border: Border {
                 color: color(p.line_accent),
-                width: 1.0,
+                width: 1.5,
                 radius: 4.0.into(),
             },
             ..container::Style::default()

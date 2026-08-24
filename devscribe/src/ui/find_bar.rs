@@ -133,7 +133,7 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
             background: Some(color(p.bg_panel).into()),
             border: Border {
                 color: color(p.line_accent),
-                width: 1.0,
+                width: 1.5,
                 radius: 3.0.into(),
             },
             ..container::Style::default()

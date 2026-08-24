@@ -50,7 +50,7 @@ fn toast_card(toast: &Toast, p: Palette) -> Element<'static, Message> {
             background: Some(color(p.bg_panel).into()),
             border: Border {
                 color: color(accent),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             ..container::Style::default()

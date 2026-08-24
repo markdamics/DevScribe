@@ -306,7 +306,7 @@ pub fn overflow_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
         background: Some(color(p.surface_raised).into()),
         border: Border {
             color: color(p.line_neutral),
-            width: 1.0,
+            width: 1.5,
             radius: 2.0.into(),
         },
         ..container::Style::default()

@@ -153,7 +153,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     .style(move |_theme| container::Style {
         border: Border {
             color: color(p.line_neutral),
-            width: 1.0,
+            width: 1.5,
             radius: 2.0.into(),
         },
         ..container::Style::default()
@@ -200,7 +200,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         background: Some(color(p.bg_panel).into()),
         border: Border {
             color: color(p.line_accent),
-            width: 1.0,
+            width: 1.5,
             radius: 4.0.into(),
         },
         ..container::Style::default()

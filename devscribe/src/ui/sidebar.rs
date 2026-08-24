@@ -67,7 +67,7 @@ fn draft_editor_row(draft: &Draft, depth: usize, row_h: f32, p: Palette) -> Elem
             background: color(p.bg_inset).into(),
             border: Border {
                 color: color(p.line_accent),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             icon: color(p.text_muted),
@@ -483,7 +483,7 @@ pub fn projects_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
     .width(Length::Fixed(260.0))
     .style(move |_theme| container::Style {
         background: Some(color(p.surface_raised).into()),
-        border: Border { color: color(p.line_neutral), width: 1.0, radius: 2.0.into() },
+        border: Border { color: color(p.line_neutral), width: 1.5, radius: 2.0.into() },
         ..container::Style::default()
     });
 

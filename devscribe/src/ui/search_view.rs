@@ -35,7 +35,7 @@ fn query_box(p: Palette, query: &str) -> Element<'static, Message> {
             background: color(p.bg_void).into(),
             border: Border {
                 color: color(p.line_neutral),
-                width: 1.0,
+                width: 1.5,
                 radius: 2.0.into(),
             },
             icon: color(p.text_muted),

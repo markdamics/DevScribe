@@ -46,6 +46,8 @@ pub struct EditorCanvas {
     /// Index into `find_matches` of the current (more prominently
     /// highlighted) match. Meaningless when `find_matches` is empty.
     pub find_current: usize,
+    pub scroll_offset: f32,
+    pub viewport_height: f32,
 }
 
 /// Purely local interaction state — never synced back into `State` directly.
@@ -199,11 +201,31 @@ impl canvas::Program<Message> for EditorCanvas {
 
         let mono = fonts::mono(iced::font::Weight::Normal);
 
-        // Spans are sorted and document-ordered; walk them alongside lines
-        // rather than rescanning from the start each time.
-        let mut span_cursor = 0usize;
+        // Only the lines that could plausibly be visible need geometry —
+        // `bounds` covers the whole (fixed-height) document, so without
+        // this a large file would re-shape/tessellate every line on every
+        // scroll tick.
+        const OVERSCAN_LINES: usize = 8;
+        let total_lines = self.document.line_count();
+        let first_onscreen =
+            ((self.scroll_offset - TOP_PAD).max(0.0) / line_height).floor() as usize;
+        let onscreen_count = (self.viewport_height.max(0.0) / line_height).ceil() as usize + 1;
+        let first_line = first_onscreen.saturating_sub(OVERSCAN_LINES);
+        let last_line = (first_onscreen + onscreen_count + OVERSCAN_LINES).min(total_lines);
 
-        for line in 0..self.document.line_count() {
+        // Spans are sorted and document-ordered; walk them alongside lines
+        // rather than rescanning from the start each time. Jump straight to
+        // `first_line` via binary search rather than a linear fast-forward,
+        // since that line can be far into the document.
+        let mut span_cursor = if first_line == 0 {
+            0
+        } else {
+            let first_line_byte = self.document.text().line_to_byte(first_line);
+            self.highlights
+                .partition_point(|s| s.end <= first_line_byte)
+        };
+
+        for line in first_line..last_line {
             let y = TOP_PAD + line as f32 * line_height;
             let is_cursor_line = line == self.cursor.line;
 
