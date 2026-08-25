@@ -74,13 +74,13 @@ impl Lang {
     /// (foreground, background) matching the mockup's per-language badge tints.
     pub fn badge(self, p: Palette) -> (Color, Color) {
         match self {
-            Lang::Rust => (color(p.status_warn), tint(p.status_warn, 0.16)),
-            Lang::Json => (color(p.status_ok), tint(p.status_ok, 0.16)),
+            Lang::Rust => (color(p.status_warning), tint(p.status_warning, 0.16)),
+            Lang::Json => (color(p.status_success), tint(p.status_success, 0.16)),
             Lang::Cpp => (color(p.status_info), tint(p.status_info, 0.18)),
             Lang::Header => (color(p.text_muted), tint(p.status_info, 0.12)),
             Lang::Java => (color(p.status_danger), tint(p.status_danger, 0.16)),
-            Lang::Ts => (color(p.accent), tint(p.accent, 0.22)),
-            Lang::Tsx => (color(p.status_info), tint(p.accent, 0.22)),
+            Lang::Ts => (color(p.accent_solid), tint(p.accent_solid, 0.22)),
+            Lang::Tsx => (color(p.status_info), tint(p.accent_solid, 0.22)),
             Lang::Toml => (color(p.text_muted), tint(p.text_muted, 0.14)),
             Lang::Md => (color(p.text_muted), tint(p.text_muted, 0.14)),
             Lang::Other => (color(p.text_muted), tint(p.text_muted, 0.12)),

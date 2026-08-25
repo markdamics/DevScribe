@@ -20,7 +20,7 @@ fn line_number(n: Option<usize>, p: Palette) -> Element<'static, Message> {
     let label = n.map(|n| (n + 1).to_string()).unwrap_or_default();
     text(label)
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(11.0))
+        .size(crate::text_scale::px(13.0))
         .color(color(p.text_muted))
         .width(Length::Fixed(GUTTER_WIDTH))
         .into()
@@ -29,7 +29,7 @@ fn line_number(n: Option<usize>, p: Palette) -> Element<'static, Message> {
 fn diff_row(line: &DiffLine, p: Palette) -> Element<'static, Message> {
     let (marker, marker_color, bg) = match line.kind {
         DiffLineKind::Equal => (" ", color(p.text_muted), None),
-        DiffLineKind::Insert => ("+", color(p.status_ok), Some(tint(p.status_ok))),
+        DiffLineKind::Insert => ("+", color(p.status_success), Some(tint(p.status_success))),
         DiffLineKind::Delete => ("-", color(p.status_danger), Some(tint(p.status_danger))),
     };
 
@@ -38,13 +38,13 @@ fn diff_row(line: &DiffLine, p: Palette) -> Element<'static, Message> {
         line_number(line.new_line, p),
         text(marker)
             .font(fonts::mono(Weight::Bold))
-            .size(crate::text_scale::px(12.0))
+            .size(crate::text_scale::px(15.0))
             .color(marker_color)
             .width(Length::Fixed(16.0)),
         text(line.text.clone())
             .font(fonts::mono(Weight::Normal))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_secondary)),
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_body)),
     ]
     .spacing(4.0)
     .align_y(Alignment::Center);
@@ -95,7 +95,7 @@ pub fn view(state: &State, path: &Path, p: Palette) -> Element<'static, Message>
             .width(Length::Fill)
             .height(Length::Fill)
             .style(move |_theme| container::Style {
-                background: Some(color(p.bg_void).into()),
+                background: Some(color(p.bg_canvas).into()),
                 ..container::Style::default()
             })
             .into()

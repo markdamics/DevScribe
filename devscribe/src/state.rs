@@ -7,7 +7,7 @@ use devscribe_core::git::{ChangeKind, Repo};
 use devscribe_core::lsp::{self, LspCommand, LspEvent};
 use devscribe_core::search::{self, SearchHit};
 use devscribe_core::syntax::{self, Span};
-use devscribe_core::theme::ThemeName;
+use devscribe_core::theme::{Accent, ThemeMode};
 use devscribe_core::Document;
 use iced::futures::channel::mpsc;
 use iced::keyboard;
@@ -102,8 +102,8 @@ impl LspStatus {
     pub fn describe(&self, p: devscribe_core::theme::Palette) -> (devscribe_core::theme::Rgba, String) {
         match self {
             LspStatus::Starting => (p.text_muted, "rust-analyzer starting\u{2026}".to_string()),
-            LspStatus::Ready => (p.status_ok, "rust-analyzer ready".to_string()),
-            LspStatus::Unavailable(reason) => (p.status_warn, format!("rust-analyzer unavailable ({reason})")),
+            LspStatus::Ready => (p.status_success, "rust-analyzer ready".to_string()),
+            LspStatus::Unavailable(reason) => (p.status_warning, format!("rust-analyzer unavailable ({reason})")),
             LspStatus::Disabled => (p.text_muted, "rust-analyzer disabled".to_string()),
         }
     }
@@ -287,7 +287,8 @@ impl SettingsCategory {
 #[derive(Debug, Clone)]
 pub enum PaletteAction {
     OpenFile(PathBuf),
-    SetTheme(ThemeName),
+    SetThemeMode(ThemeMode),
+    SetAccent(Accent),
     FocusSearchTab,
     /// Opens (or focuses) a diff tab for the currently active file tab.
     ViewDiffOfActiveFile,
@@ -597,7 +598,8 @@ impl EditorState {
 }
 
 pub struct State {
-    pub theme: ThemeName,
+    pub theme_mode: ThemeMode,
+    pub accent: Accent,
     /// Every currently open tab, in the order they appear in the tab bar.
     pub open_tabs: Vec<OpenTab>,
     /// `None` only when `open_tabs` is empty.
@@ -605,6 +607,11 @@ pub struct State {
     pub assist_on: bool,
     pub projects_open: bool,
     pub overflow_open: bool,
+    /// `true` collapses the sidebar to a narrow icon rail (project glyph +
+    /// Settings + an "expand" button), matching the mockup's `panel-left-close`/
+    /// `panel-left-open` toggle. Independent of `welcome_open` — this only
+    /// matters once a project is open at all.
+    pub sidebar_collapsed: bool,
     /// `true` while no project is open and the welcome screen ("Select a
     /// project") is showing full-window in place of the whole editor —
     /// `shell::view()` short-circuits to `welcome::view` before touching
@@ -880,34 +887,38 @@ fn startup() -> Startup {
     }
 }
 
-/// The persisted theme (`settings::save_theme`, written on every
-/// `set_theme` call), or the default if nothing's saved yet. Global, not
-/// project-scoped, so this is independent of `startup()`/`Startup` above.
+/// The persisted settings (`settings::save`, written by `persist_settings`
+/// on every settings-changing message), or defaults for whatever wasn't
+/// there yet. Global, not project-scoped, so this is independent of
+/// `startup()`/`Startup` above.
 #[cfg(not(test))]
-fn startup_theme() -> ThemeName {
-    settings::load().unwrap_or_default()
+fn startup_settings() -> settings::Settings {
+    settings::load()
 }
 
 /// Never reads the real `~/.config/devscribe/settings.json` — same reason
 /// `startup()`'s test build never reads `recent_projects.json`: every test
 /// that constructs `State::default()` would otherwise depend on whatever
-/// theme this machine's user last picked in the real app.
+/// settings this machine's user last picked in the real app.
 #[cfg(test)]
-fn startup_theme() -> ThemeName {
-    ThemeName::default()
+fn startup_settings() -> settings::Settings {
+    settings::Settings::default()
 }
 
 impl Default for State {
     fn default() -> Self {
         let Startup { welcome_open, root, snapshot, repo, recent_projects, welcome_rows } = startup();
+        let settings = startup_settings();
 
         Self {
-            theme: startup_theme(),
+            theme_mode: settings.theme_mode,
+            accent: settings.accent,
             open_tabs: Vec::new(),
             active_tab: None,
             assist_on: true,
             projects_open: false,
             overflow_open: false,
+            sidebar_collapsed: false,
             welcome_open,
             recent_projects,
             welcome_rows,
@@ -918,7 +929,7 @@ impl Default for State {
             caret_visible: true,
             lsp_status: LspStatus::default(),
             lsp_sender: None,
-            lsp_enabled: true,
+            lsp_enabled: settings.lsp_enabled,
             repo,
             changed_files: snapshot.changed_files,
             ahead_behind: snapshot.ahead_behind,
@@ -935,12 +946,12 @@ impl Default for State {
             palette_selected: 0,
             settings_open: false,
             settings_category: SettingsCategory::default(),
-            git_status_in_tree: false,
-            save_on_focus_loss: false,
-            density: Density::default(),
-            problem_lens_enabled: true,
-            editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
-            ui_font_scale: UI_FONT_SCALE_DEFAULT,
+            git_status_in_tree: settings.git_status_in_tree,
+            save_on_focus_loss: settings.save_on_focus_loss,
+            density: settings.density,
+            problem_lens_enabled: settings.problem_lens_enabled,
+            editor_font_size: settings.editor_font_size,
+            ui_font_scale: settings.ui_font_scale,
             toasts: Vec::new(),
             next_toast_id: 0,
             draft: None,
@@ -954,7 +965,8 @@ impl Default for State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    SetTheme(ThemeName),
+    SetThemeMode(ThemeMode),
+    SetAccent(Accent),
     SelectOpenTab(TabKey),
     CloseTab(TabKey),
     CloseActiveTab,
@@ -962,6 +974,8 @@ pub enum Message {
     ToggleAssist,
     ToggleProjects,
     ToggleOverflow,
+    CollapseSidebar,
+    ExpandSidebar,
     ToggleChangesPanel,
     /// Opens (or focuses) a diff tab for `path`, from a sidebar Changes row.
     /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
@@ -1090,7 +1104,8 @@ pub enum Message {
 
 pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
     match message {
-        Message::SetTheme(theme) => set_theme(state, theme),
+        Message::SetThemeMode(mode) => set_theme_mode(state, mode),
+        Message::SetAccent(accent) => set_accent(state, accent),
         Message::SelectOpenTab(key) => {
             if state.open_tabs.iter().any(|t| t.key() == key) {
                 state.active_tab = Some(key);
@@ -1106,6 +1121,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ToggleAssist => state.assist_on = !state.assist_on,
         Message::ToggleProjects => state.projects_open = !state.projects_open,
         Message::ToggleOverflow => state.overflow_open = !state.overflow_open,
+        Message::CollapseSidebar => {
+            state.sidebar_collapsed = true;
+            // Closing menus that were anchored to sidebar content about to
+            // disappear, same as the mockup's own `collapseSidebar` handler.
+            state.projects_open = false;
+            state.ctx_menu = None;
+        }
+        Message::ExpandSidebar => state.sidebar_collapsed = false,
         Message::ToggleChangesPanel => state.changes_panel_open = !state.changes_panel_open,
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
         Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
@@ -1292,13 +1315,26 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::CloseSettings => state.settings_open = false,
-        Message::SetDensity(density) => state.density = density,
-        Message::ToggleProblemLens => state.problem_lens_enabled = !state.problem_lens_enabled,
+        Message::SetDensity(density) => {
+            state.density = density;
+            persist_settings(state);
+        }
+        Message::ToggleProblemLens => {
+            state.problem_lens_enabled = !state.problem_lens_enabled;
+            persist_settings(state);
+        }
         Message::SetSettingsCategory(category) => state.settings_category = category,
-        Message::ToggleGitStatusInTree => state.git_status_in_tree = !state.git_status_in_tree,
-        Message::ToggleSaveOnFocusLoss => state.save_on_focus_loss = !state.save_on_focus_loss,
+        Message::ToggleGitStatusInTree => {
+            state.git_status_in_tree = !state.git_status_in_tree;
+            persist_settings(state);
+        }
+        Message::ToggleSaveOnFocusLoss => {
+            state.save_on_focus_loss = !state.save_on_focus_loss;
+            persist_settings(state);
+        }
         Message::ToggleLspEnabled => {
             state.lsp_enabled = !state.lsp_enabled;
+            persist_settings(state);
             if state.lsp_enabled {
                 // The subscription (gated on `lsp_enabled`, see
                 // `subscription`) picks this up and spawns a fresh worker;
@@ -1330,9 +1366,11 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::SetEditorFontSize(size) => {
             state.editor_font_size = size.clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
+            persist_settings(state);
         }
         Message::SetUiFontScale(scale) => {
             state.ui_font_scale = scale.clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+            persist_settings(state);
         }
         Message::DismissToast(id) => state.toasts.retain(|t| t.id != id),
         Message::PruneToasts => {
@@ -1504,7 +1542,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
 fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Message> {
     match action {
         PaletteAction::OpenFile(path) => open_or_focus_file(state, path),
-        PaletteAction::SetTheme(theme) => set_theme(state, theme),
+        PaletteAction::SetThemeMode(mode) => set_theme_mode(state, mode),
+        PaletteAction::SetAccent(accent) => set_accent(state, accent),
         PaletteAction::FocusSearchTab => focus_search(state),
         PaletteAction::ViewDiffOfActiveFile => {
             if let Some(path) = active_file_path(state) {
@@ -1519,22 +1558,29 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
         }
         PaletteAction::ToggleAssist => state.assist_on = !state.assist_on,
         PaletteAction::ToggleProjects => state.projects_open = !state.projects_open,
-        PaletteAction::ToggleProblemLens => state.problem_lens_enabled = !state.problem_lens_enabled,
+        PaletteAction::ToggleProblemLens => {
+            state.problem_lens_enabled = !state.problem_lens_enabled;
+            persist_settings(state);
+        }
         PaletteAction::IncreaseEditorFontSize => {
             state.editor_font_size =
                 (state.editor_font_size + EDITOR_FONT_SIZE_STEP).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
+            persist_settings(state);
         }
         PaletteAction::DecreaseEditorFontSize => {
             state.editor_font_size =
                 (state.editor_font_size - EDITOR_FONT_SIZE_STEP).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
+            persist_settings(state);
         }
         PaletteAction::IncreaseUiFontScale => {
             state.ui_font_scale =
                 (state.ui_font_scale + UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+            persist_settings(state);
         }
         PaletteAction::DecreaseUiFontScale => {
             state.ui_font_scale =
                 (state.ui_font_scale - UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+            persist_settings(state);
         }
         PaletteAction::OpenSettings => state.settings_open = true,
         PaletteAction::SaveFile => return save_current_file(state),
@@ -1644,15 +1690,33 @@ fn save_all_dirty_files(state: &mut State) {
     }
 }
 
-/// The single place `state.theme` gets changed — persists the choice
-/// (`settings::save_theme`) so it survives closing and reopening the app,
-/// same shape as `recent_projects::touch` persisting on every project
-/// load. Both `Message::SetTheme` (settings panel) and
-/// `PaletteAction::SetTheme` (command palette) go through this rather than
-/// setting the field directly, so neither path can silently forget to save.
-fn set_theme(state: &mut State, theme: ThemeName) {
-    state.theme = theme;
-    settings::save_theme(theme);
+/// The single place any settings-panel-controlled field gets persisted
+/// (`settings::save`) so it survives closing and reopening the app, same
+/// shape as `recent_projects::touch` persisting on every project load.
+/// Called at the end of every settings-changing `Message` arm below, so none
+/// of them can silently forget to save.
+fn persist_settings(state: &State) {
+    settings::save(&settings::Settings {
+        theme_mode: state.theme_mode,
+        accent: state.accent,
+        density: state.density,
+        ui_font_scale: state.ui_font_scale,
+        editor_font_size: state.editor_font_size,
+        git_status_in_tree: state.git_status_in_tree,
+        problem_lens_enabled: state.problem_lens_enabled,
+        save_on_focus_loss: state.save_on_focus_loss,
+        lsp_enabled: state.lsp_enabled,
+    });
+}
+
+fn set_theme_mode(state: &mut State, mode: ThemeMode) {
+    state.theme_mode = mode;
+    persist_settings(state);
+}
+
+fn set_accent(state: &mut State, accent: Accent) {
+    state.accent = accent;
+    persist_settings(state);
 }
 
 fn push_toast(state: &mut State, kind: ToastKind, message: impl Into<String>) {
@@ -1987,10 +2051,16 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
         });
     }
 
-    for theme in ThemeName::ALL {
+    for mode in ThemeMode::ALL {
         entries.push(PaletteEntry {
-            label: format!("Theme: {}", theme.label()),
-            action: PaletteAction::SetTheme(theme),
+            label: format!("Theme: {}", mode.label()),
+            action: PaletteAction::SetThemeMode(mode),
+        });
+    }
+    for accent in Accent::ALL {
+        entries.push(PaletteEntry {
+            label: format!("Accent: {}", accent.label()),
+            action: PaletteAction::SetAccent(accent),
         });
     }
 

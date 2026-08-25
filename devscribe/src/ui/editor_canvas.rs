@@ -235,7 +235,7 @@ impl canvas::Program<Message> for EditorCanvas {
                         Point::new(GUTTER_WIDTH, y),
                         Size::new(bounds.width - GUTTER_WIDTH, line_height),
                     ),
-                    tint(p.accent, 0.08),
+                    tint(p.accent_solid, 0.08),
                 );
             }
 
@@ -259,7 +259,7 @@ impl canvas::Program<Message> for EditorCanvas {
                         Point::new(x0, y),
                         Size::new((x1 - x0).max(char_width * 0.4), line_height),
                     ),
-                    tint(p.accent, 0.22),
+                    tint(p.accent_solid, 0.22),
                 );
             }
 
@@ -277,17 +277,17 @@ impl canvas::Program<Message> for EditorCanvas {
                     Size::new((x1 - x0).max(char_width * 0.4), line_height - 2.0),
                 );
                 if is_current {
-                    frame.fill(&rect, tint(p.status_warn, 0.35));
+                    frame.fill(&rect, tint(p.status_warning, 0.35));
                     frame.stroke(
                         &rect,
                         Stroke {
-                            style: Style::Solid(color(p.status_warn)),
+                            style: Style::Solid(color(p.status_warning)),
                             width: 1.0,
                             ..Stroke::default()
                         },
                     );
                 } else {
-                    frame.fill(&rect, tint(p.status_warn, 0.16));
+                    frame.fill(&rect, tint(p.status_warning, 0.16));
                 }
             }
 
@@ -295,7 +295,7 @@ impl canvas::Program<Message> for EditorCanvas {
                 content: (line + 1).to_string(),
                 position: Point::new(GUTTER_WIDTH - 14.0, y),
                 color: if is_cursor_line {
-                    color(p.text_primary)
+                    color(p.text_strong)
                 } else {
                     tint(p.text_muted, 0.6)
                 },
@@ -322,7 +322,7 @@ impl canvas::Program<Message> for EditorCanvas {
                     frame.fill_text(Text {
                         content: text,
                         position: Point::new(GUTTER_WIDTH + TEXT_INSET, y),
-                        color: color(p.text_secondary),
+                        color: color(p.text_body),
                         size: Pixels(font_size),
                         line_height: LineHeight::Absolute(Pixels(line_height)),
                         font: mono,
@@ -399,7 +399,7 @@ impl canvas::Program<Message> for EditorCanvas {
                 let x = GUTTER_WIDTH + TEXT_INSET + self.cursor.col as f32 * char_width;
                 frame.fill(
                     &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
-                    color(p.accent),
+                    color(p.accent_solid),
                 );
             }
         }
@@ -429,7 +429,7 @@ fn severity_color(severity: DiagnosticSeverity, p: Palette) -> Rgba {
     if severity == DiagnosticSeverity::ERROR {
         p.status_danger
     } else if severity == DiagnosticSeverity::WARNING {
-        p.status_warn
+        p.status_warning
     } else if severity == DiagnosticSeverity::INFORMATION {
         p.status_info
     } else {
@@ -470,17 +470,17 @@ fn draw_wavy_underline(frame: &mut Frame, x0: f32, x1: f32, y: f32, color: Color
 /// type→status-info, string→status-ok, constant→status-warn, comment→muted).
 pub(crate) fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
     match kind {
-        HighlightKind::Default => color(p.text_secondary),
-        HighlightKind::Keyword => color(p.accent),
+        HighlightKind::Default => color(p.text_body),
+        HighlightKind::Keyword => color(p.accent_solid),
         HighlightKind::Type => color(p.status_info),
-        HighlightKind::Function => color(p.text_primary),
-        HighlightKind::Macro => color(p.accent_2),
-        HighlightKind::String => color(p.status_ok),
-        HighlightKind::Number => color(p.accent_2),
+        HighlightKind::Function => color(p.text_strong),
+        HighlightKind::Macro => color(p.seal_solid),
+        HighlightKind::String => color(p.status_success),
+        HighlightKind::Number => color(p.seal_solid),
         HighlightKind::Comment => color(p.text_muted),
-        HighlightKind::Constant => color(p.status_warn),
+        HighlightKind::Constant => color(p.status_warning),
         HighlightKind::Attribute => color(p.text_muted),
-        HighlightKind::Punctuation => color(p.text_secondary),
+        HighlightKind::Punctuation => color(p.text_body),
     }
 }
 

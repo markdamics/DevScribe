@@ -69,7 +69,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_void).into()),
+            background: Some(color(p.bg_canvas).into()),
             ..container::Style::default()
         });
 
@@ -89,8 +89,8 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
     let open_palette = button(
         text("Open palette \u{2318}K")
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary)),
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong)),
     )
     .padding([6.0, 14.0])
     .on_press(Message::TogglePalette)
@@ -103,9 +103,9 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
                 None
             },
             border: Border {
-                color: color(p.line_neutral),
+                color: color(p.border_hairline),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..button::Style::default()
         }
@@ -114,15 +114,15 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
     let content = column![
         text("NO BUFFER OPEN")
             .font(fonts::mono(Weight::Bold))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
         text("Select a file in the explorer, or open the command palette.")
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_secondary)),
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_body)),
         open_palette,
     ]
-    .spacing(10.0)
+    .spacing(12.0)
     .align_x(Alignment::Center);
 
     container(content)
@@ -130,7 +130,7 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
         .height(Length::Fill)
         .center(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_void).into()),
+            background: Some(color(p.bg_canvas).into()),
             ..container::Style::default()
         })
         .into()
@@ -159,7 +159,7 @@ fn content_area(state: &State, p: Palette) -> Element<'static, Message> {
 pub fn view(state: &State) -> Element<'static, Message> {
     crate::text_scale::set(state.ui_font_scale);
 
-    let p = palette(state.theme);
+    let p = palette(state.theme_mode, state.accent);
 
     // No project open — the welcome screen replaces the whole editor
     // (title bar included: the window still has default OS decorations,
@@ -190,8 +190,8 @@ pub fn view(state: &State) -> Element<'static, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_void).into()),
-            text_color: Some(color(p.text_primary)),
+            background: Some(color(p.bg_canvas).into()),
+            text_color: Some(color(p.text_strong)),
             ..container::Style::default()
         });
 

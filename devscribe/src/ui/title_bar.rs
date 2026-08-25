@@ -12,16 +12,16 @@ use crate::widgets;
 
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     let logo = canvas(LogoMark {
-        left: color(p.accent),
-        right: color(p.accent_2),
+        left: color(p.accent_solid),
+        right: color(p.seal_solid),
     })
-    .width(Length::Fixed(18.0))
-    .height(Length::Fixed(18.0));
+    .width(Length::Fixed(22.0))
+    .height(Length::Fixed(22.0));
 
     let wordmark = text("DEVSCRIBE")
         .font(fonts::display(Weight::ExtraBold))
-        .size(crate::text_scale::px(14.0))
-        .color(color(p.text_primary));
+        .size(crate::text_scale::px(18.0))
+        .color(color(p.text_strong));
 
     // The real crate version, not the mockup's static "V1.4.0" — Phase 7
     // added a real version readout to Settings → About, and having the
@@ -37,32 +37,32 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         row![
             text("RUN ANYTHING")
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(11.0)),
-            text("⌘K").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(10.0)),
+                .size(crate::text_scale::px(15.0)),
+            text("⌘K").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(15.0)),
         ]
-        .spacing(8.0)
+        .spacing(9.0)
         .align_y(Alignment::Center),
     ))
-    .padding([0.0, 12.0])
-    .height(Length::Fixed(24.0))
+    .padding([0.0, 16.0])
+    .height(Length::Fixed(34.0))
     .on_press(Message::TogglePalette)
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {
-            background: Some(color(p.bg_void).into()),
+            background: Some(color(p.bg_canvas).into()),
             text_color: if hovered {
-                color(p.text_primary)
+                color(p.text_strong)
             } else {
                 color(p.text_muted)
             },
             border: Border {
                 color: if hovered {
-                    color(p.accent)
+                    color(p.accent_solid)
                 } else {
-                    color(p.line_neutral)
+                    color(p.border_hairline)
                 },
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..button::Style::default()
         }
@@ -73,43 +73,43 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         row![
             widgets::dot(
                 if assist_on {
-                    color(p.accent)
+                    color(p.accent_solid)
                 } else {
                     color(p.text_muted)
                 },
-                5.0
+                7.0
             ),
             text("ASSIST")
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(10.0)),
+                .size(crate::text_scale::px(14.0)),
         ]
-        .spacing(6.0)
+        .spacing(8.0)
         .align_y(Alignment::Center),
     ))
-    .padding([0.0, 9.0])
-    .height(Length::Fixed(22.0))
+    .padding([0.0, 14.0])
+    .height(Length::Fixed(32.0))
     .on_press(Message::ToggleAssist)
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {
             background: if assist_on {
-                Some(color(p.accent_soft).into())
+                Some(color(p.accent_quiet).into())
             } else {
                 None
             },
             text_color: if assist_on || hovered {
-                color(p.accent)
+                color(p.accent_solid)
             } else {
                 color(p.text_muted)
             },
             border: Border {
                 color: if assist_on {
-                    color(p.line_accent)
+                    color(p.border_accent)
                 } else {
-                    color(p.line_neutral)
+                    color(p.border_hairline)
                 },
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..button::Style::default()
         }
@@ -131,9 +131,9 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .height(Length::Fixed(state.density.title_bar_h()))
         .align_y(Vertical::Center)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             ..container::Style::default()
         });
 
-    column![bar_panel, widgets::hline(color(p.line_neutral))].into()
+    column![bar_panel, widgets::hline(color(p.border_hairline))].into()
 }

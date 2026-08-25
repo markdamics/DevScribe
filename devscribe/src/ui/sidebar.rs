@@ -21,8 +21,8 @@ fn tint(c: Rgba, alpha: f32) -> Color {
 /// Changes panel rows and the file tree's per-file badges.
 fn kind_letter(kind: ChangeKind, p: Palette) -> (&'static str, Rgba) {
     match kind {
-        ChangeKind::Modified => ("M", p.status_warn),
-        ChangeKind::Added => ("A", p.status_ok),
+        ChangeKind::Modified => ("M", p.status_warning),
+        ChangeKind::Added => ("A", p.status_success),
         ChangeKind::Untracked => ("U", p.status_info),
         ChangeKind::Deleted => ("D", p.status_danger),
     }
@@ -59,24 +59,24 @@ fn draft_editor_row(draft: &Draft, depth: usize, row_h: f32, p: Palette) -> Elem
     let input = text_input(draft_placeholder(draft.kind), &draft.text)
         .id(crate::state::draft_input_id())
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(12.0))
+        .size(crate::text_scale::px(15.0))
         .padding([2.0, 6.0])
         .on_input(Message::DraftTextChanged)
         .on_submit(Message::CommitDraft)
         .style(move |_theme, _status| text_input::Style {
-            background: color(p.bg_inset).into(),
+            background: color(p.surface_inset).into(),
             border: Border {
-                color: color(p.line_accent),
+                color: color(p.border_accent),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             icon: color(p.text_muted),
             placeholder: color(p.text_muted),
-            value: color(p.text_primary),
-            selection: tint(p.accent, 0.35),
+            value: color(p.text_strong),
+            selection: tint(p.accent_solid, 0.35),
         });
 
-    let cancel = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(9.0))))
+    let cancel = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(11.0))))
         .padding(0.0)
         .width(Length::Fixed(15.0))
         .height(Length::Fixed(15.0))
@@ -89,21 +89,21 @@ fn draft_editor_row(draft: &Draft, depth: usize, row_h: f32, p: Palette) -> Elem
                 } else {
                     None
                 },
-                text_color: if hovered { color(p.text_primary) } else { color(p.text_muted) },
+                text_color: if hovered { color(p.text_strong) } else { color(p.text_muted) },
                 ..button::Style::default()
             }
         });
 
     let content = row![
-        widgets::lang_badge(draft_glyph(draft.kind), color(p.accent), tint(p.accent, 0.22)),
+        widgets::lang_badge(draft_glyph(draft.kind), color(p.accent_solid), tint(p.accent_solid, 0.22)),
         input,
         text("\u{21b5}")
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(9.0))
+            .size(crate::text_scale::px(11.0))
             .color(color(p.text_muted)),
         cancel,
     ]
-    .spacing(7.0)
+    .spacing(8.0)
     .align_y(Alignment::Center);
 
     container(content)
@@ -117,7 +117,7 @@ fn draft_editor_row(draft: &Draft, depth: usize, row_h: f32, p: Palette) -> Elem
         })
         .align_y(Vertical::Center)
         .style(move |_theme| container::Style {
-            background: Some(tint(p.accent, 0.12).into()),
+            background: Some(tint(p.accent_solid, 0.12).into()),
             ..container::Style::default()
         })
         .into()
@@ -159,13 +159,13 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
             let glyph = if is_collapsed { "▸" } else { "▾" };
 
             let header = row![
-                text(glyph).size(crate::text_scale::px(10.0)).color(color(p.text_muted)),
+                text(glyph).size(crate::text_scale::px(13.0)).color(color(p.text_muted)),
                 text(name.clone())
                     .font(fonts::sans(Weight::Medium))
-                    .size(crate::text_scale::px(13.0))
-                    .color(color(p.text_primary)),
+                    .size(crate::text_scale::px(15.0))
+                    .color(color(p.text_strong)),
             ]
-            .spacing(7.0)
+            .spacing(8.0)
             .align_y(Alignment::Center);
 
             let header_row = button(widgets::center_v(header))
@@ -186,7 +186,7 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
                         } else {
                             None
                         },
-                        text_color: color(p.text_primary),
+                        text_color: color(p.text_strong),
                         ..button::Style::default()
                     }
                 });
@@ -219,11 +219,11 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
                 widgets::lang_badge(badge_label, fg, bg),
                 text(name.clone())
                     .font(fonts::sans(Weight::Medium))
-                    .size(crate::text_scale::px(13.0))
-                    .color(color(p.text_primary))
+                    .size(crate::text_scale::px(15.0))
+                    .color(color(p.text_strong))
                     .width(Length::Fill),
             ]
-            .spacing(7.0)
+            .spacing(8.0)
             .align_y(Alignment::Center);
             if let Some(&kind) = ctx.changes.get(path) {
                 let (letter, kind_color) = kind_letter(kind, p);
@@ -256,7 +256,7 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
                         } else {
                             None
                         },
-                        text_color: color(p.text_primary),
+                        text_color: color(p.text_strong),
                         ..button::Style::default()
                     }
                 });
@@ -274,7 +274,7 @@ fn git_status_row(state: &State, p: Palette) -> Element<'static, Message> {
     let Some(repo) = state.repo.as_ref() else {
         return text("No repository")
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted))
             .into();
     };
@@ -283,18 +283,18 @@ fn git_status_row(state: &State, p: Palette) -> Element<'static, Message> {
     let mut contents = row![
         text(branch)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted))
             .width(Length::Fill),
     ]
-    .spacing(6.0)
+    .spacing(8.0)
     .align_y(Alignment::Center);
 
     if let Some((ahead, behind)) = state.ahead_behind {
         contents = contents.push(
             text(format!("\u{25b2}{ahead} \u{25bc}{behind}"))
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(10.0))
+                .size(crate::text_scale::px(15.0))
                 .color(color(p.text_muted)),
         );
     }
@@ -304,7 +304,7 @@ fn git_status_row(state: &State, p: Palette) -> Element<'static, Message> {
 
 fn project_switcher(state: &State, p: Palette) -> Element<'static, Message> {
     let root = &state.root;
-    let (badge_fg, badge_bg) = (color(p.accent), tint(p.accent, 0.18));
+    let (badge_fg, badge_bg) = (color(p.accent_solid), tint(p.accent_solid, 0.18));
     let name = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -317,21 +317,21 @@ fn project_switcher(state: &State, p: Palette) -> Element<'static, Message> {
             column![
                 text(name)
                     .font(fonts::display(Weight::Semibold))
-                    .size(crate::text_scale::px(15.0))
-                    .color(color(p.text_primary)),
+                    .size(crate::text_scale::px(19.0))
+                    .color(color(p.text_strong)),
                 text(path_label)
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(10.0))
+                    .size(crate::text_scale::px(16.0))
                     .color(color(p.text_muted)),
             ]
-            .spacing(1.0)
+            .spacing(2.0)
             .width(Length::Fill),
         ]
         .spacing(8.0)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding([6.0, 8.0])
+    .padding([8.0, 10.0])
     .on_press(Message::ToggleProjects)
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
@@ -341,20 +341,20 @@ fn project_switcher(state: &State, p: Palette) -> Element<'static, Message> {
             } else {
                 None
             },
-            text_color: color(p.text_primary),
+            text_color: color(p.text_strong),
             ..button::Style::default()
         }
     });
 
     let git_row = container(git_status_row(state, p)).padding([0.0, 4.0]);
 
-    let block = column![header, git_row].spacing(6.0).padding([12.0, 12.0]);
+    let block = column![header, git_row].spacing(8.0).padding([12.0, 12.0]);
 
     container(block)
         .width(Length::Fill)
         .style(move |_theme| container::Style {
             border: Border {
-                color: color(p.line_neutral),
+                color: color(p.border_hairline),
                 width: 0.0,
                 radius: 0.0.into(),
             },
@@ -368,13 +368,13 @@ fn project_row(row_data: &state::WelcomeRow, is_current: bool, p: Palette) -> El
     let right: Element<'static, Message> = if is_current {
         text("open")
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
-            .color(color(p.accent))
+            .size(crate::text_scale::px(13.0))
+            .color(color(p.accent_solid))
             .into()
     } else {
         text(row_data.last_opened_label.clone())
             .font(fonts::mono(Weight::Light))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted))
             .into()
     };
@@ -383,8 +383,8 @@ fn project_row(row_data: &state::WelcomeRow, is_current: bool, p: Palette) -> El
         widgets::lang_badge(row_data.lang.code(&row_data.path), fg, bg),
         text(row_data.name.clone())
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong))
             .width(Length::Fill),
         right,
     ]
@@ -400,14 +400,14 @@ fn project_row(row_data: &state::WelcomeRow, is_current: bool, p: Palette) -> El
             let hovered = status == button::Status::Hovered;
             button::Style {
                 background: if is_current {
-                    Some(tint(p.accent, 0.16).into())
+                    Some(tint(p.accent_solid, 0.16).into())
                 } else if hovered {
-                    Some(color(p.bg_panel).into())
+                    Some(color(p.bg_base).into())
                 } else {
                     None
                 },
-                text_color: color(p.text_primary),
-                border: Border { color: color(p.line_neutral), width: 0.0, radius: 2.0.into() },
+                text_color: color(p.text_strong),
+                border: Border { color: color(p.border_hairline), width: 0.0, radius: 3.0.into() },
                 ..button::Style::default()
             }
         })
@@ -417,8 +417,8 @@ fn project_row(row_data: &state::WelcomeRow, is_current: bool, p: Palette) -> El
 fn projects_menu_row(glyph: &'static str, label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
     button(
         row![
-            text(glyph).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(11.0)).width(Length::Fixed(18.0)),
-            text(label).font(fonts::sans(Weight::Medium)).size(crate::text_scale::px(12.0)),
+            text(glyph).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).width(Length::Fixed(18.0)),
+            text(label).font(fonts::sans(Weight::Medium)).size(crate::text_scale::px(15.0)),
         ]
         .spacing(8.0)
         .align_y(Alignment::Center),
@@ -429,9 +429,9 @@ fn projects_menu_row(glyph: &'static str, label: &'static str, message: Message,
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {
-            background: if hovered { Some(color(p.bg_panel).into()) } else { None },
-            text_color: if hovered { color(p.text_primary) } else { color(p.text_muted) },
-            border: Border { color: color(p.line_neutral), width: 0.0, radius: 2.0.into() },
+            background: if hovered { Some(color(p.bg_base).into()) } else { None },
+            text_color: if hovered { color(p.text_strong) } else { color(p.text_muted) },
+            border: Border { color: color(p.border_hairline), width: 0.0, radius: 3.0.into() },
             ..button::Style::default()
         }
     })
@@ -470,20 +470,20 @@ pub fn projects_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
         column![
             text("PROJECTS")
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(9.0))
+                .size(crate::text_scale::px(11.0))
                 .color(color(p.text_muted)),
             column(rows).spacing(2.0),
-            widgets::hline(color(p.line_neutral)),
+            widgets::hline(color(p.border_hairline)),
             projects_menu_row("+", "Open folder\u{2026}", Message::OpenFolderDialog, p),
             projects_menu_row("\u{21a9}", "Close project", Message::CloseProject, p),
         ]
-        .spacing(6.0)
+        .spacing(8.0)
         .padding(6.0),
     )
     .width(Length::Fixed(260.0))
     .style(move |_theme| container::Style {
         background: Some(color(p.surface_raised).into()),
-        border: Border { color: color(p.line_neutral), width: 1.5, radius: 2.0.into() },
+        border: Border { color: color(p.border_hairline), width: 1.5, radius: 3.0.into() },
         ..container::Style::default()
     });
 
@@ -508,20 +508,20 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let mut stats = row![].spacing(6.0).align_y(Alignment::Center);
+    let mut stats = row![].spacing(8.0).align_y(Alignment::Center);
     if entry.insertions > 0 {
         stats = stats.push(
             text(format!("+{}", entry.insertions))
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(10.0))
-                .color(color(p.status_ok)),
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.status_success)),
         );
     }
     if entry.deletions > 0 {
         stats = stats.push(
             text(format!("\u{2212}{}", entry.deletions))
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(10.0))
+                .size(crate::text_scale::px(15.0))
                 .color(color(p.status_danger)),
         );
     }
@@ -529,8 +529,8 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
     let contents = row![
         text(name)
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.5))
-            .color(color(p.text_primary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong))
             .width(Length::Fill),
         stats,
         widgets::lang_badge(letter, color(kind_color), tint(kind_color, 0.16)),
@@ -562,7 +562,7 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
             } else {
                 None
             },
-            text_color: color(p.text_primary),
+            text_color: color(p.text_strong),
             ..button::Style::default()
         }
     })
@@ -574,13 +574,13 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
 /// no indication of *why* CHANGES wasn't showing.
 fn clean_tree_row(p: Palette) -> Element<'static, Message> {
     row![
-        widgets::dot(color(p.status_ok), 6.0),
+        widgets::dot(color(p.status_success), 6.0),
         text("Working tree clean")
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted)),
     ]
-    .spacing(7.0)
+    .spacing(8.0)
     .align_y(Alignment::Center)
     .padding([8.0, 12.0])
     .into()
@@ -606,21 +606,21 @@ fn changes_header(state: &State, p: Palette) -> Option<Element<'static, Message>
     Some(
         button(widgets::center_v(
             row![
-                text(glyph).size(crate::text_scale::px(10.0)).color(color(p.text_muted)),
+                text(glyph).size(crate::text_scale::px(15.0)).color(color(p.text_muted)),
                 text(format!("CHANGES [{}]", state.changed_files.len()))
                     .font(fonts::mono(Weight::Semibold))
-                    .size(crate::text_scale::px(11.0))
-                    .color(color(p.text_secondary)),
+                    .size(crate::text_scale::px(15.0))
+                    .color(color(p.text_muted)),
                 text(format!("+{total_ins}"))
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(10.0))
-                    .color(color(p.status_ok)),
+                    .size(crate::text_scale::px(15.0))
+                    .color(color(p.status_success)),
                 text(format!("\u{2212}{total_del}"))
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(10.0))
+                    .size(crate::text_scale::px(15.0))
                     .color(color(p.status_danger)),
             ]
-            .spacing(7.0)
+            .spacing(8.0)
             .align_y(Alignment::Center),
         ))
         .width(Length::Fill)
@@ -663,12 +663,17 @@ fn changes_rows(state: &State, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-fn footer(p: Palette) -> Element<'static, Message> {
-    let settings = button(widgets::center_fill(text("⚙").size(crate::text_scale::px(14.0))))
-        .width(Length::Fixed(26.0))
-        .height(Length::Fixed(26.0))
+/// A small icon-glyph button (Collapse sidebar / Settings / Expand sidebar)
+/// — same hover-color-swap shape as `header_icon_button`, just a fixed
+/// square rather than that one's header-row cell. Shared by `footer` (the
+/// expanded sidebar's 26px buttons) and `collapsed_rail` (its narrower 24px
+/// ones), so the two don't carry two copies of the same style closure.
+fn footer_icon_button(label: &'static str, message: Message, size: f32, p: Palette) -> Element<'static, Message> {
+    button(widgets::center_fill(text(label).size(crate::text_scale::px(15.0))))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
         .padding(0.0)
-        .on_press(Message::ToggleSettings)
+        .on_press(message)
         .style(move |_theme, status| {
             let hovered = status == button::Status::Hovered;
             button::Style {
@@ -678,22 +683,58 @@ fn footer(p: Palette) -> Element<'static, Message> {
                     None
                 },
                 text_color: if hovered {
-                    color(p.accent)
+                    color(p.accent_solid)
                 } else {
                     color(p.text_muted)
                 },
                 ..button::Style::default()
             }
-        });
+        })
+        .into()
+}
+
+fn footer(p: Palette) -> Element<'static, Message> {
+    let collapse = footer_icon_button("\u{ab}", Message::CollapseSidebar, 26.0, p);
+    let settings = footer_icon_button("⚙", Message::ToggleSettings, 26.0, p);
 
     container(
-        row![Space::new().width(Length::Fill), settings]
+        row![collapse, Space::new().width(Length::Fill), settings]
             .spacing(8.0)
             .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .padding([8.0, 12.0])
     .into()
+}
+
+/// The narrow icon rail shown in place of the full sidebar when
+/// `state.sidebar_collapsed` — project glyph, a spacer, Settings, and the
+/// "expand" button, matching the mockup's `sidebarCollapsed` branch.
+fn collapsed_rail(p: Palette) -> Element<'static, Message> {
+    let (badge_fg, badge_bg) = (color(p.accent_solid), tint(p.accent_solid, 0.18));
+    let settings = footer_icon_button("⚙", Message::ToggleSettings, 24.0, p);
+    let expand = footer_icon_button("\u{bb}", Message::ExpandSidebar, 24.0, p);
+
+    let body = column![
+        widgets::lang_badge("PR", badge_fg, badge_bg),
+        widgets::hline(color(p.border_hairline)),
+        Space::new().height(Length::Fill),
+        settings,
+        widgets::hline(color(p.border_hairline)),
+        expand,
+    ]
+    .spacing(12.0)
+    .align_x(Alignment::Center)
+    .padding([12.0, 0.0]);
+
+    container(body)
+        .width(Length::Fixed(40.0))
+        .height(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(color(p.bg_base).into()),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// A small text-glyph header button (New file / New folder / Collapse all).
@@ -704,10 +745,10 @@ fn footer(p: Palette) -> Element<'static, Message> {
 /// own color).
 fn header_icon_button(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
     button(widgets::center_fill(
-        text(label).font(fonts::mono(Weight::Bold)).size(crate::text_scale::px(10.0)),
+        text(label).font(fonts::mono(Weight::Bold)).size(crate::text_scale::px(15.0)),
     ))
-    .width(Length::Fixed(24.0))
-    .height(Length::Fixed(22.0))
+    .width(Length::Fixed(34.0))
+    .height(Length::Fixed(30.0))
     .padding(0.0)
     .on_press(message)
     .style(move |_theme, status| {
@@ -718,7 +759,7 @@ fn header_icon_button(label: &'static str, message: Message, p: Palette) -> Elem
             } else {
                 None
             },
-            text_color: if hovered { color(p.accent) } else { color(p.text_muted) },
+            text_color: if hovered { color(p.accent_solid) } else { color(p.text_muted) },
             ..button::Style::default()
         }
     })
@@ -734,25 +775,29 @@ fn explorer_header(p: Palette) -> Element<'static, Message> {
     row![
         text("EXPLORER")
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted))
             .width(Length::Fill),
         header_icon_button("+F", Message::BeginDraft(DraftKind::NewFile), p),
         header_icon_button("+D", Message::BeginDraft(DraftKind::NewFolder), p),
         header_icon_button("\u{21b1}", Message::CollapseAllDirs, p),
     ]
-    .spacing(2.0)
+    .spacing(5.0)
     .align_y(Alignment::Center)
     .padding(Padding {
-        top: 5.0,
-        right: 8.0,
-        bottom: 5.0,
+        top: 8.0,
+        right: 11.0,
+        bottom: 8.0,
         left: 12.0,
     })
     .into()
 }
 
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
+    if state.sidebar_collapsed {
+        return collapsed_rail(p);
+    }
+
     let selected: Option<&Path> = crate::state::active_editor(state).map(|e| e.path.as_path());
 
     let row_h = state.density.sidebar_row_h();
@@ -798,33 +843,33 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         if state.changes_panel_open {
             middle = middle
                 .push(container(changes_rows(state, p)).height(Length::FillPortion(1)))
-                .push(widgets::hline(color(p.line_neutral)));
+                .push(widgets::hline(color(p.border_hairline)));
         } else {
-            middle = middle.push(widgets::hline(color(p.line_neutral)));
+            middle = middle.push(widgets::hline(color(p.border_hairline)));
         }
     } else if state.repo.is_some() {
         // A git repo with nothing to show in CHANGES — say so, rather than
         // just leaving a gap where that section would otherwise be.
-        middle = middle.push(clean_tree_row(p)).push(widgets::hline(color(p.line_neutral)));
+        middle = middle.push(clean_tree_row(p)).push(widgets::hline(color(p.border_hairline)));
     }
     middle = middle
         .push(explorer_header(p))
-        .push(widgets::hline(color(p.line_neutral)))
+        .push(widgets::hline(color(p.border_hairline)))
         .push(container(tree_view).height(Length::Fill));
 
     let body = column![
         project_switcher(state, p),
-        widgets::hline(color(p.line_neutral)),
+        widgets::hline(color(p.border_hairline)),
         middle.height(Length::Fill),
-        widgets::hline(color(p.line_neutral)),
+        widgets::hline(color(p.border_hairline)),
         footer(p),
     ];
 
     container(body)
-        .width(Length::Fixed(248.0))
+        .width(Length::Fixed(272.0))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             ..container::Style::default()
         })
         .into()

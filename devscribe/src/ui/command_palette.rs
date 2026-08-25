@@ -14,7 +14,7 @@ use crate::ui::search_icon::SearchIcon;
 fn hint(label: &'static str, p: devscribe_core::theme::Palette) -> Element<'static, Message> {
     text(label)
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(10.0))
+        .size(crate::text_scale::px(13.0))
         .color(color(p.text_muted))
         .into()
 }
@@ -25,7 +25,7 @@ fn section_header(label: &'static str, p: devscribe_core::theme::Palette) -> Ele
     container(
         text(label)
             .font(fonts::mono(Weight::Semibold))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     )
     .padding(Padding {
@@ -46,11 +46,11 @@ fn entry_row(
     let is_selected = i == selected;
     let label = text(entry.label.clone())
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(12.0))
+        .size(crate::text_scale::px(15.0))
         .color(if is_selected {
-            color(p.text_primary)
+            color(p.text_strong)
         } else {
-            color(p.text_secondary)
+            color(p.text_body)
         });
     button(label)
         .width(Length::Fill)
@@ -69,7 +69,7 @@ fn entry_row(
                 } else {
                     None
                 },
-                text_color: color(p.text_primary),
+                text_color: color(p.text_strong),
                 ..button::Style::default()
             }
         })
@@ -80,7 +80,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if !state.palette_open {
         return None;
     }
-    let p = devscribe_core::theme::palette(state.theme);
+    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
 
     let entries = state::filtered_palette_entries(state);
     let selected = state.palette_selected.min(entries.len().saturating_sub(1));
@@ -110,7 +110,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         container(
             text("No matches")
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(12.0))
+                .size(crate::text_scale::px(15.0))
                 .color(color(p.text_muted)),
         )
         .padding(16.0)
@@ -122,7 +122,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let input = text_input("Run anything\u{2026}", &state.palette_query)
         .id(state::palette_query_id())
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(14.0))
+        .size(crate::text_scale::px(15.0))
         .padding([10.0, 12.0])
         .on_input(Message::PaletteQueryChanged)
         .on_submit(Message::PaletteExecute)
@@ -135,9 +135,9 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
             },
             icon: color(p.text_muted),
             placeholder: color(p.text_muted),
-            value: color(p.text_primary),
+            value: color(p.text_strong),
             selection: {
-                let mut c = p.accent;
+                let mut c = p.accent_solid;
                 c.a = 0.35;
                 color(c)
             },
@@ -146,15 +146,15 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let mode_badge = container(
         text("Commands")
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     )
     .padding([2.0, 8.0])
     .style(move |_theme| container::Style {
         border: Border {
-            color: color(p.line_neutral),
+            color: color(p.border_hairline),
             width: 1.5,
-            radius: 2.0.into(),
+            radius: 3.0.into(),
         },
         ..container::Style::default()
     });
@@ -182,14 +182,14 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         header,
         container(Space::new().width(Length::Fill).height(Length::Fixed(1.0))).style(move |_theme| {
             container::Style {
-                background: Some(color(p.line_neutral).into()),
+                background: Some(color(p.border_hairline).into()),
                 ..container::Style::default()
             }
         }),
         results,
         container(Space::new().width(Length::Fill).height(Length::Fixed(1.0))).style(move |_theme| {
             container::Style {
-                background: Some(color(p.line_neutral).into()),
+                background: Some(color(p.border_hairline).into()),
                 ..container::Style::default()
             }
         }),
@@ -197,11 +197,11 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     ])
     .width(Length::Fixed(560.0))
     .style(move |_theme| container::Style {
-        background: Some(color(p.bg_panel).into()),
+        background: Some(color(p.bg_base).into()),
         border: Border {
-            color: color(p.line_accent),
+            color: color(p.border_accent),
             width: 1.5,
-            radius: 4.0.into(),
+            radius: 10.0.into(),
         },
         ..container::Style::default()
     });
@@ -221,7 +221,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
                 background: Some(
                     Color {
                         a: 0.55,
-                        ..color(p.bg_void)
+                        ..color(p.bg_canvas)
                     }
                     .into(),
                 ),

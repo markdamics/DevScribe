@@ -25,6 +25,97 @@ picked up three things, folded into the plan below:
   the welcome screen — blocked on the welcome screen existing at all, so it
   travels with it in Phase 9.
 
+**2026-08-25 update**: the Claude Design project was pointed at a whole new
+design system, **Maho**, replacing Axiom HUD entirely (not just a token
+tweak — `DevScribe.dc.html` no longer references
+`_ds/axiom-hud-design-system-*` at all). Adopted in full, on request, rather
+than the narrower "just make the spacing bigger" option also on the table:
+
+- **Palette**: Axiom HUD's ten fixed named themes (NullGrid, Gantry,
+  Abyssal, Raven, Ember, Verdigris, Meridian, Stark, Sumi, Washi) are gone.
+  `devscribe_core::theme` now has `ThemeMode` (`Dark`/`Light`, Maho's
+  "Yoru"/"Asa") crossed with `Accent` (`Tsuki`/`Seiji`/`Matcha`/`Fuji`/
+  `Kohaku`/`Nezu` — six of the mockup's nine defined accent ramps are
+  exposed, matching the mockup's own curated picker; `Sakura`/`Shu`/`Wakaba`
+  exist in the source CSS but aren't offered there either). `Palette`'s
+  field names changed to Maho's own semantics throughout (`bg_void`→
+  `bg_canvas`, `text_primary`→`text_strong`, `line_neutral`→
+  `border_hairline`, `accent`→`accent_solid`, `status_ok`→`status_success`,
+  etc.) — a few fields with zero real call sites (`accent_dim`,
+  `accent_glow`, `grid_line`/`grid_dot`, the `status_*_soft` variants) were
+  dropped rather than carried forward as dead weight. The old `accent_2`
+  (a second brand color, used for the title-bar logo's second half and a
+  couple of syntax-highlight roles) maps onto Maho's `seal_solid` — a fixed
+  vermilion "used once per view at most" per its own source comment, which
+  is exactly that role.
+- **Settings/persistence**: `settings.json` now stores `theme_mode` +
+  `accent` instead of one `theme` key. An old, pre-Maho settings file
+  (`{"theme":"NullGrid"}`) simply fails to parse into the new shape and
+  falls back to the default (`Dark`/`Tsuki`) — same "nothing saved yet, use
+  the default" treatment every other unrecognized/missing key already got,
+  no migration code needed or added.
+- **Settings panel / command palette**: the old ten-button theme grid is
+  now two pickers — a Dark/Light toggle and a six-swatch accent row — and
+  the command palette's ten "Theme: X" entries became two "Theme:
+  Dark/Light" entries plus six "Accent: X" entries.
+- **Fonts**: the three-family stack (Oxanium display / Archivo sans / IBM
+  Plex Mono) is gone — Maho is one monospaced voice, so all three roles
+  (`fonts::display`/`sans`/`mono`) now resolve to the same bundled
+  JetBrains Mono (instanced at the weights the app actually uses: Light/
+  Regular/Medium/SemiBold/Bold/ExtraBold, no italic — nothing renders one).
+  None of the ~100+ call sites needed to change, only `fonts.rs` itself and
+  the bundled `.ttf`s. The 600 (SemiBold) weight has no named instance in
+  Google Fonts' variable source (JetBrains Mono's own static family skips it
+  too), so it was instanced without `--update-name-table` and had its name
+  table set by hand afterward — see `assets/fonts/LICENSE-OFL.txt`.
+- **Spacing/sizing — the visible "more spacious" delta**: sidebar width
+  248→272px (the mockup's own default); `Density::Compact`'s title/tab-bar
+  height 32→30px (now matches Maho's `--control-h-sm` exactly — `Comfortable`
+  (38) and `Spacious` (46) already matched `--control-h-md`/`--control-h-lg`
+  precisely, nothing to change there); button/input/badge corner radius
+  2→3px (Maho's `--radius-sm`) and modal-level containers (command palette,
+  settings panel) 4→10px (`--radius-lg`); UI font sizes bumped along Maho's
+  scale (10→11 micro, 12→13 body-sm, 14→15 body-md, 16→17 body-lg, 20→22
+  heading); off-scale `.spacing()` gaps (6/7/10/3/20px) rounded up to the
+  nearest step on Maho's `--space-*` scale (8/12/4/24px) — gaps already
+  exactly on that scale (2/4/8/12/16px, which is most of them) were left
+  alone. `devscribe_core::theme`'s `FONT_SIZES`/`SPACING`/`GEOMETRY`
+  constants were updated to the same numbers for documentation parity, but
+  — as before this change — nothing in the UI layer actually reads them;
+  every call site still owns its own literal.
+
+**Post-Maho follow-up, from direct visual feedback comparing the built app
+against the mockup/screenshots side by side**: several chrome elements read
+as too small even though their sizes matched the mockup's own CSS
+literally — the title bar's "Run anything"/Assist buttons, the sidebar's
+EXPLORER header + its icon buttons, the git branch row, the CHANGES section
+(header, clean-tree row, per-file rows), and the project-switcher's
+name/path. Bumped these in two further rounds beyond the initial Maho port,
+then did one more app-wide pass over every remaining `text_scale::px(N)`
+call site (tab bar, status bar, command palette, settings panel, welcome
+screen, diff/JSON/search views, toast, flash, find bar, context menu, and
+the shared badge/micro widgets in `widgets.rs`) — micro text moved from
+10/11px up to 13px, body-ish text from 12/13px up to 15px, and the
+title-bar wordmark/logo got an explicit bump too (15→18px / 18→22px). None
+of this is mockup-literal anymore; it's tuned by eye against the running
+app, which is expected to keep moving as more direct feedback comes in.
+
+**2026-08-26 update — collapsible sidebar**: the Claude Design mockup added
+a `sidebarCollapsed`/`sidebarOpen` toggle — a new "Collapse sidebar" button
+(`panel-left-close`) in the sidebar footer, and, when collapsed, a narrow
+34px icon rail (project glyph, a spacer, Settings, an "expand" button)
+replacing the full sidebar entirely. Ported as `State.sidebar_collapsed`
+(new `Message::CollapseSidebar`/`ExpandSidebar`, `sidebar.rs::view`
+branching to a new `collapsed_rail()` when set) — icon glyphs are plain
+text (`«`/`»`), matching this codebase's established "no SVG icons"
+convention rather than the mockup's own `MahoDesignSystem_2eb4f3.Icon`
+component. `collapseSidebar`'s mockup handler also closes the projects
+dropdown and clears any pending menu state; ported the same way (closes
+`state.projects_open` and `state.ctx_menu`, both of which would otherwise be
+anchored to sidebar content that's about to disappear). New tests:
+`state::tests::collapse_sidebar_sets_collapsed_and_closes_menus_anchored_to_it`,
+`expand_sidebar_clears_collapsed_without_touching_other_state`.
+
 ## Phased plan for remaining work
 
 Sequencing rationale: multi-tab support touches the data model that

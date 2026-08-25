@@ -12,7 +12,7 @@ use crate::ui::search_icon::SearchIcon;
 use crate::widgets;
 
 fn underline_color(active: bool, p: Palette) -> Color {
-    color(if active { p.accent } else { p.line_neutral })
+    color(if active { p.accent_solid } else { p.border_hairline })
 }
 
 /// Wraps `content` with a 1px active/inactive indicator along its bottom
@@ -46,7 +46,7 @@ fn with_underline(content: Element<'static, Message>, active: bool, p: Palette) 
 /// `OpenTab`'s doc), just a pinned entry point into the search view.
 fn search_icon_tab(active: bool, p: Palette, density: Density) -> Element<'static, Message> {
     let tab_h = density.tab_bar_h() - 1.0;
-    let icon_color = if active { color(p.text_primary) } else { color(p.text_muted) };
+    let icon_color = if active { color(p.text_strong) } else { color(p.text_muted) };
     let icon = canvas(SearchIcon { color: icon_color })
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0));
@@ -60,7 +60,7 @@ fn search_icon_tab(active: bool, p: Palette, density: Density) -> Element<'stati
             let hovered = status == button::Status::Hovered;
             button::Style {
                 background: if active {
-                    Some(color(p.bg_void).into())
+                    Some(color(p.bg_canvas).into())
                 } else if hovered {
                     Some(color(p.surface_hover).into())
                 } else {
@@ -109,7 +109,7 @@ fn tab_shell(
                     None
                 },
                 text_color: if active {
-                    color(p.text_primary)
+                    color(p.text_strong)
                 } else {
                     color(p.text_muted)
                 },
@@ -117,7 +117,7 @@ fn tab_shell(
             }
         });
 
-    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(10.0))))
+    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(13.0))))
         .padding(0.0)
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(tab_h))
@@ -131,7 +131,7 @@ fn tab_shell(
                     None
                 },
                 text_color: if hovered {
-                    color(p.text_primary)
+                    color(p.text_strong)
                 } else {
                     color(p.text_muted)
                 },
@@ -142,7 +142,7 @@ fn tab_shell(
     let inner = container(row![select, close].align_y(Alignment::Center))
         .height(Length::Fixed(tab_h))
         .style(move |_theme| container::Style {
-            background: active.then(|| color(p.bg_void).into()),
+            background: active.then(|| color(p.bg_canvas).into()),
             ..container::Style::default()
         });
 
@@ -157,7 +157,7 @@ fn file_tab_label(editor: &EditorState, p: Palette) -> Element<'static, Message>
     // generic "no extension" glyph, indistinguishable from any other
     // unrecognized real file.
     let (fg, bg, code) = if editor.document.path().is_none() {
-        (color(p.accent), Color { a: 0.22, ..color(p.accent) }, "TXT".to_string())
+        (color(p.accent_solid), Color { a: 0.22, ..color(p.accent_solid) }, "TXT".to_string())
     } else {
         let lang = crate::fs_tree::Lang::from_path(&editor.path);
         let (fg, bg) = lang.badge(p);
@@ -173,12 +173,12 @@ fn file_tab_label(editor: &EditorState, p: Palette) -> Element<'static, Message>
         widgets::lang_badge(code, fg, bg),
         text(name)
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.0)),
+            .size(crate::text_scale::px(15.0)),
     ]
-    .spacing(7.0)
+    .spacing(8.0)
     .align_y(Alignment::Center);
     if editor.document.is_dirty() {
-        contents = contents.push(widgets::dot(color(p.status_warn), 5.0));
+        contents = contents.push(widgets::dot(color(p.status_warning), 5.0));
     }
     contents.into()
 }
@@ -190,8 +190,8 @@ fn diff_tab_label(path: &std::path::Path, p: Palette) -> Element<'static, Messag
         .unwrap_or_default();
     row![text(format!("{name} \u{2194} HEAD"))
         .font(fonts::sans(Weight::Medium))
-        .size(crate::text_scale::px(12.0))
-        .color(color(p.text_primary))]
+        .size(crate::text_scale::px(15.0))
+        .color(color(p.text_strong))]
     .into()
 }
 
@@ -225,7 +225,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
             let hovered = status == button::Status::Hovered;
             button::Style {
                 text_color: if hovered || overflow_open {
-                    color(p.text_primary)
+                    color(p.text_strong)
                 } else {
                     color(p.text_muted)
                 },
@@ -240,7 +240,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .height(Length::Fixed(bar_h))
         .align_y(Vertical::Center)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             ..container::Style::default()
         })
         .into()
@@ -251,12 +251,12 @@ fn overflow_row(label: &'static str, shortcut: &'static str, message: Message, p
         row![
             text(label)
                 .font(fonts::sans(Weight::Medium))
-                .size(crate::text_scale::px(12.0))
-                .color(color(p.text_primary))
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.text_strong))
                 .width(Length::Fill),
             text(shortcut)
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(10.0))
+                .size(crate::text_scale::px(13.0))
                 .color(color(p.text_muted)),
         ]
         .align_y(Alignment::Center),
@@ -268,7 +268,7 @@ fn overflow_row(label: &'static str, shortcut: &'static str, message: Message, p
         let hovered = status == button::Status::Hovered;
         button::Style {
             background: if hovered {
-                Some(color(p.bg_panel).into())
+                Some(color(p.bg_base).into())
             } else {
                 None
             },
@@ -305,9 +305,9 @@ pub fn overflow_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
     .style(move |_theme| container::Style {
         background: Some(color(p.surface_raised).into()),
         border: Border {
-            color: color(p.line_neutral),
+            color: color(p.border_hairline),
             width: 1.5,
-            radius: 2.0.into(),
+            radius: 3.0.into(),
         },
         ..container::Style::default()
     });

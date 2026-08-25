@@ -15,21 +15,21 @@ use crate::state::{Message, State};
 
 pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let flash = state.flash.as_ref()?;
-    let p = devscribe_core::theme::palette(state.theme);
+    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
 
     let pill = container(
         text(flash.text.clone())
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
-            .color(color(p.accent)),
+            .size(crate::text_scale::px(13.0))
+            .color(color(p.accent_solid)),
     )
     .padding([6.0, 14.0])
     .style(move |_theme| container::Style {
         background: Some(color(p.surface_raised).into()),
         border: Border {
-            color: color(p.line_accent),
+            color: color(p.border_accent),
             width: 1.5,
-            radius: 2.0.into(),
+            radius: 3.0.into(),
         },
         ..container::Style::default()
     });

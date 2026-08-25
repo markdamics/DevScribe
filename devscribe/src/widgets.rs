@@ -51,7 +51,7 @@ pub fn lang_badge<'a, Message: 'a>(
     container(
         text(label)
             .font(fonts::mono(iced::font::Weight::Bold))
-            .size(crate::text_scale::px(8.0))
+            .size(crate::text_scale::px(10.0))
             .color(fg),
     )
     .center(Length::Fixed(18.0))
@@ -67,7 +67,7 @@ pub fn lang_badge<'a, Message: 'a>(
 pub fn micro<'a, Message: 'a>(content: &'a str, color: Color) -> Element<'a, Message> {
     text(content)
         .font(fonts::mono(iced::font::Weight::Medium))
-        .size(crate::text_scale::px(10.0))
+        .size(crate::text_scale::px(13.0))
         .color(color)
         .into()
 }
@@ -106,14 +106,14 @@ pub fn placeholder<'a, Message: 'a>(
     container(
         text(label)
             .font(fonts::mono(iced::font::Weight::Medium))
-            .size(crate::text_scale::px(12.0))
+            .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted)),
     )
     .width(Length::Fill)
     .height(Length::Fill)
     .center(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(color(p.bg_void).into()),
+        background: Some(color(p.bg_canvas).into()),
         ..container::Style::default()
     })
     .into()

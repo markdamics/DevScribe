@@ -32,9 +32,9 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     let problems_color = if errors > 0 {
         p.status_danger
     } else if warnings > 0 {
-        p.status_warn
+        p.status_warning
     } else {
-        p.status_ok
+        p.status_success
     };
     let problems_label = if total == 0 {
         "NO PROBLEMS".to_string()
@@ -46,10 +46,10 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         widgets::dot(color(problems_color), 6.0),
         text(problems_label)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     ]
-    .spacing(6.0)
+    .spacing(8.0)
     .align_y(Alignment::Center);
 
     let (lsp_color, lsp_label) = state.lsp_status.describe(p);
@@ -57,10 +57,10 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         widgets::dot(color(lsp_color), 6.0),
         text(lsp_label)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     ]
-    .spacing(6.0)
+    .spacing(8.0)
     .align_y(Alignment::Center);
 
     let bar = row![
@@ -77,7 +77,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .height(Length::Fixed(state.density.status_bar_h()))
         .align_y(Vertical::Center)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             ..container::Style::default()
         })
         .into()

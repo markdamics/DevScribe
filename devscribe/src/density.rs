@@ -1,7 +1,9 @@
 //! The "density" setting: scales the shell chrome's row heights (title bar,
 //! tab bar, status bar, sidebar rows). Deliberately scoped to chrome only —
 //! the code editor's own text size is a separate "zoom" concern, not this
-//! setting's job.
+//! setting's job. `Comfortable`/`Spacious`'s title/tab-bar heights (38/46)
+//! already match Maho's `--control-h-md`/`--control-h-lg` exactly; `Compact`
+//! was nudged from 32 to 30 to match `--control-h-sm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Density {
     #[default]
@@ -25,7 +27,7 @@ impl Density {
         match self {
             Density::Spacious => 46.0,
             Density::Comfortable => 38.0,
-            Density::Compact => 32.0,
+            Density::Compact => 30.0,
         }
     }
 
@@ -33,7 +35,7 @@ impl Density {
         match self {
             Density::Spacious => 46.0,
             Density::Comfortable => 38.0,
-            Density::Compact => 32.0,
+            Density::Compact => 30.0,
         }
     }
 

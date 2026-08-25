@@ -17,9 +17,9 @@ const GUTTER: f32 = 14.0;
 
 fn value_color(value: &Value, p: Palette) -> Color {
     match value {
-        Value::String(_) => color(p.status_ok),
-        Value::Number(_) => color(p.accent_2),
-        Value::Bool(_) => color(p.accent),
+        Value::String(_) => color(p.status_success),
+        Value::Number(_) => color(p.seal_solid),
+        Value::Bool(_) => color(p.accent_solid),
         Value::Null => color(p.text_muted),
         Value::Object(_) | Value::Array(_) => color(p.text_muted),
     }
@@ -36,8 +36,8 @@ fn key_label(key: Option<&str>, p: Palette) -> Option<Element<'static, Message>>
     key.map(|k| {
         text(format!("\"{k}\":"))
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong))
             .into()
     })
 }
@@ -45,7 +45,7 @@ fn key_label(key: Option<&str>, p: Palette) -> Option<Element<'static, Message>>
 fn toggle(p: Palette, path: String, collapsed: bool) -> Element<'static, Message> {
     button(widgets::center_fill(
         text(if collapsed { "\u{25b8}" } else { "\u{25be}" })
-            .size(crate::text_scale::px(9.0))
+            .size(crate::text_scale::px(11.0))
             .color(color(p.text_muted)),
     ))
     .padding(0.0)
@@ -91,7 +91,7 @@ fn node_rows(
             header = header.push(
                 text(summary)
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(12.0))
+                    .size(crate::text_scale::px(15.0))
                     .color(color(p.text_muted)),
             );
             out.push(container(header).padding(indent).into());
@@ -119,7 +119,7 @@ fn node_rows(
             header = header.push(
                 text(summary)
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(12.0))
+                    .size(crate::text_scale::px(15.0))
                     .color(color(p.text_muted)),
             );
             out.push(container(header).padding(indent).into());
@@ -147,7 +147,7 @@ fn node_rows(
             r = r.push(
                 text(text_content)
                     .font(fonts::mono(Weight::Normal))
-                    .size(crate::text_scale::px(12.0))
+                    .size(crate::text_scale::px(15.0))
                     .color(color_val),
             );
             out.push(container(r).padding(indent).into());
@@ -159,7 +159,7 @@ fn closing_row(glyph: &'static str, depth: usize, p: Palette) -> Element<'static
     container(
         text(glyph)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
+            .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted)),
     )
     .padding(Padding {
@@ -185,23 +185,23 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
                     widgets::dot(color(p.status_danger), 6.0),
                     text("INVALID JSON")
                         .font(fonts::mono(Weight::Bold))
-                        .size(crate::text_scale::px(11.0))
+                        .size(crate::text_scale::px(13.0))
                         .color(color(p.status_danger)),
                 ]
-                .spacing(6.0)
+                .spacing(8.0)
                 .align_y(Alignment::Center),
                 text(parse_error.clone())
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(12.0))
+                    .size(crate::text_scale::px(15.0))
                     .color(color(p.text_muted)),
             ]
-            .spacing(10.0),
+            .spacing(12.0),
         )
         .padding(16.0)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_void).into()),
+            background: Some(color(p.bg_canvas).into()),
             ..container::Style::default()
         })
         .into(),
@@ -210,13 +210,13 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
             node_rows(None, value, "root".to_string(), &editor.json_collapsed, 0, p, &mut rows);
 
             let badge = row![
-                widgets::dot(color(p.status_ok), 6.0),
+                widgets::dot(color(p.status_success), 6.0),
                 text("VALID JSON")
                     .font(fonts::mono(Weight::Bold))
-                    .size(crate::text_scale::px(10.0))
+                    .size(crate::text_scale::px(13.0))
                     .color(color(p.text_muted)),
             ]
-            .spacing(6.0)
+            .spacing(8.0)
             .align_y(Alignment::Center)
             .padding([8.0, 12.0]);
 
@@ -228,7 +228,7 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |_theme| container::Style {
-                    background: Some(color(p.bg_void).into()),
+                    background: Some(color(p.bg_canvas).into()),
                     ..container::Style::default()
                 })
                 .into()

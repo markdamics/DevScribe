@@ -229,6 +229,35 @@ fn reveal_active_in_tree_uncollapses_ancestor_dirs() {
 }
 
 #[test]
+fn collapse_sidebar_sets_collapsed_and_closes_menus_anchored_to_it() {
+    let mut state = State {
+        projects_open: true,
+        ctx_menu: Some(ContextMenu { target: None, confirm_delete: false }),
+        ..State::default()
+    };
+
+    let _ = update(&mut state, Message::CollapseSidebar);
+
+    assert!(state.sidebar_collapsed);
+    assert!(!state.projects_open, "the projects dropdown is anchored to sidebar content that's about to disappear");
+    assert!(state.ctx_menu.is_none(), "the tree context menu is anchored to sidebar content that's about to disappear");
+}
+
+#[test]
+fn expand_sidebar_clears_collapsed_without_touching_other_state() {
+    let mut state = State {
+        sidebar_collapsed: true,
+        projects_open: true,
+        ..State::default()
+    };
+
+    let _ = update(&mut state, Message::ExpandSidebar);
+
+    assert!(!state.sidebar_collapsed);
+    assert!(state.projects_open, "expanding shouldn't have any side effects beyond un-collapsing");
+}
+
+#[test]
 fn view_working_tree_diff_prefers_the_active_file() {
     let files = TempFiles::new("wtd-active");
     // `changed_files` starts empty rather than trusting `State::default()`'s

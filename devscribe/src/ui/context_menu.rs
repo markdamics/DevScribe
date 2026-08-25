@@ -10,7 +10,7 @@ use crate::state::{DraftKind, Message, State};
 use crate::widgets;
 
 fn menu_row(label: &'static str, shortcut: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
-    styled_menu_row(label, shortcut, message, color(p.text_primary), p)
+    styled_menu_row(label, shortcut, message, color(p.text_strong), p)
 }
 
 /// "Delete"'s own row, in `status_danger` rather than the normal text
@@ -33,12 +33,12 @@ fn styled_menu_row(
         row![
             text(label)
                 .font(fonts::sans(iced::font::Weight::Medium))
-                .size(crate::text_scale::px(12.0))
+                .size(crate::text_scale::px(15.0))
                 .color(text_color)
                 .width(Length::Fill),
             text(shortcut)
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(10.0))
+                .size(crate::text_scale::px(13.0))
                 .color(color(p.text_muted)),
         ]
         .align_y(Alignment::Center),
@@ -50,7 +50,7 @@ fn styled_menu_row(
         let hovered = status == button::Status::Hovered;
         button::Style {
             background: if hovered {
-                Some(color(p.bg_panel).into())
+                Some(color(p.bg_base).into())
             } else {
                 None
             },
@@ -73,20 +73,20 @@ fn confirm_delete_rows(target: &Path, p: Palette) -> Vec<Element<'static, Messag
     vec![
         text(format!("Delete this {noun}?"))
             .font(fonts::sans(iced::font::Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong))
             .into(),
         text(name)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted))
             .into(),
         text("This can't be undone.")
             .font(fonts::sans(iced::font::Weight::Medium))
-            .size(crate::text_scale::px(11.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.status_danger))
             .into(),
-        widgets::hline(color(p.line_neutral)),
+        widgets::hline(color(p.border_hairline)),
         menu_row("Cancel", "", Message::CloseTreeContext, p),
         danger_menu_row("Delete permanently", Message::DeletePath(target.to_path_buf()), p),
     ]
@@ -114,17 +114,17 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         let mut rows: Vec<Element<'static, Message>> = vec![
             text(target_label.to_uppercase())
                 .font(fonts::mono(Weight::Semibold))
-                .size(crate::text_scale::px(10.0))
+                .size(crate::text_scale::px(13.0))
                 .color(color(p.text_muted))
                 .into(),
             menu_row("New file", "\u{2318}N", Message::BeginDraftIn(DraftKind::NewFile, dir.clone()), p),
             menu_row("New folder", "\u{21e7}\u{2318}N", Message::BeginDraftIn(DraftKind::NewFolder, dir), p),
         ];
         if let Some(target) = ctx.target.clone() {
-            rows.push(widgets::hline(color(p.line_neutral)));
+            rows.push(widgets::hline(color(p.border_hairline)));
             rows.push(menu_row("Rename", "\u{21b5}", Message::BeginRename(target.clone()), p));
             rows.push(menu_row("Copy path", "\u{2325}\u{2318}C", Message::CopyPath(target), p));
-            rows.push(widgets::hline(color(p.line_neutral)));
+            rows.push(widgets::hline(color(p.border_hairline)));
             rows.push(danger_menu_row("Delete", Message::PromptDeletePath, p));
         }
         rows
@@ -135,9 +135,9 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         .style(move |_theme| container::Style {
             background: Some(color(p.surface_raised).into()),
             border: Border {
-                color: color(p.line_neutral),
+                color: color(p.border_hairline),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..container::Style::default()
         });

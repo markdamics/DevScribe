@@ -21,7 +21,7 @@ fn nav_button(
     let mut b = button(widgets::center_fill(
         text(label)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0)),
+            .size(crate::text_scale::px(13.0)),
     ))
     .width(Length::Fixed(22.0))
     .height(Length::Fixed(22.0))
@@ -35,7 +35,7 @@ fn nav_button(
                 None
             },
             text_color: if enabled {
-                color(p.text_primary)
+                color(p.text_strong)
             } else {
                 color(p.text_muted)
             },
@@ -66,7 +66,7 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
     let input = text_input("Find\u{2026}", &find.query)
         .id(state::find_query_id())
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(12.0))
+        .size(crate::text_scale::px(15.0))
         .padding([4.0, 6.0])
         .on_input(Message::FindQueryChanged)
         .on_submit(Message::FindNext)
@@ -79,15 +79,15 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
             },
             icon: color(p.text_muted),
             placeholder: color(p.text_muted),
-            value: color(p.text_primary),
+            value: color(p.text_strong),
             selection: {
-                let mut c = p.accent;
+                let mut c = p.accent_solid;
                 c.a = 0.35;
                 color(c)
             },
         });
 
-    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(10.0))))
+    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(13.0))))
         .width(Length::Fixed(22.0))
         .height(Length::Fixed(22.0))
         .padding(0.0)
@@ -112,13 +112,13 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
         input,
         text(count_label)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
         nav_button("\u{2191}", Message::FindPrev, has_matches, p),
         nav_button("\u{2193}", Message::FindNext, has_matches, p),
         close,
     ]
-    .spacing(6.0)
+    .spacing(8.0)
     .align_y(Alignment::Center)
     .padding(Padding {
         top: 4.0,
@@ -130,11 +130,11 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
     let panel = container(pill)
         .width(Length::Fixed(320.0))
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             border: Border {
-                color: color(p.line_accent),
+                color: color(p.border_accent),
                 width: 1.5,
-                radius: 3.0.into(),
+                radius: 6.0.into(),
             },
             ..container::Style::default()
         });

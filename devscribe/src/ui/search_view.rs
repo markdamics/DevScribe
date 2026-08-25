@@ -27,22 +27,22 @@ use crate::widgets;
 fn query_box(p: Palette, query: &str) -> Element<'static, Message> {
     text_input("Search project files\u{2026}", query)
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(13.0))
+        .size(crate::text_scale::px(15.0))
         .padding([8.0, 12.0])
         .on_input(Message::SearchQueryChanged)
         .on_submit(Message::SearchSubmit)
         .style(move |_theme, _status| text_input::Style {
-            background: color(p.bg_void).into(),
+            background: color(p.bg_canvas).into(),
             border: Border {
-                color: color(p.line_neutral),
+                color: color(p.border_hairline),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             icon: color(p.text_muted),
             placeholder: color(p.text_muted),
-            value: color(p.text_primary),
+            value: color(p.text_strong),
             selection: {
-                let mut c = p.accent;
+                let mut c = p.accent_solid;
                 c.a = 0.35;
                 color(c)
             },
@@ -63,11 +63,11 @@ fn stats_row(state: &State, p: Palette) -> Element<'static, Message> {
     row![
         text(format!("Results for \u{201c}{}\u{201d}", state.search_last_query))
             .font(fonts::sans(Weight::Semibold))
-            .size(crate::text_scale::px(14.0))
-            .color(color(p.text_primary)),
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong)),
         text(format!("{matches} MATCHES // {files} FILES // {ms} MS"))
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     ]
     .spacing(12.0)
@@ -83,7 +83,7 @@ fn stats_row(state: &State, p: Palette) -> Element<'static, Message> {
 fn match_line_runs(preview: &str, match_start: usize, match_len: usize, p: Palette) -> Vec<Element<'static, Message>> {
     let chars: Vec<char> = preview.chars().collect();
     let len = chars.len();
-    let run_color = color(p.text_secondary);
+    let run_color = color(p.text_body);
 
     if match_len == 0 {
         return vec![plain_run(preview.to_string(), run_color)];
@@ -98,7 +98,7 @@ fn match_line_runs(preview: &str, match_start: usize, match_len: usize, p: Palet
     }
     if local_end > local_start {
         let matched: String = chars[local_start..local_end].iter().collect();
-        out.push(matched_run(matched, color(p.text_primary), p));
+        out.push(matched_run(matched, color(p.text_strong), p));
     }
     if local_end < len {
         out.push(plain_run(chars[local_end..].iter().collect(), run_color));
@@ -109,7 +109,7 @@ fn match_line_runs(preview: &str, match_start: usize, match_len: usize, p: Palet
 fn plain_run(content: String, color_val: Color) -> Element<'static, Message> {
     text(content)
         .font(fonts::mono(Weight::Normal))
-        .size(crate::text_scale::px(11.5))
+        .size(crate::text_scale::px(13.5))
         .color(color_val)
         .into()
 }
@@ -118,13 +118,13 @@ fn matched_run(content: String, color_val: Color, p: Palette) -> Element<'static
     container(
         text(content)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.5))
+            .size(crate::text_scale::px(13.5))
             .color(color_val),
     )
     .style(move |_theme| container::Style {
         background: Some(
             color({
-                let mut c = p.accent;
+                let mut c = p.accent_solid;
                 c.a = 0.28;
                 c
             })
@@ -138,7 +138,7 @@ fn matched_run(content: String, color_val: Color, p: Palette) -> Element<'static
 fn match_row(result: &SearchResult, p: Palette) -> Element<'static, Message> {
     let gutter = text((result.hit.line + 1).to_string())
         .font(fonts::mono(Weight::Medium))
-        .size(crate::text_scale::px(11.0))
+        .size(crate::text_scale::px(13.0))
         .color({
             let mut c = p.text_muted;
             c.a = 0.6;
@@ -193,11 +193,11 @@ fn file_group<'a>(path: &'a Path, results: &[&'a SearchResult], p: Palette) -> E
         widgets::lang_badge(lang.code(path), fg, bg),
         text(name)
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary)),
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong)),
         text(results.len().to_string())
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(10.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     ]
     .spacing(8.0)
@@ -248,7 +248,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
             sections.push(file_group(path, &results, p));
         }
         scrollable(
-            column(sections).spacing(20.0).padding(Padding {
+            column(sections).spacing(24.0).padding(Padding {
                 top: 12.0,
                 right: 24.0,
                 bottom: 24.0,
@@ -260,11 +260,11 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .into()
     };
 
-    container(column![input, widgets::hline(color(p.line_neutral)), body])
+    container(column![input, widgets::hline(color(p.border_hairline)), body])
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_void).into()),
+            background: Some(color(p.bg_canvas).into()),
             ..container::Style::default()
         })
         .into()

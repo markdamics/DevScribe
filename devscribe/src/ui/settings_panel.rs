@@ -7,7 +7,7 @@
 //! mockup's `New window`/`Open folder`/`Save as` rows — none of those
 //! actions exist in DevScribe). Rendered as a `stack!` layer over the
 //! shell, same backdrop-modal mechanism as `command_palette`.
-use devscribe_core::theme::{Palette, ThemeName};
+use devscribe_core::theme::{Accent, Palette, ThemeMode};
 use iced::font::Weight;
 use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
 use iced::{Alignment, Border, Color, Element, Length};
@@ -31,8 +31,8 @@ fn stepper_button(label: &'static str, p: Palette, message: Message, enabled: bo
     button(widgets::center_fill(
         text(label)
             .font(fonts::mono(Weight::Bold))
-            .size(crate::text_scale::px(13.0))
-            .color(if enabled { color(p.text_primary) } else { color(p.text_muted) }),
+            .size(crate::text_scale::px(15.0))
+            .color(if enabled { color(p.text_strong) } else { color(p.text_muted) }),
     ))
     .width(Length::Fixed(28.0))
     .height(Length::Fixed(28.0))
@@ -47,9 +47,9 @@ fn stepper_button(label: &'static str, p: Palette, message: Message, enabled: bo
                 None
             },
             border: Border {
-                color: color(p.line_neutral),
+                color: color(p.border_hairline),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..button::Style::default()
         }
@@ -70,8 +70,8 @@ fn stepper_row(
         container(
             text(value_label)
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(12.0))
-                .color(color(p.text_primary)),
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.text_strong)),
         )
         .width(Length::Fixed(48.0))
         .align_x(Alignment::Center),
@@ -106,43 +106,85 @@ fn ui_scale_row(state: &State, p: Palette) -> Element<'static, Message> {
     )
 }
 
-fn theme_grid(state: &State, p: Palette) -> Element<'static, Message> {
-    let rows: Vec<Element<'static, Message>> = ThemeName::ALL
-        .chunks(4)
+/// Dark/Light toggle (2 buttons) — replaces the old ten-named-theme grid.
+fn theme_mode_row(state: &State, p: Palette) -> Element<'static, Message> {
+    let buttons: Vec<Element<'static, Message>> = ThemeMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let active = state.theme_mode == mode;
+            button(
+                text(mode.label())
+                    .font(fonts::mono(Weight::Medium))
+                    .size(crate::text_scale::px(13.0))
+                    .color(if active { color(p.accent_solid) } else { color(p.text_body) }),
+            )
+            .width(Length::Fill)
+            .padding([6.0, 10.0])
+            .on_press(Message::SetThemeMode(mode))
+            .style(move |_theme, status| {
+                let hovered = status == button::Status::Hovered;
+                button::Style {
+                    background: if active {
+                        Some(color(p.accent_quiet).into())
+                    } else if hovered {
+                        Some(color(p.surface_hover).into())
+                    } else {
+                        None
+                    },
+                    border: Border {
+                        color: if active { color(p.border_accent) } else { color(p.border_hairline) },
+                        width: 1.5,
+                        radius: 3.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .into()
+        })
+        .collect();
+
+    row(buttons).spacing(8.0).into()
+}
+
+/// Accent swatch row (6 buttons, one per `Accent` variant) — Maho's
+/// dark/light-orthogonal replacement for the old fixed named-theme colors.
+fn accent_row(state: &State, p: Palette) -> Element<'static, Message> {
+    let rows: Vec<Element<'static, Message>> = Accent::ALL
+        .chunks(3)
         .map(|chunk| {
             let buttons: Vec<Element<'static, Message>> = chunk
                 .iter()
-                .map(|&theme| {
-                    let active = state.theme == theme;
-                    let swatch = devscribe_core::theme::palette(theme).accent;
+                .map(|&accent| {
+                    let active = state.accent == accent;
+                    let swatch = devscribe_core::theme::palette(state.theme_mode, accent).accent_solid;
                     button(
                         row![
                             widgets::dot(color(swatch), 6.0),
-                            text(theme.label())
+                            text(accent.label())
                                 .font(fonts::mono(Weight::Medium))
-                                .size(crate::text_scale::px(11.0))
-                                .color(if active { color(p.accent) } else { color(p.text_secondary) }),
+                                .size(crate::text_scale::px(13.0))
+                                .color(if active { color(p.accent_solid) } else { color(p.text_body) }),
                         ]
-                        .spacing(6.0)
+                        .spacing(8.0)
                         .align_y(Alignment::Center),
                     )
                     .width(Length::Fill)
                     .padding([6.0, 10.0])
-                    .on_press(Message::SetTheme(theme))
+                    .on_press(Message::SetAccent(accent))
                     .style(move |_theme, status| {
                         let hovered = status == button::Status::Hovered;
                         button::Style {
                             background: if active {
-                                Some(color(p.accent_soft).into())
+                                Some(color(p.accent_quiet).into())
                             } else if hovered {
                                 Some(color(p.surface_hover).into())
                             } else {
                                 None
                             },
                             border: Border {
-                                color: if active { color(p.line_accent) } else { color(p.line_neutral) },
+                                color: if active { color(p.border_accent) } else { color(p.border_hairline) },
                                 width: 1.5,
-                                radius: 2.0.into(),
+                                radius: 3.0.into(),
                             },
                             ..button::Style::default()
                         }
@@ -160,7 +202,7 @@ fn theme_grid(state: &State, p: Palette) -> Element<'static, Message> {
 fn section_label(label: &'static str, p: Palette) -> Element<'static, Message> {
     text(label)
         .font(fonts::mono(Weight::Bold))
-        .size(crate::text_scale::px(10.0))
+        .size(crate::text_scale::px(13.0))
         .color(color(p.text_muted))
         .into()
 }
@@ -173,8 +215,8 @@ fn density_row(state: &State, p: Palette) -> Element<'static, Message> {
             button(
                 text(density.label())
                     .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(12.0))
-                    .color(if active { color(p.accent) } else { color(p.text_secondary) }),
+                    .size(crate::text_scale::px(15.0))
+                    .color(if active { color(p.accent_solid) } else { color(p.text_body) }),
             )
             .padding([6.0, 14.0])
             .on_press(Message::SetDensity(density))
@@ -182,16 +224,16 @@ fn density_row(state: &State, p: Palette) -> Element<'static, Message> {
                 let hovered = status == button::Status::Hovered;
                 button::Style {
                     background: if active {
-                        Some(color(p.accent_soft).into())
+                        Some(color(p.accent_quiet).into())
                     } else if hovered {
                         Some(color(p.surface_hover).into())
                     } else {
                         None
                     },
                     border: Border {
-                        color: if active { color(p.line_accent) } else { color(p.line_neutral) },
+                        color: if active { color(p.border_accent) } else { color(p.border_hairline) },
                         width: 1.5,
-                        radius: 2.0.into(),
+                        radius: 3.0.into(),
                     },
                     ..button::Style::default()
                 }
@@ -206,16 +248,16 @@ fn density_row(state: &State, p: Palette) -> Element<'static, Message> {
 fn toggle_row(label: &'static str, enabled: bool, message: Message, p: Palette) -> Element<'static, Message> {
     button(
         row![
-            widgets::dot(if enabled { color(p.accent) } else { color(p.text_muted) }, 6.0),
+            widgets::dot(if enabled { color(p.accent_solid) } else { color(p.text_muted) }, 6.0),
             text(label)
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(12.0))
-                .color(color(p.text_primary)),
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.text_strong)),
             iced::widget::Space::new().width(Length::Fill),
             text(if enabled { "ON" } else { "OFF" })
                 .font(fonts::mono(Weight::Bold))
-                .size(crate::text_scale::px(10.0))
-                .color(if enabled { color(p.status_ok) } else { color(p.text_muted) }),
+                .size(crate::text_scale::px(13.0))
+                .color(if enabled { color(p.status_success) } else { color(p.text_muted) }),
         ]
         .spacing(8.0)
         .align_y(Alignment::Center),
@@ -232,9 +274,9 @@ fn toggle_row(label: &'static str, enabled: bool, message: Message, p: Palette) 
                 None
             },
             border: Border {
-                color: color(p.line_neutral),
+                color: color(p.border_hairline),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..button::Style::default()
         }
@@ -246,8 +288,8 @@ fn category_nav_row(category: SettingsCategory, active: bool, p: Palette) -> Ele
     button(
         text(category.label())
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(if active { color(p.text_primary) } else { color(p.text_secondary) })
+            .size(crate::text_scale::px(15.0))
+            .color(if active { color(p.text_strong) } else { color(p.text_body) })
             .width(Length::Fill),
     )
     .width(Length::Fill)
@@ -264,9 +306,9 @@ fn category_nav_row(category: SettingsCategory, active: bool, p: Palette) -> Ele
                 None
             },
             border: Border {
-                color: if active { color(p.line_accent) } else { Color::TRANSPARENT },
+                color: if active { color(p.border_accent) } else { Color::TRANSPARENT },
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..button::Style::default()
         }
@@ -284,7 +326,7 @@ fn category_nav(state: &State, p: Palette) -> Element<'static, Message> {
         .width(Length::Fixed(168.0))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_void).into()),
+            background: Some(color(p.bg_canvas).into()),
             ..container::Style::default()
         })
         .into()
@@ -298,7 +340,8 @@ fn category_nav(state: &State, p: Palette) -> Element<'static, Message> {
 /// didn't match the mockup's own categorization.
 fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
     column![
-        column![section_label("THEME", p), theme_grid(state, p)].spacing(8.0),
+        column![section_label("THEME", p), theme_mode_row(state, p)].spacing(8.0),
+        column![section_label("ACCENT", p), accent_row(state, p)].spacing(8.0),
         column![section_label("ROW DENSITY", p), density_row(state, p)].spacing(8.0),
         column![section_label("UI TEXT SIZE", p), ui_scale_row(state, p)].spacing(8.0),
         column![
@@ -312,7 +355,7 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
         ]
         .spacing(8.0),
     ]
-    .spacing(20.0)
+    .spacing(24.0)
     .into()
 }
 
@@ -343,7 +386,7 @@ fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
         ]
         .spacing(8.0),
     ]
-    .spacing(20.0)
+    .spacing(24.0)
     .into()
 }
 
@@ -357,12 +400,12 @@ fn status_row(name: &'static str, status_color: Color, status_label: String, p: 
             widgets::dot(status_color, 6.0),
             text(name)
                 .font(fonts::mono(Weight::Semibold))
-                .size(crate::text_scale::px(12.0))
-                .color(color(p.text_primary))
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.text_strong))
                 .width(Length::Fill),
             text(status_label)
                 .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(11.0))
+                .size(crate::text_scale::px(13.0))
                 .color(status_color),
         ]
         .spacing(8.0)
@@ -372,9 +415,9 @@ fn status_row(name: &'static str, status_color: Color, status_label: String, p: 
     .padding([8.0, 10.0])
     .style(move |_theme| container::Style {
         border: Border {
-            color: color(p.line_neutral),
+            color: color(p.border_hairline),
             width: 1.5,
-            radius: 2.0.into(),
+            radius: 3.0.into(),
         },
         ..container::Style::default()
     })
@@ -402,13 +445,13 @@ fn shortcut_row(label: &'static str, keys: &'static str, p: Palette) -> Element<
     row![
         text(label)
             .font(fonts::sans(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_secondary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_body))
             .width(Length::Fill),
         text(keys)
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
-            .color(color(p.text_primary)),
+            .size(crate::text_scale::px(13.0))
+            .color(color(p.text_strong)),
     ]
     .align_y(Alignment::Center)
     .padding([7.0, 0.0])
@@ -461,7 +504,7 @@ fn shortcuts_content(p: Palette) -> Element<'static, Message> {
         ]
         .spacing(8.0),
     ]
-    .spacing(20.0)
+    .spacing(24.0)
     .into()
 }
 
@@ -477,10 +520,10 @@ fn about_content(state: &State, p: Palette) -> Element<'static, Message> {
         text("DEVSCRIBE")
             .font(fonts::display(Weight::ExtraBold))
             .size(crate::text_scale::px(22.0))
-            .color(color(p.text_primary)),
+            .color(color(p.text_strong)),
         text(concat!("v", env!("CARGO_PKG_VERSION")))
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
+            .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),
     ]
     .spacing(2.0);
@@ -489,10 +532,10 @@ fn about_content(state: &State, p: Palette) -> Element<'static, Message> {
         banner,
         column![
             section_label("BUILD", p),
-            status_row("VERSION", color(p.text_primary), env!("CARGO_PKG_VERSION").to_string(), p),
+            status_row("VERSION", color(p.text_strong), env!("CARGO_PKG_VERSION").to_string(), p),
             status_row(
                 "PLATFORM",
-                color(p.text_primary),
+                color(p.text_strong),
                 format!("{} // {}", std::env::consts::OS, std::env::consts::ARCH),
                 p
             ),
@@ -504,7 +547,7 @@ fn about_content(state: &State, p: Palette) -> Element<'static, Message> {
         ]
         .spacing(8.0),
     ]
-    .spacing(20.0)
+    .spacing(24.0)
     .into()
 }
 
@@ -526,16 +569,16 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if !state.settings_open {
         return None;
     }
-    let p = devscribe_core::theme::palette(state.theme);
+    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
 
     let header = row![
         text("SETTINGS")
             .font(fonts::mono(Weight::Bold))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong))
             .width(Length::Fill),
         button(widgets::center_fill(
-            text("\u{2715}").size(crate::text_scale::px(11.0)).color(color(p.text_muted)),
+            text("\u{2715}").size(crate::text_scale::px(13.0)).color(color(p.text_muted)),
         ))
             .padding(0.0)
             .width(Length::Fixed(18.0))
@@ -546,10 +589,10 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     .align_y(Alignment::Center)
     .padding([12.0, 16.0]);
 
-    let split = row![category_nav(state, p), widgets::vline(color(p.line_neutral)), category_content(state, p)]
+    let split = row![category_nav(state, p), widgets::vline(color(p.border_hairline)), category_content(state, p)]
         .height(Length::Fill);
 
-    let body = column![header, widgets::hline(color(p.line_neutral)), split];
+    let body = column![header, widgets::hline(color(p.border_hairline)), split];
 
     let panel = container(body)
         .width(Length::Fixed(760.0))
@@ -564,11 +607,11 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         // out — this one child did.
         .padding(1.5)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             border: Border {
-                color: color(p.line_accent),
+                color: color(p.border_accent),
                 width: 1.5,
-                radius: 4.0.into(),
+                radius: 10.0.into(),
             },
             ..container::Style::default()
         });
@@ -592,7 +635,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
                 background: Some(
                     Color {
                         a: 0.55,
-                        ..color(p.bg_void)
+                        ..color(p.bg_canvas)
                     }
                     .into(),
                 ),

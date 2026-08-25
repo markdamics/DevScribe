@@ -1,78 +1,193 @@
-//! Persisted app-level settings — for now, just the last-selected theme
-//! (`state::set_theme` calls `save_theme` on every change). Same shape as
-//! `recent_projects.rs`: a small JSON file under `~/.config/devscribe/`,
-//! loaded once at startup, best-effort on write (a failure here is never a
-//! hard error — the app just falls back to the default theme).
-use devscribe_core::theme::ThemeName;
+//! Persisted app-level settings: every value the Settings panel exposes —
+//! theme mode + accent, chrome density, UI/editor font size, and the
+//! Explorer/Editor/Toolchains toggles — in one JSON file under
+//! `~/.config/devscribe/`, loaded once at startup, best-effort on write (a
+//! failure here is never a hard error — the app just falls back to
+//! defaults). `state.rs`'s `persist_settings` is the single place any of
+//! this gets written, called at the end of every settings-changing
+//! `Message` arm, so no such change can silently forget to save.
+use crate::density::Density;
+use devscribe_core::theme::{Accent, ThemeMode};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Every persisted setting, decoupled from `State` so this module doesn't
+/// need to know about tabs/trees/LSP/etc. — just the values the Settings
+/// panel actually controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settings {
+    pub theme_mode: ThemeMode,
+    pub accent: Accent,
+    pub density: Density,
+    pub ui_font_scale: f32,
+    pub editor_font_size: f32,
+    pub git_status_in_tree: bool,
+    pub problem_lens_enabled: bool,
+    pub save_on_focus_loss: bool,
+    pub lsp_enabled: bool,
+}
+
+impl Default for Settings {
+    /// Mirrors `State::default()`'s own literal defaults for these same
+    /// fields — the two must be kept in sync by hand, since `State` has a
+    /// great deal else besides settings and can't just delegate to this.
+    fn default() -> Self {
+        Self {
+            theme_mode: ThemeMode::default(),
+            accent: Accent::default(),
+            density: Density::default(),
+            ui_font_scale: crate::state::UI_FONT_SCALE_DEFAULT,
+            editor_font_size: crate::state::EDITOR_FONT_SIZE_DEFAULT,
+            git_status_in_tree: false,
+            problem_lens_enabled: true,
+            save_on_focus_loss: false,
+            lsp_enabled: true,
+        }
+    }
+}
+
+/// The on-disk shape. Enums round-trip through their own stable string keys
+/// (the Rust variant name, not `label()` — a *display* string, free to
+/// change for wording reasons; using it here would silently reset the
+/// setting the day a label gets reworded) rather than serde's derived
+/// representation, so renaming/reordering variants doesn't reshuffle the
+/// file format. Every field defaults independently on load (`#[serde(default...)]`)
+/// so a file from before some later field existed — or with one
+/// unrecognized/corrupt value — degrades one field at a time instead of the
+/// whole load failing.
 #[derive(Serialize, Deserialize)]
 struct SettingsFile {
-    theme: String,
+    #[serde(default)]
+    theme_mode: String,
+    #[serde(default)]
+    accent: String,
+    #[serde(default)]
+    density: String,
+    #[serde(default = "default_ui_font_scale")]
+    ui_font_scale: f32,
+    #[serde(default = "default_editor_font_size")]
+    editor_font_size: f32,
+    #[serde(default)]
+    git_status_in_tree: bool,
+    #[serde(default = "default_true")]
+    problem_lens_enabled: bool,
+    #[serde(default)]
+    save_on_focus_loss: bool,
+    #[serde(default = "default_true")]
+    lsp_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ui_font_scale() -> f32 {
+    crate::state::UI_FONT_SCALE_DEFAULT
+}
+
+fn default_editor_font_size() -> f32 {
+    crate::state::EDITOR_FONT_SIZE_DEFAULT
 }
 
 fn store_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("devscribe").join("settings.json"))
 }
 
-/// Stable serialization keys for `ThemeName` — the Rust variant name, not
-/// `ThemeName::label()` (a *display* string, free to change for wording
-/// reasons; using it here would silently reset everyone's saved theme the
-/// day a label gets reworded).
-fn theme_key(theme: ThemeName) -> &'static str {
-    match theme {
-        ThemeName::NullGrid => "NullGrid",
-        ThemeName::Gantry => "Gantry",
-        ThemeName::Abyssal => "Abyssal",
-        ThemeName::Raven => "Raven",
-        ThemeName::Ember => "Ember",
-        ThemeName::Verdigris => "Verdigris",
-        ThemeName::Meridian => "Meridian",
-        ThemeName::Stark => "Stark",
-        ThemeName::Sumi => "Sumi",
-        ThemeName::Washi => "Washi",
+fn mode_key(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::Dark => "Dark",
+        ThemeMode::Light => "Light",
     }
 }
 
-fn theme_from_key(key: &str) -> Option<ThemeName> {
-    ThemeName::ALL.into_iter().find(|theme| theme_key(*theme) == key)
+fn mode_from_key(key: &str) -> Option<ThemeMode> {
+    ThemeMode::ALL.into_iter().find(|mode| mode_key(*mode) == key)
 }
 
-/// `None` on any error — a missing file (first run), unreadable file,
-/// corrupt JSON, or an unrecognized theme key are all just "nothing saved
-/// yet, use the default," not a hard failure. Only called from `state.rs`'s
-/// non-test `startup_theme()` — the test build deliberately never reads
-/// the real config file (see that function's doc), so this is unreachable
-/// dead code there specifically, not in the real binary.
+fn accent_key(accent: Accent) -> &'static str {
+    match accent {
+        Accent::Tsuki => "Tsuki",
+        Accent::Seiji => "Seiji",
+        Accent::Matcha => "Matcha",
+        Accent::Fuji => "Fuji",
+        Accent::Kohaku => "Kohaku",
+        Accent::Nezu => "Nezu",
+    }
+}
+
+fn accent_from_key(key: &str) -> Option<Accent> {
+    Accent::ALL.into_iter().find(|accent| accent_key(*accent) == key)
+}
+
+fn density_key(density: Density) -> &'static str {
+    match density {
+        Density::Compact => "Compact",
+        Density::Comfortable => "Comfortable",
+        Density::Spacious => "Spacious",
+    }
+}
+
+fn density_from_key(key: &str) -> Option<Density> {
+    Density::ALL.into_iter().find(|density| density_key(*density) == key)
+}
+
+/// The persisted settings, falling back to `Settings::default()` wholesale
+/// (missing file, unreadable file, corrupt JSON) or field-by-field (an
+/// unrecognized enum key — including every key from the pre-Maho
+/// ten-named-theme era) rather than treating either as a hard failure. Only
+/// called from `state.rs`'s non-test `startup_settings()` (see that
+/// function's doc), so this is unreachable dead code in the test build
+/// specifically, not in the real binary.
 #[cfg_attr(test, allow(dead_code))]
-pub fn load() -> Option<ThemeName> {
-    store_path().and_then(|path| load_from(&path))
+pub fn load() -> Settings {
+    store_path().and_then(|path| load_from(&path)).unwrap_or_default()
 }
 
-fn load_from(path: &Path) -> Option<ThemeName> {
+fn load_from(path: &Path) -> Option<Settings> {
     let text = std::fs::read_to_string(path).ok()?;
     let file: SettingsFile = serde_json::from_str(&text).ok()?;
-    theme_from_key(&file.theme)
+    let defaults = Settings::default();
+    Some(Settings {
+        theme_mode: mode_from_key(&file.theme_mode).unwrap_or(defaults.theme_mode),
+        accent: accent_from_key(&file.accent).unwrap_or(defaults.accent),
+        density: density_from_key(&file.density).unwrap_or(defaults.density),
+        ui_font_scale: file.ui_font_scale,
+        editor_font_size: file.editor_font_size,
+        git_status_in_tree: file.git_status_in_tree,
+        problem_lens_enabled: file.problem_lens_enabled,
+        save_on_focus_loss: file.save_on_focus_loss,
+        lsp_enabled: file.lsp_enabled,
+    })
 }
 
 /// Best-effort: a write failure (read-only config dir, disk full) is
-/// silently swallowed — the theme just won't survive the next restart,
-/// not a reason to interrupt the user with an error.
-pub fn save_theme(theme: ThemeName) {
+/// silently swallowed — settings just won't survive the next restart, not a
+/// reason to interrupt the user with an error.
+pub fn save(settings: &Settings) {
     if let Some(path) = store_path() {
-        save_to(&path, theme);
+        save_to(&path, settings);
     }
 }
 
-fn save_to(path: &Path, theme: ThemeName) {
+fn save_to(path: &Path, settings: &Settings) {
     let Some(parent) = path.parent() else {
         return;
     };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    if let Ok(json) = serde_json::to_string_pretty(&SettingsFile { theme: theme_key(theme).to_string() }) {
+    let file = SettingsFile {
+        theme_mode: mode_key(settings.theme_mode).to_string(),
+        accent: accent_key(settings.accent).to_string(),
+        density: density_key(settings.density).to_string(),
+        ui_font_scale: settings.ui_font_scale,
+        editor_font_size: settings.editor_font_size,
+        git_status_in_tree: settings.git_status_in_tree,
+        problem_lens_enabled: settings.problem_lens_enabled,
+        save_on_focus_loss: settings.save_on_focus_loss,
+        lsp_enabled: settings.lsp_enabled,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(path, json);
     }
 }

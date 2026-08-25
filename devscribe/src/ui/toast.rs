@@ -13,13 +13,13 @@ use crate::widgets;
 
 fn toast_card(toast: &Toast, p: Palette) -> Element<'static, Message> {
     let accent = match toast.kind {
-        ToastKind::Success => p.status_ok,
-        ToastKind::Warning => p.status_warn,
+        ToastKind::Success => p.status_success,
+        ToastKind::Warning => p.status_warning,
         ToastKind::Error => p.status_danger,
     };
 
     let dismiss = button(widgets::center_fill(
-        text("\u{2715}").size(crate::text_scale::px(10.0)).color(color(p.text_muted)),
+        text("\u{2715}").size(crate::text_scale::px(13.0)).color(color(p.text_muted)),
     ))
     .padding(0.0)
     .width(Length::Fixed(16.0))
@@ -30,12 +30,12 @@ fn toast_card(toast: &Toast, p: Palette) -> Element<'static, Message> {
     let content = row![
         text(toast.message.clone())
             .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(12.0))
-            .color(color(p.text_primary))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_strong))
             .width(Length::Fill),
         dismiss,
     ]
-    .spacing(10.0)
+    .spacing(12.0)
     .align_y(Alignment::Center);
 
     container(content)
@@ -47,11 +47,11 @@ fn toast_card(toast: &Toast, p: Palette) -> Element<'static, Message> {
             left: 12.0,
         })
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_panel).into()),
+            background: Some(color(p.bg_base).into()),
             border: Border {
                 color: color(accent),
                 width: 1.5,
-                radius: 2.0.into(),
+                radius: 3.0.into(),
             },
             ..container::Style::default()
         })
@@ -62,7 +62,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if state.toasts.is_empty() {
         return None;
     }
-    let p = devscribe_core::theme::palette(state.theme);
+    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
 
     let cards: Vec<Element<'static, Message>> =
         state.toasts.iter().map(|toast| toast_card(toast, p)).collect();
