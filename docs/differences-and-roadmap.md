@@ -116,6 +116,29 @@ anchored to sidebar content that's about to disappear). New tests:
 `state::tests::collapse_sidebar_sets_collapsed_and_closes_menus_anchored_to_it`,
 `expand_sidebar_clears_collapsed_without_touching_other_state`.
 
+**Persist every Settings-panel value, not just theme/accent**: previously
+only `theme_mode`/`accent` survived a restart (`settings::save_theme`) —
+density, UI font scale, editor font size, and the Explorer/Editor/Toolchains
+toggles (`git_status_in_tree`, `problem_lens_enabled`, `save_on_focus_loss`,
+`lsp_enabled`) all silently reset to their defaults every launch. Generalized
+`settings.rs` to a single `Settings` struct covering everything the settings
+panel exposes, with one `settings::save`/`settings::load` pair instead of
+the old theme-only `save_theme`; `state.rs` gained one choke-point,
+`persist_settings(state)`, called at the end of every settings-changing
+`Message` *and* `PaletteAction` arm (the command palette's own
+increase/decrease-font-size and problem-lens-toggle actions bypassed the
+`Message` handlers entirely and would otherwise have kept not persisting).
+Each field now defaults independently on load (`#[serde(default...)]` per
+`SettingsFile` field) rather than the whole file being rejected if one enum
+key doesn't parse — a deliberate loosening from the Maho migration's
+whole-file-reset behavior, since going forward, adding a new persisted
+field shouldn't reset everyone's already-saved theme/accent just because it
+wasn't there yet. New tests:
+`settings::tests::save_to_and_load_from_round_trips_every_field`,
+`load_from_a_partial_file_defaults_only_the_missing_fields`,
+`load_from_a_pre_maho_key_defaults_every_field_not_a_panic` (updated from
+the old "returns `None`" expectation), `density_key_round_trips_through_density_from_key_for_every_density`.
+
 ## Phased plan for remaining work
 
 Sequencing rationale: multi-tab support touches the data model that
