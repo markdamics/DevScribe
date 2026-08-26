@@ -34,6 +34,14 @@ pub enum Language {
     Rust,
     Json,
     Toml,
+    Java,
+    Python,
+    JavaScript,
+    TypeScript,
+    Cpp,
+    Yaml,
+    Xml,
+    Ini,
 }
 
 impl Language {
@@ -42,6 +50,14 @@ impl Language {
             "rs" => Some(Language::Rust),
             "json" => Some(Language::Json),
             "toml" => Some(Language::Toml),
+            "java" => Some(Language::Java),
+            "py" | "pyi" => Some(Language::Python),
+            "js" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "ts" | "mts" | "cts" | "tsx" => Some(Language::TypeScript),
+            "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" => Some(Language::Cpp),
+            "yml" | "yaml" => Some(Language::Yaml),
+            "xml" | "svg" | "xsd" | "xsl" | "xslt" | "plist" => Some(Language::Xml),
+            "ini" | "cfg" | "properties" => Some(Language::Ini),
             _ => None,
         }
     }
@@ -64,6 +80,7 @@ pub struct Span {
 /// verbatim, so this list stays short.
 const HIGHLIGHT_NAMES: &[&str] = &[
     "attribute",
+    "boolean",
     "comment",
     "constant",
     "constant.builtin",
@@ -76,12 +93,14 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "punctuation",
     "string",
     "string.escape",
+    "tag",
     "type",
     "variable",
 ];
 
 const HIGHLIGHT_KINDS: &[HighlightKind] = &[
     HighlightKind::Attribute,
+    HighlightKind::Constant,
     HighlightKind::Comment,
     HighlightKind::Constant,
     HighlightKind::Constant,
@@ -94,6 +113,7 @@ const HIGHLIGHT_KINDS: &[HighlightKind] = &[
     HighlightKind::Punctuation,
     HighlightKind::String,
     HighlightKind::String,
+    HighlightKind::Keyword,
     HighlightKind::Type,
     HighlightKind::Default,
 ];
@@ -146,11 +166,153 @@ fn toml_config() -> &'static HighlightConfiguration {
     })
 }
 
+fn java_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_java::LANGUAGE.into(),
+            "java",
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .expect("tree-sitter-java ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn python_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_python::LANGUAGE.into(),
+            "python",
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .expect("tree-sitter-python ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn javascript_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_javascript::LOCALS_QUERY,
+        )
+        .expect("tree-sitter-javascript ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn typescript_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        )
+        .expect("tree-sitter-typescript ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn cpp_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            tree_sitter_cpp::HIGHLIGHT_QUERY,
+            "",
+            "",
+        )
+        .expect("tree-sitter-cpp ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn yaml_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_yaml::LANGUAGE.into(),
+            "yaml",
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .expect("tree-sitter-yaml ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn xml_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_xml::LANGUAGE_XML.into(),
+            "xml",
+            tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+            "",
+            "",
+        )
+        .expect("tree-sitter-xml ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn ini_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        // tree-sitter-ini's shipped query tags `(comment)` with both
+        // `@comment` and `@spell`; the second, unrecognized capture on the
+        // same node makes tree-sitter-highlight drop the highlight for that
+        // node entirely rather than falling back to the first. We don't use
+        // `@spell` for anything, so strip it before compiling.
+        let highlights_query = tree_sitter_ini::HIGHLIGHTS_QUERY.replace(" @spell", "");
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_ini::LANGUAGE.into(),
+            "ini",
+            &highlights_query,
+            "",
+            "",
+        )
+        .expect("tree-sitter-ini ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
 fn config_for(language: Language) -> &'static HighlightConfiguration {
     match language {
         Language::Rust => rust_config(),
         Language::Json => json_config(),
         Language::Toml => toml_config(),
+        Language::Java => java_config(),
+        Language::Python => python_config(),
+        Language::JavaScript => javascript_config(),
+        Language::TypeScript => typescript_config(),
+        Language::Cpp => cpp_config(),
+        Language::Yaml => yaml_config(),
+        Language::Xml => xml_config(),
+        Language::Ini => ini_config(),
     }
 }
 

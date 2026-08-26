@@ -6,6 +6,20 @@ fn language_from_extension() {
     assert_eq!(Language::from_extension("RS"), Some(Language::Rust));
     assert_eq!(Language::from_extension("json"), Some(Language::Json));
     assert_eq!(Language::from_extension("toml"), Some(Language::Toml));
+    assert_eq!(Language::from_extension("java"), Some(Language::Java));
+    assert_eq!(Language::from_extension("py"), Some(Language::Python));
+    assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
+    assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
+    assert_eq!(Language::from_extension("tsx"), Some(Language::TypeScript));
+    assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
+    assert_eq!(Language::from_extension("h"), Some(Language::Cpp));
+    assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+    assert_eq!(Language::from_extension("yaml"), Some(Language::Yaml));
+    assert_eq!(Language::from_extension("xml"), Some(Language::Xml));
+    assert_eq!(Language::from_extension("svg"), Some(Language::Xml));
+    assert_eq!(Language::from_extension("ini"), Some(Language::Ini));
+    assert_eq!(Language::from_extension("cfg"), Some(Language::Ini));
+    assert_eq!(Language::from_extension("properties"), Some(Language::Ini));
     assert_eq!(Language::from_extension("md"), None);
 }
 
@@ -71,4 +85,46 @@ fn highlights_toml_keys_and_strings() {
         .iter()
         .any(|s| source[s.start..s.end].contains("devscribe")
             && s.kind == HighlightKind::String));
+}
+
+#[test]
+fn highlights_yaml_strings_and_comments() {
+    let mut highlighter = Highlighter::new();
+    let source = "# a comment\nname: \"devscribe\"\nenabled: true\n";
+    let spans = highlighter.highlight(Language::Yaml, source);
+
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].starts_with('#') && s.kind == HighlightKind::Comment));
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].contains("devscribe") && s.kind == HighlightKind::String));
+}
+
+#[test]
+fn highlights_xml_tags_and_comments() {
+    let mut highlighter = Highlighter::new();
+    let source = "<!-- hi -->\n<note><to>Tove</to></note>\n";
+    let spans = highlighter.highlight(Language::Xml, source);
+
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].contains("hi") && s.kind == HighlightKind::Comment));
+    assert!(spans
+        .iter()
+        .any(|s| &source[s.start..s.end] == "note" && s.kind == HighlightKind::Keyword));
+}
+
+#[test]
+fn highlights_ini_sections_and_comments() {
+    let mut highlighter = Highlighter::new();
+    let source = "; a comment\n[section]\nkey = value\n";
+    let spans = highlighter.highlight(Language::Ini, source);
+
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].starts_with(';') && s.kind == HighlightKind::Comment));
+    assert!(spans
+        .iter()
+        .any(|s| &source[s.start..s.end] == "section" && s.kind == HighlightKind::Type));
 }

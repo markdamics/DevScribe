@@ -1,4 +1,5 @@
 pub mod command_palette;
+pub mod completions;
 pub mod context_menu;
 pub mod diff_view;
 pub mod editor_canvas;

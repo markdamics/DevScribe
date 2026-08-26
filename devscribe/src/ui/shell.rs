@@ -8,8 +8,8 @@ use crate::fonts;
 use crate::state::{self, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
-    command_palette, context_menu, diff_view, find_bar, flash, json_view, search_view,
-    settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
+    command_palette, completions, context_menu, diff_view, find_bar, flash, json_view,
+    search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
 
@@ -178,9 +178,11 @@ pub fn view(state: &State) -> Element<'static, Message> {
     .width(Length::Fill)
     .height(Length::Fill);
 
-    let body = row![sidebar::view(state, p), main_column]
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let mut body = row![sidebar::view(state, p)];
+    if !state.sidebar_collapsed {
+        body = body.push(sidebar::resize_handle(p));
+    }
+    let body = body.push(main_column).width(Length::Fill).height(Length::Fill);
 
     let root = column![title_bar::view(state, p), body]
         .width(Length::Fill)
@@ -196,6 +198,7 @@ pub fn view(state: &State) -> Element<'static, Message> {
         });
 
     let mut layers: Vec<Element<'static, Message>> = vec![base.into()];
+    layers.extend(completions::view(state, p));
     layers.extend(command_palette::view(state));
     layers.extend(settings_panel::view(state));
     layers.extend(tab_bar::overflow_menu(state, p));

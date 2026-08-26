@@ -866,11 +866,30 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     ];
 
     container(body)
-        .width(Length::Fixed(272.0))
+        .width(Length::Fixed(state.sidebar_width))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_base).into()),
             ..container::Style::default()
         })
         .into()
+}
+
+/// A thin drag handle on the sidebar's right edge — pressing it starts a
+/// resize (`Message::SidebarResizeStarted`); the actual drag is then driven
+/// by the window-wide cursor subscription in `state::subscription`, since
+/// this handle is far narrower than the mouse can move between frames.
+pub fn resize_handle(p: Palette) -> Element<'static, Message> {
+    mouse_area(
+        container(Space::new().width(Length::Fixed(4.0)).height(Length::Fill))
+            .width(Length::Fixed(4.0))
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(color(p.border_hairline).into()),
+                ..container::Style::default()
+            }),
+    )
+    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+    .on_press(Message::SidebarResizeStarted)
+    .into()
 }

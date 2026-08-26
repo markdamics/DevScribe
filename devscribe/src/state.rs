@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 
 use devscribe_core::diff::DiffLine;
 use devscribe_core::git::{ChangeKind, Repo};
-use devscribe_core::lsp::{self, LspCommand, LspEvent};
+use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguage};
 use devscribe_core::search::{self, SearchHit};
 use devscribe_core::syntax::{self, Span};
 use devscribe_core::theme::{Accent, ThemeMode};
 use devscribe_core::Document;
 use iced::futures::channel::mpsc;
 use iced::keyboard;
+use iced::mouse;
 
 use crate::density::Density;
 use crate::fs_tree::{self, Node};
@@ -87,9 +88,11 @@ pub struct EditorDiagnostic {
 pub enum LspStatus {
     #[default]
     Starting,
+    /// Auto-install is running in the background (`start_server_install`).
+    Installing,
     Ready,
     Unavailable(String),
-    /// Turned off via the settings panel's "Enable rust-analyzer" toggle —
+    /// Turned off via the settings panel's "Enable language servers" toggle —
     /// distinct from `Unavailable` (a failed spawn/handshake) so the status
     /// bar doesn't imply something went wrong when the user asked for this.
     Disabled,
@@ -99,12 +102,13 @@ impl LspStatus {
     /// (status-dot color, label) — the single source of truth both
     /// `status_bar.rs` and `settings_panel.rs`'s Toolchains/About content
     /// render from, so the two never drift apart.
-    pub fn describe(&self, p: devscribe_core::theme::Palette) -> (devscribe_core::theme::Rgba, String) {
+    pub fn describe(&self, server_name: &str, p: devscribe_core::theme::Palette) -> (devscribe_core::theme::Rgba, String) {
         match self {
-            LspStatus::Starting => (p.text_muted, "rust-analyzer starting\u{2026}".to_string()),
-            LspStatus::Ready => (p.status_success, "rust-analyzer ready".to_string()),
-            LspStatus::Unavailable(reason) => (p.status_warning, format!("rust-analyzer unavailable ({reason})")),
-            LspStatus::Disabled => (p.text_muted, "rust-analyzer disabled".to_string()),
+            LspStatus::Starting => (p.text_muted, format!("{server_name} starting\u{2026}")),
+            LspStatus::Installing => (p.text_muted, format!("installing {server_name}\u{2026}")),
+            LspStatus::Ready => (p.status_success, format!("{server_name} ready")),
+            LspStatus::Unavailable(reason) => (p.status_warning, format!("{server_name} unavailable ({reason})")),
+            LspStatus::Disabled => (p.text_muted, format!("{server_name} disabled")),
         }
     }
 }
@@ -379,7 +383,55 @@ pub struct EditorState {
     /// to virtualize `EditorCanvas::draw` (skip lines outside the visible
     /// range) — not meaningful outside that.
     pub scroll_offset: f32,
+    /// Active completion popup: `None` = closed, `Some(items)` = showing.
+    pub completions: Option<Vec<CompletionItem>>,
+    /// Keyboard-navigation index into `completions`.
+    pub completion_selected: usize,
+    /// Cursor position when the completion request was sent, used to discard
+    /// stale responses that arrive after the cursor moved elsewhere.
+    pub completion_anchor: CursorPos,
+    /// Undo history — snapshots taken just before an edit that starts a new
+    /// undo step (see `record_undo_boundary`). Consecutive same-kind edits
+    /// (typing character after character, backspacing run after run)
+    /// coalesce into whatever's already on top instead of pushing a new
+    /// entry, so `Ctrl+Z` undoes a whole word/paste/deletion at a time
+    /// rather than one keystroke.
+    undo_stack: Vec<UndoSnapshot>,
+    /// Snapshots popped off `undo_stack` by `undo()`, replayed by `redo()`.
+    /// Cleared on every new edit, same as any other editor's redo stack.
+    redo_stack: Vec<UndoSnapshot>,
+    /// The kind of the most recent edit, for `record_undo_boundary`'s
+    /// same-kind coalescing. Reset to `None` by any cursor move or
+    /// mouse-driven selection change that isn't itself an edit, so typing
+    /// never coalesces across an unrelated click or arrow-key jump.
+    last_edit_kind: Option<EditKind>,
 }
+
+/// A point in `EditorState::undo_stack`/`redo_stack` — the whole buffer plus
+/// enough cursor state to put the user back where they were. Cloning
+/// `Document` clones its `Rope`, which is cheap (structural sharing), so
+/// this is fine to snapshot on every undo boundary rather than diffing.
+#[derive(Clone)]
+struct UndoSnapshot {
+    document: Document,
+    cursor: CursorPos,
+    selection_anchor: Option<CursorPos>,
+}
+
+/// What kind of edit just happened, for `record_undo_boundary`'s
+/// same-kind-coalesces-into-one-step logic. `Other` never coalesces, even
+/// with itself — each paste/cut is its own undo step.
+#[derive(PartialEq, Clone, Copy)]
+enum EditKind {
+    Insert,
+    Delete,
+    Other,
+}
+
+/// Undo history is capped at this many steps per editor (each holding a full
+/// document snapshot) so an very long editing session can't grow it without
+/// bound.
+const MAX_UNDO_ENTRIES: usize = 500;
 
 impl EditorState {
     pub fn new(document: Document, path: PathBuf) -> Self {
@@ -406,6 +458,12 @@ impl EditorState {
             diff: DiffStatus::default(),
             find: None,
             scroll_offset: 0.0,
+            completions: None,
+            completion_selected: 0,
+            completion_anchor: CursorPos::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit_kind: None,
         };
         this.reparse_json();
         this
@@ -491,7 +549,37 @@ impl EditorState {
         }
     }
 
+    /// Pushes a fresh undo snapshot unless this edit is the same `kind` as
+    /// the one right before it (typing coalescing into one word, backspaces
+    /// coalescing into one run) — always call this *before* mutating
+    /// `document`. `Other` never coalesces, so paste/cut are always their
+    /// own undo step regardless of what happened right before them.
+    fn record_undo_boundary(&mut self, kind: EditKind) {
+        let coalesce = kind != EditKind::Other && self.last_edit_kind == Some(kind);
+        if !coalesce {
+            self.undo_stack.push(UndoSnapshot {
+                document: self.document.clone(),
+                cursor: self.cursor,
+                selection_anchor: self.selection_anchor,
+            });
+            if self.undo_stack.len() > MAX_UNDO_ENTRIES {
+                self.undo_stack.remove(0);
+            }
+        }
+        self.last_edit_kind = Some(kind);
+        self.redo_stack.clear();
+    }
+
     pub fn insert_text(&mut self, text: &str) {
+        // A lone, non-newline character is ordinary typing and coalesces
+        // with adjacent typing into one undo step; anything else (paste,
+        // Tab's 4 spaces, Enter's "\n") always starts a fresh one.
+        let kind = if text.chars().count() == 1 && text != "\n" {
+            EditKind::Insert
+        } else {
+            EditKind::Other
+        };
+        self.record_undo_boundary(kind);
         self.delete_selection();
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
         self.document.insert(idx, text);
@@ -503,6 +591,7 @@ impl EditorState {
     }
 
     pub fn backspace(&mut self) {
+        self.record_undo_boundary(EditKind::Delete);
         if self.delete_selection() {
             self.rehighlight();
             self.reparse_json();
@@ -521,6 +610,7 @@ impl EditorState {
     }
 
     pub fn delete_forward(&mut self) {
+        self.record_undo_boundary(EditKind::Delete);
         if self.delete_selection() {
             self.rehighlight();
             self.reparse_json();
@@ -538,7 +628,48 @@ impl EditorState {
         self.refind();
     }
 
+    /// `Ctrl+Z`. `false` if there was nothing left to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.redo_stack.push(UndoSnapshot {
+            document: self.document.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        });
+        self.document = prev.document;
+        self.cursor = prev.cursor;
+        self.selection_anchor = prev.selection_anchor;
+        self.last_edit_kind = None;
+        self.rehighlight();
+        self.reparse_json();
+        self.refind();
+        true
+    }
+
+    /// `Ctrl+Shift+Z` / `Ctrl+Y`. `false` if there was nothing left to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack.push(UndoSnapshot {
+            document: self.document.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        });
+        self.document = next.document;
+        self.cursor = next.cursor;
+        self.selection_anchor = next.selection_anchor;
+        self.last_edit_kind = None;
+        self.rehighlight();
+        self.reparse_json();
+        self.refind();
+        true
+    }
+
     pub fn move_cursor(&mut self, dir: Direction, extend: bool) {
+        self.last_edit_kind = None;
         if extend {
             if self.selection_anchor.is_none() {
                 self.selection_anchor = Some(self.cursor);
@@ -586,6 +717,7 @@ impl EditorState {
     }
 
     pub fn click(&mut self, line: usize, col: usize, extend: bool) {
+        self.last_edit_kind = None;
         if extend {
             if self.selection_anchor.is_none() {
                 self.selection_anchor = Some(self.cursor);
@@ -595,7 +727,99 @@ impl EditorState {
         }
         self.cursor = CursorPos { line, col };
     }
+
+    /// Double-click word selection: expands `col` to cover the run of
+    /// same-class characters it falls on (word chars, whitespace, or other
+    /// punctuation each form their own run), matching the usual editor
+    /// convention of selecting "the thing under the cursor" regardless of
+    /// what kind of thing that is.
+    pub fn select_word_at(&mut self, line: usize, col: usize) {
+        self.last_edit_kind = None;
+        let text = self.document.line_text(line);
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            self.selection_anchor = None;
+            self.cursor = CursorPos { line, col: 0 };
+            return;
+        }
+        let idx = col.min(chars.len() - 1);
+        let class = char_class(chars[idx]);
+        let mut start = idx;
+        while start > 0 && char_class(chars[start - 1]) == class {
+            start -= 1;
+        }
+        let mut end = idx + 1;
+        while end < chars.len() && char_class(chars[end]) == class {
+            end += 1;
+        }
+        self.selection_anchor = Some(CursorPos { line, col: start });
+        self.cursor = CursorPos { line, col: end };
+    }
+
+    /// Triple-click line selection: the whole line including its trailing
+    /// newline (so it visibly covers the line like `select_word_at` covers a
+    /// word), except on the file's last line, which has no newline to take.
+    pub fn select_line_at(&mut self, line: usize) {
+        self.last_edit_kind = None;
+        self.selection_anchor = Some(CursorPos { line, col: 0 });
+        self.cursor = if line + 1 < self.document.line_count() {
+            CursorPos { line: line + 1, col: 0 }
+        } else {
+            CursorPos { line, col: self.document.line_len_chars(line) }
+        };
+    }
+
+    pub fn select_all(&mut self) {
+        self.last_edit_kind = None;
+        let total_chars = self.document.text().len_chars();
+        self.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+        self.cursor = self.document.line_col(total_chars).into();
+    }
+
+    /// The currently selected text, if any — `Ctrl+C`'s payload.
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|(start, end)| self.document.text().slice(start..end).to_string())
+    }
+
+    /// `Ctrl+X`: returns the selected text (like `selected_text`) and also
+    /// removes it, or `None` (leaving the document untouched) if there was
+    /// no selection.
+    pub fn cut_selection(&mut self) -> Option<String> {
+        let text = self.selected_text();
+        if text.is_some() {
+            self.record_undo_boundary(EditKind::Other);
+            self.delete_selection();
+            self.rehighlight();
+            self.reparse_json();
+            self.refind();
+        }
+        text
+    }
 }
+
+#[derive(PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Space,
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Other
+    }
+}
+
+/// Sidebar width bounds for the drag handle — narrow enough to still show
+/// file names, wide enough to leave room for the editor.
+pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 560.0;
+pub const SIDEBAR_DEFAULT_WIDTH: f32 = 272.0;
 
 pub struct State {
     pub theme_mode: ThemeMode,
@@ -612,6 +836,14 @@ pub struct State {
     /// `panel-left-open` toggle. Independent of `welcome_open` — this only
     /// matters once a project is open at all.
     pub sidebar_collapsed: bool,
+    /// Sidebar width in logical pixels, dragged via the resize handle on its
+    /// right edge — see `Message::SidebarResizeDragged`. Clamped to
+    /// `[SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH]`.
+    pub sidebar_width: f32,
+    /// `true` while the sidebar's resize handle is being dragged — the
+    /// window-wide mouse subscription (see `subscription`) only runs while
+    /// this is set, so idle frames don't pay for a global cursor listener.
+    pub sidebar_resizing: bool,
     /// `true` while no project is open and the welcome screen ("Select a
     /// project") is showing full-window in place of the whole editor —
     /// `shell::view()` short-circuits to `welcome::view` before touching
@@ -642,9 +874,14 @@ pub struct State {
     pub lsp_status: LspStatus,
     lsp_sender: Option<mpsc::Sender<LspCommand>>,
     /// Off switches the LSP subscription off entirely (see `subscription`)
-    /// rather than just ignoring its output — no `rust-analyzer` process
+    /// rather than just ignoring its output — no language server process
     /// gets spawned at all while this is `false`. On by default.
     pub lsp_enabled: bool,
+    /// Incremented after a successful auto-install to force the subscription
+    /// to tear down and respawn `lsp_worker` with the newly installed binary.
+    /// Without this, the subscription key `(root, language)` hasn't changed
+    /// so iced wouldn't restart the worker automatically.
+    lsp_restart_token: u64,
     /// `None` when `root` isn't a git repository — an expected, common case.
     pub repo: Option<Repo>,
     /// The sidebar's "CHANGES" panel contents — every file that differs from
@@ -919,6 +1156,8 @@ impl Default for State {
             projects_open: false,
             overflow_open: false,
             sidebar_collapsed: false,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            sidebar_resizing: false,
             welcome_open,
             recent_projects,
             welcome_rows,
@@ -930,6 +1169,7 @@ impl Default for State {
             lsp_status: LspStatus::default(),
             lsp_sender: None,
             lsp_enabled: settings.lsp_enabled,
+            lsp_restart_token: 0,
             repo,
             changed_files: snapshot.changed_files,
             ahead_behind: snapshot.ahead_behind,
@@ -976,6 +1216,13 @@ pub enum Message {
     ToggleOverflow,
     CollapseSidebar,
     ExpandSidebar,
+    /// Pressed the sidebar's edge resize handle.
+    SidebarResizeStarted,
+    /// Cursor moved while resizing — carries the cursor's window-space X
+    /// position, which becomes the new sidebar width directly (the handle
+    /// sits flush against the sidebar's right edge at X == 0).
+    SidebarResizeDragged(f32),
+    SidebarResizeEnded,
     ToggleChangesPanel,
     /// Opens (or focuses) a diff tab for `path`, from a sidebar Changes row.
     /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
@@ -989,7 +1236,31 @@ pub enum Message {
     EditorBackspace,
     EditorDelete,
     EditorMove { dir: Direction, extend: bool },
+    /// A left-button press or drag-move over the canvas — also the plain
+    /// (non-double/triple) click path. `extend: true` both for shift-click
+    /// and for every drag-move after the initial press, so a mouse drag
+    /// just keeps calling `EditorState::click`, which is exactly
+    /// `extend`'s existing shift-click behavior (see `EditorCanvas::update`).
     EditorClick { line: usize, col: usize, extend: bool },
+    /// Double-click — selects the word (or punctuation/whitespace run) under
+    /// the click.
+    EditorSelectWord { line: usize, col: usize },
+    /// Triple-click — selects the whole line.
+    EditorSelectLine { line: usize },
+    /// `Ctrl+A`.
+    EditorSelectAll,
+    /// `Ctrl+Z`.
+    EditorUndo,
+    /// `Ctrl+Shift+Z` / `Ctrl+Y`.
+    EditorRedo,
+    /// `Ctrl+C`.
+    EditorCopy,
+    /// `Ctrl+X`.
+    EditorCut,
+    /// `Ctrl+V` — kicks off an async clipboard read; the actual insert
+    /// happens in `EditorPasteWithText` once it resolves.
+    EditorPaste,
+    EditorPasteWithText(Option<String>),
     /// The editor's `scrollable` reported a new vertical offset — stored so
     /// `EditorCanvas::draw` can skip lines outside the visible range.
     EditorScrolled(f32),
@@ -1099,6 +1370,15 @@ pub enum Message {
     /// keyed by the first `PathBuf` (its old, possibly-synthetic-untitled
     /// path) — `None` if the user cancelled, `Some(new_path)` otherwise.
     SaveAsResult(PathBuf, Option<PathBuf>),
+    /// A background server install (`start_server_install`) finished.
+    /// `Ok(())` = installed successfully; `Err(msg)` = failed with reason.
+    ServerInstallComplete(Result<(), String>),
+    /// Arrow-key navigation inside the completion popup: +1 down, -1 up.
+    CompletionMove(i32),
+    /// Tab/Enter while the completion popup is open — inserts the selected item.
+    CompletionSelect,
+    /// Closes the completion popup without inserting.
+    CloseCompletion,
     Noop,
 }
 
@@ -1129,17 +1409,70 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.ctx_menu = None;
         }
         Message::ExpandSidebar => state.sidebar_collapsed = false,
+        Message::SidebarResizeStarted => state.sidebar_resizing = true,
+        Message::SidebarResizeDragged(x) => {
+            if state.sidebar_resizing {
+                state.sidebar_width = x.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+            }
+        }
+        Message::SidebarResizeEnded => state.sidebar_resizing = false,
         Message::ToggleChangesPanel => state.changes_panel_open = !state.changes_panel_open,
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
         Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
         Message::SelectFile(path) => open_or_focus_file(state, path),
         Message::EditorInsertText(text) => {
             if let Some(path) = active_file_path(state) {
+                // Intercept Enter ("\n") and Tab ("    ") when the completion
+                // popup is open — select the highlighted item instead of
+                // inserting the literal text.
+                let completions_open = find_editor(state, &path)
+                    .is_some_and(|e| e.completions.is_some());
+                if completions_open && (text == "\n" || text == "    ") {
+                    return update(state, Message::CompletionSelect);
+                }
+
                 if let Some(editor) = find_editor_mut(state, &path) {
+                    // Any non-trigger keystroke closes a stale popup.
+                    if editor.completions.is_some() && text != "." && text != ":" {
+                        editor.completions = None;
+                    }
                     editor.insert_text(&text);
                 }
                 send_did_change_for(state, &path);
                 recompute_diff_for(state, &path);
+
+                // Trigger completion on '.' or second ':' of '::'
+                if matches!(state.lsp_status, LspStatus::Ready) && (text == "." || text == ":") {
+                    let trigger_info = find_editor(state, &path).and_then(|editor| {
+                        let cursor = editor.cursor;
+                        let line_text = editor.document.line_text(cursor.line);
+                        let should_trigger = if text == ":" {
+                            line_text.ends_with("::")
+                        } else {
+                            true
+                        };
+                        if should_trigger {
+                            let utf16_char = char_col_to_utf16_col(&line_text, cursor.col);
+                            Some((cursor, utf16_char))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((cursor, utf16_char)) = trigger_info {
+                        if let Some(uri) = lsp_uri(&path) {
+                            if let Some(sender) = state.lsp_sender.as_mut() {
+                                let _ = sender.try_send(LspCommand::Completion {
+                                    uri,
+                                    line: cursor.line as u32,
+                                    character: utf16_char,
+                                });
+                            }
+                            if let Some(editor) = find_editor_mut(state, &path) {
+                                editor.completion_anchor = cursor;
+                            }
+                        }
+                    }
+                }
             }
         }
         Message::EditorBackspace => {
@@ -1164,6 +1497,30 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
+                // Up/Down navigate the completion popup when it's open and
+                // the user hasn't started a selection-extend (shift+arrow).
+                if editor.completions.is_some() && !extend {
+                    match dir {
+                        Direction::Up => {
+                            editor.completion_selected =
+                                editor.completion_selected.saturating_sub(1);
+                            return iced::Task::none();
+                        }
+                        Direction::Down => {
+                            let max = editor
+                                .completions
+                                .as_ref()
+                                .map_or(0, |v| v.len().saturating_sub(1));
+                            editor.completion_selected =
+                                (editor.completion_selected + 1).min(max);
+                            return iced::Task::none();
+                        }
+                        _ => {
+                            // Any other cursor movement dismisses the popup.
+                            editor.completions = None;
+                        }
+                    }
+                }
                 editor.move_cursor(dir, extend);
             }
         }
@@ -1171,7 +1528,80 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
+                editor.completions = None;
                 editor.click(line, col, extend);
+            }
+        }
+        Message::EditorSelectWord { line, col } => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.completions = None;
+                editor.select_word_at(line, col);
+            }
+        }
+        Message::EditorSelectLine { line } => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.completions = None;
+                editor.select_line_at(line);
+            }
+        }
+        Message::EditorSelectAll => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.completions = None;
+                editor.select_all();
+            }
+        }
+        Message::EditorCopy => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor(state, &path)
+                && let Some(text) = editor.selected_text()
+            {
+                return iced::clipboard::write(text);
+            }
+        }
+        Message::EditorCut => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && let Some(text) = editor.cut_selection()
+            {
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
+                return iced::clipboard::write(text);
+            }
+        }
+        Message::EditorUndo => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && editor.undo()
+            {
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
+            }
+        }
+        Message::EditorRedo => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && editor.redo()
+            {
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
+            }
+        }
+        Message::EditorPaste => return iced::clipboard::read().map(Message::EditorPasteWithText),
+        Message::EditorPasteWithText(text) => {
+            if let Some(text) = text
+                && let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.completions = None;
+                editor.insert_text(&text);
+                send_did_change_for(state, &path);
+                recompute_diff_for(state, &path);
             }
         }
         Message::EditorScrolled(offset) => {
@@ -1191,7 +1621,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     send_did_open_for(state, &path);
                 }
                 if was_starting {
-                    push_toast(state, ToastKind::Success, "rust-analyzer ready");
+                    let name = active_server_name(state);
+                    push_toast(state, ToastKind::Success, format!("{name} ready"));
                 }
             }
             LspEvent::Diagnostics { uri, diagnostics } => {
@@ -1201,10 +1632,38 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.diagnostics = convert_diagnostics(&editor.document, diagnostics);
                 }
             }
+            LspEvent::Completions { uri, line, character, items } => {
+                if let Some(path) = uri.to_file_path().ok()
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    // Discard stale results: only apply if the cursor hasn't
+                    // moved since the request was sent.
+                    let anchor = editor.completion_anchor;
+                    if anchor.line == line as usize {
+                        let line_text = editor.document.line_text(anchor.line);
+                        let anchor_utf16 = char_col_to_utf16_col(&line_text, anchor.col);
+                        if anchor_utf16 == character {
+                            editor.completions = if items.is_empty() { None } else { Some(items) };
+                            editor.completion_selected = 0;
+                        }
+                    }
+                }
+            }
+            LspEvent::NeedsInstall => {
+                // Binary not on PATH and not in the managed dir — kick off
+                // a background install and show progress in the status bar.
+                if !matches!(state.lsp_status, LspStatus::Installing) {
+                    if let Some(lang) = active_lsp_language(state) {
+                        state.lsp_status = LspStatus::Installing;
+                        return start_server_install(lang);
+                    }
+                }
+            }
             LspEvent::Unavailable(reason) => {
                 state.lsp_status = LspStatus::Unavailable(reason.clone());
                 state.lsp_sender = None;
-                push_toast(state, ToastKind::Warning, format!("rust-analyzer unavailable: {reason}"));
+                let name = active_server_name(state);
+                push_toast(state, ToastKind::Warning, format!("{name} unavailable: {reason}"));
             }
         },
         Message::ToggleDirCollapsed(path) => {
@@ -1507,6 +1966,17 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::EscapePressed => {
+            let completions_open = active_file_path(state)
+                .and_then(|ref path| find_editor(state, path))
+                .is_some_and(|e| e.completions.is_some());
+            if completions_open {
+                if let Some(path) = active_file_path(state)
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.completions = None;
+                }
+                return iced::Task::none();
+            }
             let find_open = active_file_path(state)
                 .and_then(|path| find_editor(state, &path))
                 .is_some_and(|editor| editor.find.is_some());
@@ -1528,6 +1998,70 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.palette_open = false;
             } else if state.settings_open {
                 state.settings_open = false;
+            }
+        }
+        Message::ServerInstallComplete(result) => {
+            match result {
+                Ok(()) => {
+                    // Bump the restart token so the subscription key changes
+                    // and iced tears down the idle worker, spawning a fresh
+                    // one that will now find the installed binary.
+                    state.lsp_restart_token += 1;
+                    state.lsp_status = LspStatus::Starting;
+                    let name = active_server_name(state);
+                    push_toast(state, ToastKind::Success, format!("{name} installed"));
+                }
+                Err(reason) => {
+                    state.lsp_status = LspStatus::Unavailable(reason.clone());
+                    let name = active_server_name(state);
+                    push_toast(state, ToastKind::Error, format!("{name} install failed: {reason}"));
+                }
+            }
+        }
+        Message::CompletionMove(delta) => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && editor.completions.is_some()
+            {
+                let len = editor.completions.as_ref().map_or(0, Vec::len);
+                if len > 0 {
+                    let sel = editor.completion_selected as i32 + delta;
+                    editor.completion_selected = sel.clamp(0, (len - 1) as i32) as usize;
+                }
+            }
+        }
+        Message::CompletionSelect => {
+            if let Some(path) = active_file_path(state) {
+                let insert_text = find_editor(state, &path).and_then(|editor| {
+                    let items = editor.completions.as_ref()?;
+                    let sel = editor.completion_selected.min(items.len().saturating_sub(1));
+                    let item = items.get(sel)?;
+                    let text = item.insert_text.as_deref().unwrap_or(&item.label).to_string();
+                    Some((text, editor.completion_anchor, editor.cursor))
+                });
+                if let Some((text, anchor, cursor)) = insert_text {
+                    if let Some(editor) = find_editor_mut(state, &path) {
+                        editor.completions = None;
+                        editor.completion_selected = 0;
+                        // Replace text typed since the trigger with the completion.
+                        let start = editor.document.char_index(anchor.line, anchor.col);
+                        let end = editor.document.char_index(cursor.line, cursor.col);
+                        if start <= end {
+                            editor.document.remove(start..end);
+                            editor.cursor = editor.document.line_col(start).into();
+                        }
+                        editor.insert_text(&text);
+                    }
+                    send_did_change_for(state, &path);
+                    recompute_diff_for(state, &path);
+                }
+            }
+        }
+        Message::CloseCompletion => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.completions = None;
             }
         }
         Message::Noop => {}
@@ -2692,6 +3226,21 @@ fn convert_diagnostics(document: &Document, diagnostics: Vec<lsp::Diagnostic>) -
         .collect()
 }
 
+/// Spawns a background OS thread that installs `language`'s server binary
+/// via the method defined in `server_install::spec_for`. Result arrives as
+/// `Message::ServerInstallComplete`.
+fn start_server_install(language: LspLanguage) -> iced::Task<Message> {
+    iced_runtime::task::blocking(move |mut sender| {
+        let spec = crate::server_install::spec_for(language);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::server_install::install(&spec)
+        }))
+        .unwrap_or_else(|_| Err("install panicked unexpectedly".into()));
+        let _ = sender.try_send(result);
+    })
+    .map(Message::ServerInstallComplete)
+}
+
 fn utf16_col_to_char_col(line: &str, utf16_col: usize) -> usize {
     let mut utf16_count = 0usize;
     for (char_idx, ch) in line.chars().enumerate() {
@@ -2703,24 +3252,44 @@ fn utf16_col_to_char_col(line: &str, utf16_col: usize) -> usize {
     line.chars().count()
 }
 
-/// Keyed on `root` via `Subscription::run_with` (see `subscription`) rather
-/// than the zero-arg `Subscription::run` this used before project-switching
-/// existed: `run_with`'s data is part of the subscription's identity, so a
-/// project switch changing `state.root` makes the runtime tear down the old
-/// LSP worker and spawn a fresh one for the new root automatically — no
-/// manual kill/respawn bookkeeping needed beyond `reset_project_scoped_state`
-/// clearing the stale `lsp_sender`/`lsp_status` in the meantime.
+fn char_col_to_utf16_col(line: &str, char_col: usize) -> u32 {
+    line.chars().take(char_col).map(|c| c.len_utf16() as u32).sum()
+}
+
+/// Language of the currently active file, if it maps to a known LSP language.
+pub fn active_lsp_language(state: &State) -> Option<LspLanguage> {
+    active_file_path(state)?
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(LspLanguage::from_extension)
+}
+
+/// Display name of the active language server (for status bar / toasts).
+pub fn active_server_name(state: &State) -> &'static str {
+    active_lsp_language(state)
+        .map(LspLanguage::command)
+        .unwrap_or("language server")
+}
+
+/// Keyed on `(root, language, restart_token)` so that:
+/// - a project switch (new `root`) tears down the old worker automatically
+/// - switching the active file to a different language does the same
+/// - a successful auto-install increments `restart_token`, forcing iced to
+///   respawn the worker so it picks up the newly installed binary
 ///
-/// `&PathBuf`, not `&Path` as clippy would otherwise want: `run_with<D,
-/// S>(data: D, builder: fn(&D) -> S)` requires this to be exactly
-/// `fn(&PathBuf) -> S` since `D = PathBuf` (`state.root`'s type) — a raw
-/// `fn` pointer type isn't interchangeable with `fn(&Path) -> S` the way an
-/// ordinary call-site argument would be.
-#[allow(clippy::ptr_arg)]
-fn lsp_worker(root: &PathBuf) -> impl iced::futures::Stream<Item = LspEvent> + use<> {
+/// Binary resolution happens inside the async stream body so the main thread
+/// never blocks: if the binary isn't found, `NeedsInstall` is emitted and
+/// the worker exits cleanly.
+fn lsp_worker((root, language, _token): &(PathBuf, LspLanguage, u64)) -> impl iced::futures::Stream<Item = LspEvent> + use<> {
     let root = root.clone();
-    iced::stream::channel(32, async move |output| {
-        lsp::run(root, output).await;
+    let language = *language;
+    iced::stream::channel(32, async move |mut output| {
+        use iced::futures::SinkExt as _;
+        let spec = crate::server_install::spec_for(language);
+        match crate::server_install::resolve_binary(&spec) {
+            Some(binary) => lsp::run(root, language, binary, output).await,
+            None => { let _ = output.send(LspEvent::NeedsInstall).await; }
+        }
     })
 }
 
@@ -2803,6 +3372,20 @@ fn window_events((_id, event): (iced::window::Id, iced::window::Event)) -> Messa
     }
 }
 
+/// Drives an in-progress sidebar drag (see `Message::SidebarResizeStarted`)
+/// with window-wide cursor tracking — the resize handle itself is only a
+/// few pixels wide, far narrower than a fast drag's mouse movement, so the
+/// handle's own `mouse_area` can't be the thing reporting position once the
+/// cursor has left it. Only subscribed while `state.sidebar_resizing`, so
+/// idle frames don't pay for a global mouse listener.
+fn sidebar_resize_events(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::SidebarResizeDragged(position.x)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(_)) => Some(Message::SidebarResizeEnded),
+        _ => None,
+    }
+}
+
 pub fn subscription(state: &State) -> iced::Subscription<Message> {
     let mut subs = vec![
         iced::time::every(std::time::Duration::from_millis(530)).map(|_| Message::CaretTick),
@@ -2810,13 +3393,14 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
         iced::keyboard::listen().map(global_keys),
         iced::window::events().map(window_events),
     ];
-    // No LSP worker while no project is open (`welcome_open`) — there's no
-    // meaningful root to spawn one for — or while the user has switched it
-    // off (`lsp_enabled`, see `Message::ToggleLspEnabled`). Once both hold,
-    // keying on `state.root` via `run_with` (see `lsp_worker`'s doc)
-    // restarts it on every project switch for free.
+    // No LSP worker while no project is open or LSP is disabled. The key
+    // includes `lsp_restart_token` so incrementing it (after a successful
+    // auto-install) forces iced to respawn the worker — see `lsp_worker`.
     if !state.welcome_open && state.lsp_enabled {
-        subs.push(iced::Subscription::run_with(state.root.clone(), lsp_worker).map(Message::Lsp));
+        if let Some(lang) = active_lsp_language(state) {
+            let key = (state.root.clone(), lang, state.lsp_restart_token);
+            subs.push(iced::Subscription::run_with(key, lsp_worker).map(Message::Lsp));
+        }
     }
     // Only ticks while there's an actual pending debounce to check
     // (`search_query_changed_at` goes back to `None` the moment a search
@@ -2830,6 +3414,9 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     // stuck (see the roadmap's search bug-fix writeup, "seventh pass").
     if state.search_query_changed_at.is_some() {
         subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::SearchDebounceTick));
+    }
+    if state.sidebar_resizing {
+        subs.push(iced::event::listen_with(sidebar_resize_events));
     }
     iced::Subscription::batch(subs)
 }

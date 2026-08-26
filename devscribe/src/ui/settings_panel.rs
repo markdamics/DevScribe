@@ -12,11 +12,14 @@ use iced::font::Weight;
 use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
 use iced::{Alignment, Border, Color, Element, Length};
 
+use devscribe_core::lsp::LspLanguage;
+
 use crate::color::color;
 use crate::density::Density;
 use crate::fonts;
+use crate::server_install;
 use crate::state::{
-    Message, SettingsCategory, State, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
+    self, Message, SettingsCategory, State, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
     EDITOR_FONT_SIZE_STEP, UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
 };
 use crate::widgets;
@@ -424,21 +427,47 @@ fn status_row(name: &'static str, status_color: Color, status_label: String, p: 
     .into()
 }
 
-/// The one real toolchain DevScribe manages: `rust-analyzer`, via
-/// `state.lsp_status`. Deliberately doesn't list the mockup's clangd/jdtls/
-/// typescript-language-server rows — DevScribe has no integration with any
-/// of those, and fabricated "READY" statuses for servers that don't exist
-/// would be exactly the kind of fake control this project has consistently
-/// avoided (see e.g. Phase 4's "Install toolchains automatically").
+/// One row per supported language server — shows live status for the active
+/// server and "INSTALLED" / "NOT INSTALLED" for all others.
 fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
-    let (status_color, status_label) = state.lsp_status.describe(p);
-    column![
+    let active_lang = state::active_lsp_language(state);
+
+    let all_langs = [
+        (LspLanguage::Rust,       "RUST-ANALYZER",              "rust"),
+        (LspLanguage::Java,       "JDTLS",                      "java"),
+        (LspLanguage::Python,     "PYRIGHT",                    "python"),
+        (LspLanguage::TypeScript, "TYPESCRIPT-LANGUAGE-SERVER", "ts/js"),
+        (LspLanguage::Cpp,        "CLANGD",                     "c/c++"),
+    ];
+
+    let rows: Vec<Element<'static, Message>> = all_langs
+        .iter()
+        .map(|(lang, display, _ext)| {
+            let (dot_color, label) = if active_lang == Some(*lang) {
+                // Use the live status for the currently active language.
+                state.lsp_status.describe(display, p)
+            } else {
+                // For inactive languages, show whether the binary is available.
+                let spec = server_install::spec_for(*lang);
+                if server_install::resolve_binary(&spec).is_some() {
+                    (p.status_success, format!("{display} installed"))
+                } else {
+                    (p.text_muted, format!("{display} not installed"))
+                }
+            };
+            status_row(display, color(dot_color), label, p)
+        })
+        .collect();
+
+    let mut col = column![
         section_label("LANGUAGE SERVERS", p),
-        status_row("RUST-ANALYZER", color(status_color), status_label, p),
-        toggle_row("Enable rust-analyzer", state.lsp_enabled, Message::ToggleLspEnabled, p),
     ]
-    .spacing(8.0)
-    .into()
+    .spacing(8.0);
+    for row in rows {
+        col = col.push(row);
+    }
+    col.push(toggle_row("Enable language servers", state.lsp_enabled, Message::ToggleLspEnabled, p))
+        .into()
 }
 
 fn shortcut_row(label: &'static str, keys: &'static str, p: Palette) -> Element<'static, Message> {
@@ -515,7 +544,7 @@ fn shortcuts_content(p: Palette) -> Element<'static, Message> {
 /// field in `Cargo.toml`), and inventing values for either would be exactly
 /// the kind of fabricated content this doc keeps calling out.
 fn about_content(state: &State, p: Palette) -> Element<'static, Message> {
-    let (status_color, status_label) = state.lsp_status.describe(p);
+    let (status_color, status_label) = state.lsp_status.describe(state::active_server_name(state), p);
     let banner = column![
         text("DEVSCRIBE")
             .font(fonts::display(Weight::ExtraBold))
@@ -595,8 +624,8 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let body = column![header, widgets::hline(color(p.border_hairline)), split];
 
     let panel = container(body)
-        .width(Length::Fixed(760.0))
-        .height(Length::Fixed(520.0))
+        .width(Length::Fixed(860.0))
+        .height(Length::Fixed(700.0))
         // Padding matching the border's own width — without it, `category_nav`'s
         // full-height `bg_void` fill (the left nav rail's distinct background,
         // zero-inset since `body`/`split` carry no padding of their own) sits

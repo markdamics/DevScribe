@@ -4,6 +4,7 @@ mod fonts;
 mod fs_tree;
 mod logging;
 mod recent_projects;
+mod server_install;
 mod settings;
 mod state;
 mod text_scale;

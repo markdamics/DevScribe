@@ -14,3 +14,8 @@ iced_runtime = "0.14"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+# Server auto-install: blocking HTTP + archive extraction for clangd binary download
+ureq = "3"
+zip = "2"
+flate2 = "1"
+tar = "0.4"

@@ -10,6 +10,7 @@ use iced::alignment::Vertical;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Style, Text};
 use iced::widget::text::{Alignment, LineHeight};
 use iced::{keyboard, mouse, Color, Pixels, Point, Rectangle, Renderer, Size, Theme};
+use std::time::{Duration, Instant};
 
 use crate::color::color;
 use crate::fonts;
@@ -58,7 +59,19 @@ pub struct EditorCanvas {
 pub struct CanvasState {
     focused: bool,
     modifiers: keyboard::Modifiers,
+    /// `true` from a left-button press until its matching release — while
+    /// set, further `CursorMoved` events extend the selection (drag-select).
+    dragging: bool,
+    /// `(when, line, col)` of the last left-button press, for double/triple
+    /// click detection — a same-cell press within `CLICK_STREAK_WINDOW`
+    /// advances `click_streak`; anything else resets it to a fresh single.
+    last_click: Option<(Instant, usize, usize)>,
+    /// 1 = plain click, 2 = double (select word), 3 = triple (select line),
+    /// wrapping back to 1 on a fourth same-cell click.
+    click_streak: u8,
 }
+
+const CLICK_STREAK_WINDOW: Duration = Duration::from_millis(450);
 
 impl EditorCanvas {
     fn line_height(&self) -> f32 {
@@ -129,6 +142,30 @@ impl EditorCanvas {
             };
         }
 
+        if modifiers.command()
+            && let Key::Character(c) = key.as_ref()
+        {
+            return if c.eq_ignore_ascii_case("a") {
+                publish(Message::EditorSelectAll)
+            } else if c.eq_ignore_ascii_case("c") {
+                publish(Message::EditorCopy)
+            } else if c.eq_ignore_ascii_case("x") {
+                publish(Message::EditorCut)
+            } else if c.eq_ignore_ascii_case("v") {
+                publish(Message::EditorPaste)
+            } else if c.eq_ignore_ascii_case("z") {
+                if modifiers.shift() {
+                    publish(Message::EditorRedo)
+                } else {
+                    publish(Message::EditorUndo)
+                }
+            } else if c.eq_ignore_ascii_case("y") {
+                publish(Message::EditorRedo)
+            } else {
+                None
+            };
+        }
+
         // Command/control/alt-modified keys are shortcuts, not text — never
         // insert their `text` payload (e.g. Ctrl+S shouldn't type an "s").
         if modifiers.command() || modifiers.control() || modifiers.alt() {
@@ -158,12 +195,49 @@ impl canvas::Program<Message> for EditorCanvas {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let position = cursor.position_in(bounds)?;
                 state.focused = true;
+                state.dragging = true;
                 let (line, col) = self.hit_test(position);
-                let extend = state.modifiers.shift();
-                Some(
-                    canvas::Action::publish(Message::EditorClick { line, col, extend })
-                        .and_capture(),
-                )
+
+                // Shift-click always just extends, same as shift+arrow —
+                // doesn't participate in double/triple-click detection.
+                if state.modifiers.shift() {
+                    state.last_click = None;
+                    state.click_streak = 0;
+                    return Some(
+                        canvas::Action::publish(Message::EditorClick { line, col, extend: true })
+                            .and_capture(),
+                    );
+                }
+
+                let now = Instant::now();
+                let repeats_last = state.last_click.is_some_and(|(at, l, c)| {
+                    l == line && c == col && now.duration_since(at) < CLICK_STREAK_WINDOW
+                });
+                state.click_streak = if repeats_last { state.click_streak % 3 + 1 } else { 1 };
+                state.last_click = Some((now, line, col));
+
+                let message = match state.click_streak {
+                    2 => Message::EditorSelectWord { line, col },
+                    3 => Message::EditorSelectLine { line },
+                    _ => Message::EditorClick { line, col, extend: false },
+                };
+                Some(canvas::Action::publish(message).and_capture())
+            }
+            // Drag-select: every cursor move while the button is still down
+            // extends the selection from wherever it started, the same way
+            // shift-click does. Computed from the cursor's absolute
+            // position (not `position_in`, which is `None` once the cursor
+            // strays outside the canvas's own bounds) so a drag past either
+            // edge still keeps extending rather than freezing — `hit_test`
+            // already clamps whatever it's given to a valid line/col.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
+                let position = cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))?;
+                let (line, col) = self.hit_test(position);
+                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true }).and_capture())
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.dragging = false;
+                None
             }
             canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
@@ -488,4 +562,26 @@ pub(crate) fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
 /// the `Canvas` so it can sit inside a `scrollable` for vertical scrolling.
 pub fn content_height(line_count: usize, font_size: f32) -> f32 {
     TOP_PAD * 2.0 + line_count as f32 * font_size * LINE_HEIGHT_RATIO
+}
+
+/// Approximate window-relative pixel position of the bottom-left corner of
+/// the cursor glyph, for anchoring overlay widgets (e.g. the completion
+/// popup) near the typing point.
+///
+/// `header_height` should include everything above the editor's scrollable
+/// area (title bar + tab bar). The result is approximate; sub-pixel and font
+/// metric variations mean it may be off by a few pixels.
+pub fn cursor_pixel_pos(
+    line: usize,
+    col: usize,
+    font_size: f32,
+    scroll_offset: f32,
+    header_height: f32,
+) -> (f32, f32) {
+    let line_height = font_size * LINE_HEIGHT_RATIO;
+    let char_width = font_size * CHAR_WIDTH_RATIO;
+    let x = GUTTER_WIDTH + TEXT_INSET + col as f32 * char_width;
+    // +1 so the popup appears *below* the cursor line, not overlapping it.
+    let y = header_height + TOP_PAD + (line as f32 + 1.0) * line_height - scroll_offset;
+    (x, y)
 }

@@ -7,7 +7,7 @@ use iced::{Alignment, Element, Length};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{Message, OpenTab, State};
+use crate::state::{self, Message, OpenTab, State};
 use crate::widgets;
 
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
@@ -52,7 +52,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     .spacing(8.0)
     .align_y(Alignment::Center);
 
-    let (lsp_color, lsp_label) = state.lsp_status.describe(p);
+    let (lsp_color, lsp_label) = state.lsp_status.describe(state::active_server_name(state), p);
     let lsp = row![
         widgets::dot(color(lsp_color), 6.0),
         text(lsp_label)
