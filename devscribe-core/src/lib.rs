@@ -5,6 +5,7 @@ pub mod lsp;
 pub mod search;
 pub mod syntax;
 pub mod theme;
+pub mod watcher;
 
 pub use document::Document;
 pub use theme::{Accent, Palette, Theme, ThemeMode};

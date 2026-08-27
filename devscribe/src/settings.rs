@@ -38,7 +38,7 @@ impl Default for Settings {
             density: Density::default(),
             ui_font_scale: crate::state::UI_FONT_SCALE_DEFAULT,
             editor_font_size: crate::state::EDITOR_FONT_SIZE_DEFAULT,
-            git_status_in_tree: false,
+            git_status_in_tree: true,
             problem_lens_enabled: true,
             save_on_focus_loss: false,
             lsp_enabled: true,
@@ -67,7 +67,7 @@ struct SettingsFile {
     ui_font_scale: f32,
     #[serde(default = "default_editor_font_size")]
     editor_font_size: f32,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     git_status_in_tree: bool,
     #[serde(default = "default_true")]
     problem_lens_enabled: bool,

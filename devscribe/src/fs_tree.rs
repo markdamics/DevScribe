@@ -7,14 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::color::color;
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    ".idea",
-    ".vscode",
-    ".claude",
-];
+use devscribe_core::watcher::SKIP_DIRS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {

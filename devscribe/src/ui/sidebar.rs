@@ -214,18 +214,27 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
             let is_selected = ctx.selected == Some(path.as_path());
             let (fg, bg) = lang.badge(p);
             let badge_label = lang.code(path);
+            // Highlighting a changed/created/deleted file both in its name
+            // color and its trailing badge (below) — not just the badge —
+            // is what actually makes it easy to spot at a glance scanning
+            // down the tree, the same way VS Code tints the label itself.
+            let change = ctx.changes.get(path).copied();
+            let name_color = match change {
+                Some(kind) => kind_letter(kind, p).1,
+                None => p.text_strong,
+            };
 
             let mut contents = row![
                 widgets::lang_badge(badge_label, fg, bg),
                 text(name.clone())
                     .font(fonts::sans(Weight::Medium))
                     .size(crate::text_scale::px(15.0))
-                    .color(color(p.text_strong))
+                    .color(color(name_color))
                     .width(Length::Fill),
             ]
             .spacing(8.0)
             .align_y(Alignment::Center);
-            if let Some(&kind) = ctx.changes.get(path) {
+            if let Some(kind) = change {
                 let (letter, kind_color) = kind_letter(kind, p);
                 contents = contents.push(widgets::lang_badge(letter, color(kind_color), tint(kind_color, 0.16)));
             }

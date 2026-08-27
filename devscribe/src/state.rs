@@ -8,6 +8,7 @@ use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguag
 use devscribe_core::search::{self, SearchHit};
 use devscribe_core::syntax::{self, Span};
 use devscribe_core::theme::{Accent, ThemeMode};
+use devscribe_core::watcher::{self, WatchEvent};
 use devscribe_core::Document;
 use iced::futures::channel::mpsc;
 use iced::keyboard;
@@ -1266,6 +1267,10 @@ pub enum Message {
     EditorScrolled(f32),
     CaretTick,
     Lsp(LspEvent),
+    /// A debounced batch of on-disk changes from `file_watcher` — an edit
+    /// made outside DevScribe (another terminal, `git checkout`, and later
+    /// the AI Chat Assist panel's own file edits).
+    FilesChanged(Vec<WatchEvent>),
     JsonToggle(String),
     ToggleDirCollapsed(PathBuf),
     SearchQueryChanged(String),
@@ -1666,6 +1671,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 push_toast(state, ToastKind::Warning, format!("{name} unavailable: {reason}"));
             }
         },
+        Message::FilesChanged(events) => {
+            refresh_tree(state);
+            refresh_changed_files(state);
+            for event in &events {
+                if let WatchEvent::Changed(path) | WatchEvent::Created(path) = event {
+                    reload_editor_from_disk(state, path);
+                }
+            }
+        }
         Message::ToggleDirCollapsed(path) => {
             if !state.collapsed_dirs.remove(&path) {
                 state.collapsed_dirs.insert(path);
@@ -2714,6 +2728,29 @@ fn find_editor_mut<'a>(state: &'a mut State, path: &Path) -> Option<&'a mut Edit
     })
 }
 
+/// Reloads an open, *unmodified* buffer's content from disk after
+/// `Message::FilesChanged` reports an external change to `path` — a dirty
+/// buffer is left alone rather than clobbering in-progress local edits;
+/// the git-changes panel and the tab's own modified indicator already make
+/// that divergence visible without DevScribe silently picking a side.
+/// Rebuilds the `EditorState` the same way opening the file fresh would
+/// (`open_or_focus_file`), so highlights/undo history/etc. all stay
+/// consistent with the new content instead of being patched piecemeal.
+fn reload_editor_from_disk(state: &mut State, path: &Path) {
+    let Some(editor) = find_editor_mut(state, path) else {
+        return;
+    };
+    if editor.document.is_dirty() {
+        return;
+    }
+    let Ok(document) = Document::open(path) else {
+        return;
+    };
+    *editor = EditorState::new(document, path.to_path_buf());
+    send_did_change_for(state, path);
+    recompute_diff_for(state, path);
+}
+
 /// The active tab's `EditorState`, if the active tab is a `File`.
 pub fn active_editor(state: &State) -> Option<&EditorState> {
     find_editor(state, &active_file_path(state)?)
@@ -3293,6 +3330,15 @@ fn lsp_worker((root, language, _token): &(PathBuf, LspLanguage, u64)) -> impl ic
     })
 }
 
+/// Keyed on `root` alone, mirroring `lsp_worker`'s keying — switching
+/// projects tears down and respawns the watcher on the new root.
+fn file_watcher(root: &PathBuf) -> impl iced::futures::Stream<Item = Vec<WatchEvent>> + use<> {
+    let root = root.clone();
+    iced::stream::channel(32, async move |output| {
+        watcher::run(root, output).await;
+    })
+}
+
 /// Ctrl/Cmd+K (palette), Ctrl/Cmd+S (save), and Escape (close whatever
 /// overlay is open) — global shortcuts that work regardless of which widget
 /// has focus. `keyboard::listen()` only sees events no focused widget
@@ -3401,6 +3447,11 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
             let key = (state.root.clone(), lang, state.lsp_restart_token);
             subs.push(iced::Subscription::run_with(key, lsp_worker).map(Message::Lsp));
         }
+    }
+    // No file watcher with no project open — keyed on `root` so switching
+    // projects tears down and respawns it on the new one (see `file_watcher`).
+    if !state.welcome_open {
+        subs.push(iced::Subscription::run_with(state.root.clone(), file_watcher).map(Message::FilesChanged));
     }
     // Only ticks while there's an actual pending debounce to check
     // (`search_query_changed_at` goes back to `None` the moment a search
