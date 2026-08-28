@@ -82,8 +82,15 @@ fn search_icon_tab(active: bool, p: Palette, density: Density) -> Element<'stati
 /// on both left a visible gap between the label and the close button instead
 /// of one continuous highlighted tab. Buttons can't nest in iced, so this
 /// container is the only shared surface both can sit on.
+/// `select`/`close` are passed in as full `Message`s rather than derived
+/// from a `TabKey` here, so this can back both real `open_tabs`-backed tabs
+/// (`Message::SelectOpenTab`/`CloseTab`) *and* the virtual `Chat` tab
+/// (`Message::ChatOpenTab`/`ChatCloseTab`, since `close_tab` only ever
+/// looks tabs up in `open_tabs`, which `Chat` is never part of — see
+/// `TabKey::Chat`'s own doc comment).
 fn tab_shell(
-    key: TabKey,
+    select: Message,
+    close: Message,
     active: bool,
     p: Palette,
     density: Density,
@@ -99,7 +106,7 @@ fn tab_shell(
             bottom: 0.0,
             left: 16.0,
         })
-        .on_press(Message::SelectOpenTab(key.clone()))
+        .on_press(select)
         .style(move |_theme, status| {
             let hovered = status == button::Status::Hovered;
             button::Style {
@@ -121,7 +128,7 @@ fn tab_shell(
         .padding(0.0)
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(tab_h))
-        .on_press(Message::CloseTab(key))
+        .on_press(close)
         .style(move |_theme, status| {
             let hovered = status == button::Status::Hovered;
             button::Style {
@@ -195,6 +202,16 @@ fn diff_tab_label(path: &std::path::Path, p: Palette) -> Element<'static, Messag
     .into()
 }
 
+fn chat_tab_label(p: Palette) -> Element<'static, Message> {
+    row![
+        widgets::dot(color(p.accent_solid), 6.0),
+        text("Chat").font(fonts::sans(Weight::Medium)).size(crate::text_scale::px(15.0)).color(color(p.text_strong)),
+    ]
+    .spacing(8.0)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     let bar_h = state.density.tab_bar_h();
 
@@ -208,8 +225,12 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
             OpenTab::File(editor) => file_tab_label(editor, p),
             OpenTab::Diff(path) => diff_tab_label(path, p),
         };
-        tab_shell(key, active, p, state.density, label)
+        tab_shell(Message::SelectOpenTab(key.clone()), Message::CloseTab(key), active, p, state.density, label)
     }));
+    if state.chat_tab_open {
+        let active = state.active_tab.as_ref() == Some(&TabKey::Chat);
+        tab_elements.push(tab_shell(Message::ChatOpenTab, Message::ChatCloseTab, active, p, state.density, chat_tab_label(p)));
+    }
 
     let tabs = row(tab_elements)
         .width(Length::Fill)

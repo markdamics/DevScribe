@@ -348,6 +348,11 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
         column![section_label("ROW DENSITY", p), density_row(state, p)].spacing(8.0),
         column![section_label("UI TEXT SIZE", p), ui_scale_row(state, p)].spacing(8.0),
         column![
+            section_label("FILES", p),
+            toggle_row("Show hidden files", state.show_hidden_files, Message::ToggleShowHiddenFiles, p),
+        ]
+        .spacing(8.0),
+        column![
             section_label("GIT", p),
             toggle_row("Show git status in tree", state.git_status_in_tree, Message::ToggleGitStatusInTree, p),
         ]

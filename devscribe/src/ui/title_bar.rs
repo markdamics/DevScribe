@@ -68,7 +68,12 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         }
     });
 
-    let assist_on = state.assist_on;
+    // "On" here means "there's a live session at all" — includes it being
+    // open as a full tab, not just `chat_mode != Closed` alone, since
+    // opening as a tab actually sets `chat_mode` to `Closed` (the docked
+    // panel and the tab view are mutually exclusive presentations of the
+    // same session). See `state::chat_is_active`.
+    let assist_on = crate::state::chat_is_active(state);
     let assist_button = button(widgets::center_v(
         row![
             widgets::dot(
@@ -88,7 +93,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     ))
     .padding([0.0, 14.0])
     .height(Length::Fixed(32.0))
-    .on_press(Message::ToggleAssist)
+    .on_press(Message::ChatToggle)
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {

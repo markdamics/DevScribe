@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(git stash *)",
+      "Bash(rm -f /tmp/devscribe-claude-166293-* *)",
+      "Bash(python3 -c ' *)",
+      "Bash(grep -n \"^    iced::Task::none\\(\\)$\" /home/mdamics/Projects/DevScribe/devscribe/src/state.rs)",
+      "Bash(awk '/^pub fn update/,0' /home/mdamics/Projects/DevScribe/devscribe/src/state.rs)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

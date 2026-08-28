@@ -5,10 +5,10 @@ use iced::{Alignment, Border, Element, Length};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{self, EditorState, Message, State, TabKey};
+use crate::state::{self, ChatMode, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
-    command_palette, completions, context_menu, diff_view, find_bar, flash, json_view,
+    chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash, json_view,
     search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
@@ -153,6 +153,7 @@ fn content_area(state: &State, p: Palette) -> Element<'static, Message> {
         }
         TabKey::Diff(path) => diff_view::view(state, path, p),
         TabKey::Search => search_view::view(state, p),
+        TabKey::Chat => chat_panel::tab_view(state, p),
     }
 }
 
@@ -182,7 +183,16 @@ pub fn view(state: &State) -> Element<'static, Message> {
     if !state.sidebar_collapsed {
         body = body.push(sidebar::resize_handle(p));
     }
-    let body = body.push(main_column).width(Length::Fill).height(Length::Fill);
+    body = body.push(main_column);
+    match state.chat_mode {
+        ChatMode::Docked => {
+            body = body.push(chat_panel::resize_handle(p));
+            body = body.push(chat_panel::docked_view(state, p));
+        }
+        ChatMode::Collapsed => body = body.push(chat_panel::collapsed_rail(p)),
+        ChatMode::Window | ChatMode::Closed => {}
+    }
+    let body = body.width(Length::Fill).height(Length::Fill);
 
     let root = column![title_bar::view(state, p), body]
         .width(Length::Fill)
@@ -206,6 +216,9 @@ pub fn view(state: &State) -> Element<'static, Message> {
     layers.extend(context_menu::view(state, p));
     layers.extend(toast::view(state));
     layers.extend(flash::view(state));
+    if state.chat_mode == ChatMode::Window {
+        layers.push(chat_panel::window_view(state, p));
+    }
 
     iced::widget::Stack::with_children(layers).into()
 }

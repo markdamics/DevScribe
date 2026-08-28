@@ -97,7 +97,11 @@ fn is_hidden(name: &str) -> bool {
 
 /// Walks `root` and builds a `Node` tree: directories first (alphabetical),
 /// then files (alphabetical). Returns an empty vec if `root` can't be read.
-pub fn walk(root: &Path) -> Vec<Node> {
+/// `show_hidden` — the sidebar's "Show hidden files" setting — lets dotfiles
+/// and the `SKIP_DIRS` build/dependency directories (`.git`, `target`,
+/// `node_modules`, …) through when `true`; otherwise both are skipped as
+/// before.
+pub fn walk(root: &Path, show_hidden: bool) -> Vec<Node> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -110,7 +114,7 @@ pub fn walk(root: &Path) -> Vec<Node> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if is_hidden(name) || SKIP_DIRS.contains(&name) {
+        if !show_hidden && (is_hidden(name) || SKIP_DIRS.contains(&name)) {
             continue;
         }
 
@@ -131,7 +135,7 @@ pub fn walk(root: &Path) -> Vec<Node> {
     let mut nodes: Vec<Node> = dirs
         .into_iter()
         .map(|(name, path)| Node::Dir {
-            children: walk(&path),
+            children: walk(&path, show_hidden),
             name,
             path,
         })

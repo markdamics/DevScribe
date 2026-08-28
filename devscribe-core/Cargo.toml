@@ -27,3 +27,4 @@ gix = "0.86.0"
 similar = "3.2.0"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 notify = "8.2.0"
+uuid = { version = "1.26.0", features = ["v4"] }

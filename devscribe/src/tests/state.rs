@@ -394,7 +394,7 @@ fn recompute_search_caps_a_single_file_with_many_matches_on_one_line() {
     let dir = files.a.parent().unwrap().to_path_buf();
     std::fs::write(dir.join("many_matches.txt"), "e".repeat(500)).unwrap();
 
-    let files_in_dir: Vec<PathBuf> = fs_tree::flatten_files(&fs_tree::walk(&dir)).into_iter().map(Path::to_path_buf).collect();
+    let files_in_dir: Vec<PathBuf> = fs_tree::flatten_files(&fs_tree::walk(&dir, false)).into_iter().map(Path::to_path_buf).collect();
 
     let outcome = run_search(&files_in_dir, "e");
 
@@ -436,7 +436,7 @@ fn search_debounce_tick_starts_a_search_once_the_delay_elapses() {
     std::fs::write(dir.join("match.txt"), "needle").unwrap();
     let mut state = State {
         root: dir.clone(),
-        tree: fs_tree::walk(&dir),
+        tree: fs_tree::walk(&dir, false),
         search_query: "needle".to_string(),
         search_query_changed_at: Instant::now().checked_sub(SEARCH_DEBOUNCE_DELAY * 2),
         ..State::default()
@@ -456,7 +456,7 @@ fn search_submit_bypasses_the_debounce_and_starts_immediately() {
     std::fs::write(dir.join("match.txt"), "needle").unwrap();
     let mut state = State {
         root: dir.clone(),
-        tree: fs_tree::walk(&dir),
+        tree: fs_tree::walk(&dir, false),
         search_query: "needle".to_string(),
         search_query_changed_at: Some(Instant::now()), // well within the debounce window
         ..State::default()
@@ -516,7 +516,7 @@ fn starting_a_new_search_aborts_the_previous_ones_handle() {
     std::fs::write(dir.join("match.txt"), "needle").unwrap();
     let mut state = State {
         root: dir.clone(),
-        tree: fs_tree::walk(&dir),
+        tree: fs_tree::walk(&dir, false),
         search_query: "first".to_string(),
         ..State::default()
     };
@@ -540,7 +540,7 @@ fn recompute_search_skips_files_over_the_size_limit() {
     // it even matches.
     let oversized = "e".repeat((MAX_SEARCH_FILE_BYTES + 1) as usize);
     std::fs::write(dir.join("too_big.txt"), oversized).unwrap();
-    let files_in_dir: Vec<PathBuf> = fs_tree::flatten_files(&fs_tree::walk(&dir)).into_iter().map(Path::to_path_buf).collect();
+    let files_in_dir: Vec<PathBuf> = fs_tree::flatten_files(&fs_tree::walk(&dir, false)).into_iter().map(Path::to_path_buf).collect();
 
     let outcome = run_search(&files_in_dir, "e");
 
@@ -571,7 +571,7 @@ fn recompute_search_stops_after_max_files_scanned() {
     }
     std::fs::write(dir.join("zzz_needle.txt"), "needle").unwrap();
 
-    let files_in_dir: Vec<PathBuf> = fs_tree::flatten_files(&fs_tree::walk(&dir)).into_iter().map(Path::to_path_buf).collect();
+    let files_in_dir: Vec<PathBuf> = fs_tree::flatten_files(&fs_tree::walk(&dir, false)).into_iter().map(Path::to_path_buf).collect();
 
     let outcome = run_search(&files_in_dir, "needle");
 
@@ -834,4 +834,376 @@ fn delete_path_on_a_missing_path_toasts_an_error_instead_of_panicking() {
         state.toasts.iter().any(|t| t.kind == ToastKind::Error),
         "a delete that can't happen should surface as an error toast"
     );
+}
+
+// --- AI Chat Assist: state/message handling (no real subprocess — that
+// end of the pipeline is proven separately, by `devscribe_core::
+// claude_agent`'s own `#[ignore]`d end-to-end test against the real
+// `claude` CLI). What's exercised here is purely the reducer logic: does
+// `update()` translate `ClaudeEvent`s and UI actions into the right
+// `ChatThread`/`ChatMode` changes.
+
+#[test]
+fn chat_toggle_opens_docked_from_fully_closed() {
+    let mut state = State { chat_mode: ChatMode::Closed, chat_tab_open: false, ..State::default() };
+    let _ = update(&mut state, Message::ChatToggle);
+    assert_eq!(state.chat_mode, ChatMode::Docked);
+}
+
+#[test]
+fn chat_toggle_closes_from_any_open_presentation() {
+    for mode in [ChatMode::Docked, ChatMode::Collapsed, ChatMode::Window] {
+        let mut state = State { chat_mode: mode, ..State::default() };
+        let _ = update(&mut state, Message::ChatToggle);
+        assert_eq!(state.chat_mode, ChatMode::Closed, "toggling off from {mode:?} should fully close");
+    }
+}
+
+#[test]
+fn chat_toggle_from_tab_mode_closes_both_instead_of_leaving_a_dual_presentation() {
+    // Opening as a tab sets `chat_mode` to `Closed` already (see
+    // `Message::ChatOpenTab`), so a naive "flip chat_mode" toggle would
+    // turn it back to `Docked` while `chat_tab_open` was still `true` —
+    // showing the panel both docked *and* as a tab at once.
+    let mut state = State { chat_mode: ChatMode::Closed, chat_tab_open: true, ..State::default() };
+    assert!(chat_is_active(&state));
+
+    let _ = update(&mut state, Message::ChatToggle);
+
+    assert_eq!(state.chat_mode, ChatMode::Closed);
+    assert!(!state.chat_tab_open);
+    assert!(!chat_is_active(&state));
+}
+
+#[test]
+fn chat_is_active_true_while_open_as_a_tab_even_though_chat_mode_is_closed() {
+    let state = State { chat_mode: ChatMode::Closed, chat_tab_open: true, ..State::default() };
+    assert!(chat_is_active(&state), "a live session as a tab must still count as active");
+}
+
+#[test]
+fn chat_open_tab_switches_presentation_and_focuses_the_chat_tab() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::ChatOpenTab);
+    assert!(state.chat_tab_open);
+    assert_eq!(state.chat_mode, ChatMode::Closed);
+    assert_eq!(state.active_tab, Some(TabKey::Chat));
+}
+
+#[test]
+fn chat_dock_from_tab_returns_to_docked_and_refocuses_away_from_the_chat_tab() {
+    let mut state = State {
+        chat_tab_open: true,
+        chat_mode: ChatMode::Closed,
+        active_tab: Some(TabKey::Chat),
+        ..State::default()
+    };
+    let _ = update(&mut state, Message::ChatDockFromTab);
+    assert!(!state.chat_tab_open);
+    assert_eq!(state.chat_mode, ChatMode::Docked);
+    assert_ne!(state.active_tab, Some(TabKey::Chat));
+}
+
+#[test]
+fn chat_ready_event_installs_the_sender_without_touching_the_transcript() {
+    // `Ready` no longer resets the thread — `SessionStarting` does that,
+    // specifically *before* a resume's history-replay events arrive (see
+    // the test below), so `Ready` arriving afterward must leave whatever
+    // was just replayed alone.
+    let mut state = State::default();
+    state.chat.messages.push(ChatMessage::Assistant("replayed history".to_string()));
+    let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
+
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::Ready(tx)));
+
+    assert!(state.chat.sender.is_some());
+    assert_eq!(state.chat.status, ChatStatus::Ready);
+    assert_eq!(state.chat.messages.len(), 1, "Ready must not clear a transcript that was just replayed");
+}
+
+#[test]
+fn chat_session_starting_event_clears_any_prior_thread() {
+    let mut state = State::default();
+    state.chat.messages.push(ChatMessage::Assistant("leftover from a previous worker instance".to_string()));
+    state.chat.cost_usd = 1.23;
+
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::SessionStarting));
+
+    assert!(state.chat.messages.is_empty());
+    assert_eq!(state.chat.cost_usd, 0.0);
+    assert!(state.chat.sender.is_none());
+}
+
+#[test]
+fn chat_operator_text_event_appends_a_transcript_entry() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::OperatorText("what does this do?".to_string())));
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Operator(t)] if t == "what does this do?"));
+}
+
+#[test]
+fn chat_session_init_records_session_id_and_model() {
+    let mut state = State::default();
+    let _ = update(
+        &mut state,
+        Message::Chat(ClaudeEvent::SessionInit { session_id: "sess-1".to_string(), model: "claude-sonnet-5".to_string() }),
+    );
+    assert_eq!(state.chat.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(state.chat.model.as_deref(), Some("claude-sonnet-5"));
+}
+
+#[test]
+fn chat_assistant_text_appends_a_transcript_entry() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantText("hello".to_string())));
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Assistant(text)] if text == "hello"));
+}
+
+#[test]
+fn chat_tool_use_and_result_correlate_by_id_into_one_entry() {
+    let mut state = State::default();
+    let _ = update(
+        &mut state,
+        Message::Chat(ClaudeEvent::ToolUseStarted {
+            id: "toolu_1".to_string(),
+            name: "Read".to_string(),
+            input: serde_json::json!({"file_path": "/tmp/x.rs"}),
+        }),
+    );
+    let _ = update(
+        &mut state,
+        Message::Chat(ClaudeEvent::ToolResult { id: "toolu_1".to_string(), is_error: false, result: serde_json::json!("contents") }),
+    );
+
+    assert_eq!(state.chat.messages.len(), 1, "the result should update the existing entry, not add a second one");
+    let ChatMessage::Tool(tool) = &state.chat.messages[0] else { panic!("expected a Tool entry") };
+    assert_eq!(tool.name, "Read");
+    assert!(tool.permission.is_none(), "Read never needed a permission decision");
+    let result = tool.result.as_ref().expect("result should be attached");
+    assert!(!result.is_error);
+    assert_eq!(result.result, serde_json::json!("contents"));
+}
+
+#[test]
+fn chat_permission_request_marks_the_matching_tool_pending() {
+    let mut state = State::default();
+    let _ = update(
+        &mut state,
+        Message::Chat(ClaudeEvent::ToolUseStarted {
+            id: "toolu_2".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"file_path": "/tmp/x.rs"}),
+        }),
+    );
+    let _ = update(
+        &mut state,
+        Message::Chat(ClaudeEvent::PermissionRequest {
+            id: "toolu_2".to_string(),
+            tool_name: "Edit".to_string(),
+            tool_input: serde_json::json!({"file_path": "/tmp/x.rs"}),
+        }),
+    );
+
+    assert_eq!(state.chat.messages.len(), 1);
+    let ChatMessage::Tool(tool) = &state.chat.messages[0] else { panic!("expected a Tool entry") };
+    assert_eq!(tool.permission, Some(PermissionState::Pending));
+}
+
+#[test]
+fn chat_permission_request_with_no_prior_tool_use_still_surfaces_defensively() {
+    // Every real capture has `ToolUseStarted` arrive first, but the handler
+    // shouldn't silently drop a pending permission if that's ever not true.
+    let mut state = State::default();
+    let _ = update(
+        &mut state,
+        Message::Chat(ClaudeEvent::PermissionRequest {
+            id: "toolu_3".to_string(),
+            tool_name: "Write".to_string(),
+            tool_input: serde_json::json!({"file_path": "/tmp/y.rs"}),
+        }),
+    );
+    assert_eq!(state.chat.messages.len(), 1);
+    let ChatMessage::Tool(tool) = &state.chat.messages[0] else { panic!("expected a Tool entry") };
+    assert_eq!(tool.name, "Write");
+    assert_eq!(tool.permission, Some(PermissionState::Pending));
+}
+
+#[test]
+fn chat_approve_permission_records_the_decision_and_forwards_it_to_the_worker() {
+    let mut state = State::default();
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.messages.push(ChatMessage::Tool(ToolActivity {
+        id: "toolu_4".to_string(),
+        name: "Edit".to_string(),
+        input: serde_json::Value::Null,
+        permission: Some(PermissionState::Pending),
+        result: None,
+    }));
+
+    let _ = update(&mut state, Message::ChatApprovePermission("toolu_4".to_string()));
+
+    let ChatMessage::Tool(tool) = &state.chat.messages[0] else { panic!("expected a Tool entry") };
+    assert_eq!(tool.permission, Some(PermissionState::Approved));
+    match rx.try_recv() {
+        Ok(ClaudeCommand::RespondPermission { id, approve, .. }) => {
+            assert_eq!(id, "toolu_4");
+            assert!(approve);
+        }
+        other => panic!("expected RespondPermission{{approve: true}}, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_deny_permission_records_the_decision_and_forwards_it_to_the_worker() {
+    let mut state = State::default();
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.messages.push(ChatMessage::Tool(ToolActivity {
+        id: "toolu_5".to_string(),
+        name: "Edit".to_string(),
+        input: serde_json::Value::Null,
+        permission: Some(PermissionState::Pending),
+        result: None,
+    }));
+
+    let _ = update(&mut state, Message::ChatDenyPermission("toolu_5".to_string()));
+
+    let ChatMessage::Tool(tool) = &state.chat.messages[0] else { panic!("expected a Tool entry") };
+    assert_eq!(tool.permission, Some(PermissionState::Denied));
+    match rx.try_recv() {
+        Ok(ClaudeCommand::RespondPermission { id, approve, .. }) => {
+            assert_eq!(id, "toolu_5");
+            assert!(!approve);
+        }
+        other => panic!("expected RespondPermission{{approve: false}}, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_turn_result_accumulates_cost_and_replaces_token_counts() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::TurnResult { cost_usd: 0.01, input_tokens: 100, output_tokens: 20 }));
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::TurnResult { cost_usd: 0.02, input_tokens: 150, output_tokens: 40 }));
+
+    assert!((state.chat.cost_usd - 0.03).abs() < f64::EPSILON, "cost should accumulate across turns");
+    assert_eq!(state.chat.input_tokens, 150, "token counts reflect the latest turn, not a running total");
+    assert_eq!(state.chat.output_tokens, 40);
+}
+
+#[test]
+fn chat_unavailable_event_clears_the_sender_and_records_the_reason() {
+    let mut state = State::default();
+    let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::Unavailable("claude not found".to_string())));
+
+    assert!(state.chat.sender.is_none());
+    assert_eq!(state.chat.status, ChatStatus::Unavailable("claude not found".to_string()));
+}
+
+#[test]
+fn chat_submit_pushes_an_operator_message_clears_the_draft_and_sends_the_prompt() {
+    let mut state = State::default();
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.input = "  explain this bug  ".to_string();
+
+    let _ = update(&mut state, Message::ChatSubmit);
+
+    assert!(state.chat.input.is_empty());
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Operator(text)] if text == "explain this bug"));
+    match rx.try_recv() {
+        Ok(ClaudeCommand::SendPrompt(text)) => assert_eq!(text, "explain this bug"),
+        other => panic!("expected SendPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_submit_with_no_live_session_does_nothing() {
+    let mut state = State::default();
+    state.chat.input = "hello".to_string();
+    let _ = update(&mut state, Message::ChatSubmit);
+    assert_eq!(state.chat.input, "hello", "nothing to send to, so the draft should be left alone");
+    assert!(state.chat.messages.is_empty());
+}
+
+#[test]
+fn chat_submit_ignores_a_blank_draft() {
+    let mut state = State::default();
+    let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.input = "   ".to_string();
+    let _ = update(&mut state, Message::ChatSubmit);
+    assert!(state.chat.messages.is_empty());
+}
+
+#[test]
+fn chat_resize_dragged_computes_width_from_the_right_edge_and_clamps() {
+    let mut state = State { chat_resizing: true, window_width: 1280.0, ..State::default() };
+
+    let _ = update(&mut state, Message::ChatResizeDragged(1000.0));
+    assert_eq!(state.chat_panel_width, 280.0, "1280 - 1000 == 280, within bounds");
+
+    let _ = update(&mut state, Message::ChatResizeDragged(0.0));
+    assert_eq!(state.chat_panel_width, CHAT_MAX_WIDTH, "1280 - 0 would exceed the max, so it clamps");
+
+    let _ = update(&mut state, Message::ChatResizeDragged(1200.0));
+    assert_eq!(state.chat_panel_width, CHAT_MIN_WIDTH, "1280 - 1200 would be under the min, so it clamps");
+}
+
+#[test]
+fn chat_resize_dragged_is_ignored_when_not_resizing() {
+    let mut state = State { chat_resizing: false, window_width: 1280.0, chat_panel_width: 340.0, ..State::default() };
+    let _ = update(&mut state, Message::ChatResizeDragged(1000.0));
+    assert_eq!(state.chat_panel_width, 340.0);
+}
+
+#[test]
+fn chat_new_session_picks_a_fresh_id_and_clears_the_transcript() {
+    let mut state = State::default();
+    let old_id = state.chat_session_id.clone();
+    state.chat.messages.push(ChatMessage::Assistant("old conversation".to_string()));
+    state.chat_sessions_open = true;
+
+    let _ = update(&mut state, Message::ChatNewSession);
+
+    assert_ne!(state.chat_session_id, old_id, "should be a genuinely new id, not reuse the old one");
+    assert!(!state.chat_session_id.is_empty());
+    assert!(state.chat.messages.is_empty());
+    assert!(!state.chat_sessions_open, "picking a session (new or resumed) should close the picker");
+}
+
+#[test]
+fn chat_resume_session_switches_the_target_id_and_clears_the_transcript() {
+    let mut state = State::default();
+    state.chat.messages.push(ChatMessage::Assistant("wrong conversation".to_string()));
+    state.chat_sessions_open = true;
+
+    let _ = update(&mut state, Message::ChatResumeSession("some-other-session-id".to_string()));
+
+    assert_eq!(state.chat_session_id, "some-other-session-id");
+    assert!(state.chat.messages.is_empty());
+    assert!(!state.chat_sessions_open);
+}
+
+#[test]
+fn chat_toggle_sessions_flips_the_picker_open_flag() {
+    let mut state = State::default();
+    assert!(!state.chat_sessions_open);
+    let _ = update(&mut state, Message::ChatToggleSessions);
+    assert!(state.chat_sessions_open);
+}
+
+#[test]
+fn chat_sessions_loaded_replaces_the_list() {
+    let mut state = State::default();
+    let sessions = vec![devscribe_core::claude_agent::SessionSummary {
+        id: "s1".to_string(),
+        title: "A past chat".to_string(),
+        last_active: std::time::SystemTime::now(),
+    }];
+    let _ = update(&mut state, Message::ChatSessionsLoaded(sessions.clone()));
+    assert_eq!(state.chat_sessions, sessions);
 }

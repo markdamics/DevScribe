@@ -144,7 +144,7 @@ pub fn resolve_binary(spec: &ServerSpec) -> Option<PathBuf> {
     None
 }
 
-fn which_binary(name: &str) -> bool {
+pub fn which_binary(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()

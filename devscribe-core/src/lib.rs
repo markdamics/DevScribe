@@ -1,3 +1,4 @@
+pub mod claude_agent;
 pub mod diff;
 pub mod document;
 pub mod git;

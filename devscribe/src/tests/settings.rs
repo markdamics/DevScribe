@@ -49,6 +49,13 @@ fn density_key_round_trips_through_density_from_key_for_every_density() {
 }
 
 #[test]
+fn chat_mode_key_round_trips_through_chat_mode_from_key_for_every_mode() {
+    for mode in ChatMode::ALL {
+        assert_eq!(chat_mode_from_key(chat_mode_key(mode)), Some(mode), "{mode:?} must round-trip through its own key");
+    }
+}
+
+#[test]
 fn mode_from_key_rejects_an_unrecognized_key() {
     assert_eq!(mode_from_key("NotARealTheme"), None);
 }
@@ -66,9 +73,12 @@ fn sample_settings() -> Settings {
         ui_font_scale: 1.2,
         editor_font_size: 16.0,
         git_status_in_tree: true,
+        show_hidden_files: true,
         problem_lens_enabled: false,
         save_on_focus_loss: true,
         lsp_enabled: false,
+        chat_mode: ChatMode::Window,
+        chat_panel_width: 420.0,
     }
 }
 

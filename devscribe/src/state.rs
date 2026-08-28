@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent};
 use devscribe_core::diff::DiffLine;
 use devscribe_core::git::{ChangeKind, Repo};
 use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguage};
@@ -30,6 +31,10 @@ pub enum TabKey {
     /// which is where the actual `DiffStatus` lives.
     Diff(PathBuf),
     Search,
+    /// The AI Chat Assist panel, opened as a full tab instead of docked —
+    /// like `Search`, never backed by an `OpenTab` entry; the actual
+    /// conversation lives on `State::chat` regardless of presentation.
+    Chat,
 }
 
 /// One entry in `State::open_tabs`. Search isn't one of these — it's a
@@ -303,7 +308,7 @@ pub enum PaletteAction {
     /// nothing open at all, as long as *something* in the tree has changed.
     ViewWorkingTreeDiff,
     CloseActiveTab,
-    ToggleAssist,
+    ChatToggle,
     ToggleProjects,
     ToggleProblemLens,
     IncreaseEditorFontSize,
@@ -822,6 +827,115 @@ pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 560.0;
 pub const SIDEBAR_DEFAULT_WIDTH: f32 = 272.0;
 
+/// AI Chat Assist docked-panel width bounds — same drag-handle idiom as the
+/// sidebar's, just anchored to the right edge instead of the left.
+pub const CHAT_MIN_WIDTH: f32 = 280.0;
+pub const CHAT_MAX_WIDTH: f32 = 560.0;
+pub const CHAT_DEFAULT_WIDTH: f32 = 340.0;
+
+/// How the AI Chat Assist panel is currently presented. Replaces the old
+/// bare `assist_on: bool` placeholder — there was no panel behind that
+/// toggle at all before this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMode {
+    Docked,
+    Collapsed,
+    Window,
+    Closed,
+}
+
+impl ChatMode {
+    pub const ALL: [ChatMode; 4] = [ChatMode::Docked, ChatMode::Collapsed, ChatMode::Window, ChatMode::Closed];
+}
+
+/// `true` whenever a live `claude` session should exist — either the
+/// docked/collapsed/floating presentation is on, *or* it's open as a full
+/// tab. Opening as a tab sets `chat_mode` to `Closed` (the docked panel and
+/// the tab view are mutually exclusive presentations of the same session),
+/// so `chat_mode != Closed` alone isn't the right "is chat active" check —
+/// unlike the source mockup's own `chatLamp`, which checks `chatMode`
+/// alone and so would show "off" while genuinely live as a tab.
+pub fn chat_is_active(state: &State) -> bool {
+    state.chat_mode != ChatMode::Closed || state.chat_tab_open
+}
+
+/// One entry in the chat transcript. A tool call is a single evolving
+/// entry (`Tool`) rather than separate "started"/"result" messages: the
+/// wire protocol reports both under the same id (see
+/// `devscribe_core::claude_agent`), and a gated call additionally reports
+/// a `PermissionRequest` under that *same* id, so keeping one entry keyed
+/// by id — rather than a separate `pending_permission` field that could
+/// drift out of sync with the transcript — is the simpler, single-source
+/// of truth.
+#[derive(Debug, Clone)]
+pub enum ChatMessage {
+    Operator(String),
+    Assistant(String),
+    Tool(ToolActivity),
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolActivity {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    /// `None` for tools that never needed a human decision (Read/Grep/...).
+    pub permission: Option<PermissionState>,
+    /// `None` while still running.
+    pub result: Option<ToolActivityResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionState {
+    Pending,
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolActivityResult {
+    pub is_error: bool,
+    pub result: serde_json::Value,
+}
+
+/// Whether the chat subprocess is up yet — drives what the panel shows
+/// before the first `Ready` event (or if `claude` isn't on PATH at all).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ChatStatus {
+    #[default]
+    Starting,
+    Ready,
+    Unavailable(String),
+}
+
+/// The AI Chat Assist conversation and session bookkeeping — independent
+/// of presentation (`State::chat_mode`/`chat_tab_open`), so switching
+/// between docked/collapsed/window/tab never loses the thread. Reset to
+/// `ChatThread::default()` whenever a new `claude` subprocess is spawned
+/// (see `Message::Chat(ClaudeEvent::Ready)`).
+#[derive(Debug, Clone, Default)]
+pub struct ChatThread {
+    pub messages: Vec<ChatMessage>,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// The input bar's current draft text.
+    pub input: String,
+    pub sender: Option<mpsc::Sender<ClaudeCommand>>,
+    pub status: ChatStatus,
+}
+
+impl ChatThread {
+    fn find_tool_mut(&mut self, id: &str) -> Option<&mut ToolActivity> {
+        self.messages.iter_mut().rev().find_map(|m| match m {
+            ChatMessage::Tool(tool) if tool.id == id => Some(tool),
+            _ => None,
+        })
+    }
+}
+
 pub struct State {
     pub theme_mode: ThemeMode,
     pub accent: Accent,
@@ -829,7 +943,44 @@ pub struct State {
     pub open_tabs: Vec<OpenTab>,
     /// `None` only when `open_tabs` is empty.
     pub active_tab: Option<TabKey>,
-    pub assist_on: bool,
+    pub chat_mode: ChatMode,
+    /// `true` while the AI Chat Assist panel is open as a full tab instead
+    /// of docked/collapsed/floating — see `TabKey::Chat`/`chat_is_active`.
+    pub chat_tab_open: bool,
+    /// Docked chat panel width in logical pixels — same drag-handle idiom
+    /// as `sidebar_width`, clamped to `[CHAT_MIN_WIDTH, CHAT_MAX_WIDTH]`.
+    pub chat_panel_width: f32,
+    /// `true` while the chat panel's resize handle is being dragged — mirrors
+    /// `sidebar_resizing`.
+    pub chat_resizing: bool,
+    /// Bumped to force `subscription()` to tear down and respawn the chat
+    /// worker for the *same* session id — reserved for a future "retry
+    /// after the process died" action, not currently wired to any UI.
+    /// Mirrors `lsp_restart_token`.
+    pub chat_restart_token: u64,
+    /// The session id `chat_worker` will spawn or resume next — never
+    /// `None`: `State::default()`/`reset_project_scoped_state` always seed
+    /// a fresh one (see `claude_agent::new_session_id`). Whether the
+    /// worker treats it as a brand-new session or resumes an existing one
+    /// is decided by the worker itself, by checking whether a transcript
+    /// for this id already exists (`claude_agent::session_exists`) — not
+    /// tracked as separate state here, so there's nothing to keep in sync
+    /// when e.g. reopening the panel after closing it naturally turns into
+    /// a resume of the same conversation.
+    pub chat_session_id: String,
+    /// Past sessions for the current project, most recently active first —
+    /// populated on demand (`Message::ChatToggleSessions` opening the
+    /// picker), not kept live, since it only reflects a filesystem scan at
+    /// the moment it was requested.
+    pub chat_sessions: Vec<claude_agent::SessionSummary>,
+    pub chat_sessions_open: bool,
+    pub chat: ChatThread,
+    /// Current window width in logical pixels — tracked only for the chat
+    /// panel's right-edge resize math (`window_width - cursor_x`, since
+    /// unlike the sidebar's left-edge handle, the cursor position alone
+    /// isn't the width). Updated from `iced::window::Event::Opened`/
+    /// `Resized`; starts at `main.rs`'s initial `window_size` request.
+    pub window_width: f32,
     pub projects_open: bool,
     pub overflow_open: bool,
     /// `true` collapses the sidebar to a narrow icon rail (project glyph +
@@ -933,6 +1084,11 @@ pub struct State {
     /// Doesn't affect the separate "CHANGES" panel, which has its own
     /// collapse toggle.
     pub git_status_in_tree: bool,
+    /// Gates the file tree walk (`fs_tree::walk`) itself: when off (the
+    /// default), dotfiles/dot-dirs and `fs_tree::SKIP_DIRS` (`.git`,
+    /// `target`, `node_modules`, …) are omitted from `state.tree`; when on,
+    /// every entry shows. Toggling it re-walks via `refresh_tree`.
+    pub show_hidden_files: bool,
     /// When on, every dirty open file is saved as soon as the app window
     /// loses focus (see `Message::WindowUnfocused`). Off by default —
     /// unlike the other toggles in this struct, this one silently writes to
@@ -1002,8 +1158,8 @@ pub struct LoadedProject {
 /// Walks `root`'s file tree and computes its git summary — the expensive
 /// part of "open a project," shared by `State::default()`'s startup
 /// auto-reopen and `start_loading_project`'s background loader.
-fn snapshot_project(root: &Path) -> ProjectSnapshot {
-    let tree = fs_tree::walk(root);
+fn snapshot_project(root: &Path, show_hidden: bool) -> ProjectSnapshot {
+    let tree = fs_tree::walk(root, show_hidden);
     // Directories start collapsed — an uncollapsed default would dump the
     // whole project tree open on first view.
     let collapsed_dirs: HashSet<PathBuf> =
@@ -1084,14 +1240,14 @@ struct Startup {
 /// every recorded path having vanished both fall through to the welcome
 /// screen, same as explicitly closing a project.
 #[cfg(not(test))]
-fn startup() -> Startup {
+fn startup(show_hidden: bool) -> Startup {
     let mut recent_projects = recent_projects::load();
     let reopen = recent_projects.iter().find(|p| p.path.is_dir()).map(|p| p.path.clone());
 
     match reopen {
         Some(root) => {
             recent_projects::touch(&mut recent_projects, root.clone());
-            let snapshot = snapshot_project(&root);
+            let snapshot = snapshot_project(&root, show_hidden);
             let repo = Repo::open(&root);
             let welcome_rows = compute_welcome_rows(&recent_projects);
             Startup { welcome_open: false, root, snapshot, repo, recent_projects, welcome_rows }
@@ -1114,7 +1270,7 @@ fn startup() -> Startup {
 /// `State::default()`'s project fields (see e.g. the `changed_files`
 /// comment a few tests down) and overriding what they need explicitly.
 #[cfg(test)]
-fn startup() -> Startup {
+fn startup(_show_hidden: bool) -> Startup {
     Startup {
         welcome_open: true,
         root: PathBuf::new(),
@@ -1145,15 +1301,24 @@ fn startup_settings() -> settings::Settings {
 
 impl Default for State {
     fn default() -> Self {
-        let Startup { welcome_open, root, snapshot, repo, recent_projects, welcome_rows } = startup();
         let settings = startup_settings();
+        let Startup { welcome_open, root, snapshot, repo, recent_projects, welcome_rows } = startup(settings.show_hidden_files);
 
         Self {
             theme_mode: settings.theme_mode,
             accent: settings.accent,
             open_tabs: Vec::new(),
             active_tab: None,
-            assist_on: true,
+            chat_mode: settings.chat_mode,
+            chat_tab_open: false,
+            chat_panel_width: settings.chat_panel_width,
+            chat_resizing: false,
+            chat_restart_token: 0,
+            chat_session_id: claude_agent::new_session_id(),
+            chat_sessions: Vec::new(),
+            chat_sessions_open: false,
+            chat: ChatThread::default(),
+            window_width: 1280.0,
             projects_open: false,
             overflow_open: false,
             sidebar_collapsed: false,
@@ -1188,6 +1353,7 @@ impl Default for State {
             settings_open: false,
             settings_category: SettingsCategory::default(),
             git_status_in_tree: settings.git_status_in_tree,
+            show_hidden_files: settings.show_hidden_files,
             save_on_focus_loss: settings.save_on_focus_loss,
             density: settings.density,
             problem_lens_enabled: settings.problem_lens_enabled,
@@ -1212,7 +1378,6 @@ pub enum Message {
     CloseTab(TabKey),
     CloseActiveTab,
     FocusSearchTab,
-    ToggleAssist,
     ToggleProjects,
     ToggleOverflow,
     CollapseSidebar,
@@ -1225,6 +1390,51 @@ pub enum Message {
     SidebarResizeDragged(f32),
     SidebarResizeEnded,
     ToggleChangesPanel,
+    /// Opens the panel if closed (docked), closes it if it's presented any
+    /// other way — mirrors the title-bar button's old `ToggleAssist`
+    /// behavior, and the mockup's own `toggleChat`.
+    ChatToggle,
+    ChatDock,
+    ChatCollapse,
+    ChatPopOut,
+    ChatClose,
+    /// "Open as tab" — see `TabKey::Chat`/`chat_is_active`.
+    ChatOpenTab,
+    /// Leaves tab presentation and returns to the docked panel.
+    ChatDockFromTab,
+    /// The chat tab's own × — unlike `ChatDockFromTab`, this closes the
+    /// panel outright rather than re-docking it (matches the mockup: its
+    /// tab-bar close handler only clears `chatTabOpen`, leaving `chatMode`
+    /// wherever it already was — `Closed`, since opening as a tab set it
+    /// there).
+    ChatCloseTab,
+    ChatInputChanged(String),
+    /// Enter (or the input bar's send action) — submits `state.chat.input`
+    /// as a new turn and clears the draft.
+    ChatSubmit,
+    /// An event from the running `claude` subprocess (see `chat_worker`).
+    Chat(ClaudeEvent),
+    ChatApprovePermission(String),
+    ChatDenyPermission(String),
+    /// Pressed the chat panel's edge resize handle.
+    ChatResizeStarted,
+    /// Cursor moved while resizing — carries the cursor's window-space X
+    /// position; the new width is `window_width - x` since the handle sits
+    /// on the panel's *left* edge (the panel itself is docked to the right).
+    ChatResizeDragged(f32),
+    ChatResizeEnded,
+    /// Starts a genuinely fresh session (new random id — see
+    /// `claude_agent::new_session_id`), replacing whatever session was
+    /// active. The old one isn't lost: it's still on disk, and will show
+    /// up in the session list next time it's opened.
+    ChatNewSession,
+    /// Switches to an existing session by id, picked from `state.chat_sessions`.
+    ChatResumeSession(String),
+    /// Opens/closes the session-picker list. Opening kicks off a
+    /// background scan (`claude_agent::list_sessions`) — see
+    /// `start_loading_chat_sessions`.
+    ChatToggleSessions,
+    ChatSessionsLoaded(Vec<claude_agent::SessionSummary>),
     /// Opens (or focuses) a diff tab for `path`, from a sidebar Changes row.
     /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
     /// targets the currently active tab.
@@ -1297,6 +1507,7 @@ pub enum Message {
     ToggleProblemLens,
     SetSettingsCategory(SettingsCategory),
     ToggleGitStatusInTree,
+    ToggleShowHiddenFiles,
     ToggleSaveOnFocusLoss,
     /// Turns the `rust-analyzer` subscription on/off (see `subscription`).
     /// Switching off drops the running worker (killing its child process,
@@ -1307,6 +1518,9 @@ pub enum Message {
     /// `save_on_focus_loss` is on, else a no-op. Fired from
     /// `iced::window::events()`, not a keybinding.
     WindowUnfocused,
+    /// The window was opened or resized — tracked only for the chat
+    /// panel's right-edge resize math; see `State::window_width`.
+    WindowResized(f32),
     /// Global `⌘/` — opens Settings straight to the Shortcuts category, in
     /// one step rather than `ToggleSettings` + `SetSettingsCategory`.
     OpenShortcutsHelp,
@@ -1403,7 +1617,75 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::FocusSearchTab => focus_search(state),
-        Message::ToggleAssist => state.assist_on = !state.assist_on,
+        Message::ChatToggle => toggle_chat(state),
+        Message::ChatDock => {
+            state.chat_mode = ChatMode::Docked;
+            persist_settings(state);
+        }
+        Message::ChatCollapse => {
+            state.chat_mode = ChatMode::Collapsed;
+            persist_settings(state);
+        }
+        Message::ChatPopOut => {
+            state.chat_mode = ChatMode::Window;
+            persist_settings(state);
+        }
+        Message::ChatClose => {
+            state.chat_mode = ChatMode::Closed;
+            persist_settings(state);
+        }
+        Message::ChatOpenTab => {
+            state.chat_tab_open = true;
+            state.chat_mode = ChatMode::Closed;
+            state.active_tab = Some(TabKey::Chat);
+            persist_settings(state);
+        }
+        Message::ChatDockFromTab => {
+            state.chat_tab_open = false;
+            state.chat_mode = ChatMode::Docked;
+            if state.active_tab == Some(TabKey::Chat) {
+                state.active_tab = state.open_tabs.first().map(|t| t.key());
+            }
+            persist_settings(state);
+        }
+        Message::ChatCloseTab => {
+            state.chat_tab_open = false;
+            if state.active_tab == Some(TabKey::Chat) {
+                state.active_tab = state.open_tabs.first().map(|t| t.key());
+            }
+        }
+        Message::ChatInputChanged(text) => state.chat.input = text,
+        Message::ChatSubmit => submit_chat_prompt(state),
+        Message::Chat(event) => handle_chat_event(state, event),
+        Message::ChatApprovePermission(id) => respond_permission(state, id, true, None),
+        Message::ChatDenyPermission(id) => respond_permission(state, id, false, Some("denied by user".to_string())),
+        Message::ChatResizeStarted => state.chat_resizing = true,
+        Message::ChatResizeDragged(x) => {
+            if state.chat_resizing {
+                state.chat_panel_width = (state.window_width - x).clamp(CHAT_MIN_WIDTH, CHAT_MAX_WIDTH);
+            }
+        }
+        Message::ChatResizeEnded => {
+            state.chat_resizing = false;
+            persist_settings(state);
+        }
+        Message::ChatNewSession => {
+            state.chat_session_id = claude_agent::new_session_id();
+            state.chat = ChatThread::default();
+            state.chat_sessions_open = false;
+        }
+        Message::ChatResumeSession(id) => {
+            state.chat_session_id = id;
+            state.chat = ChatThread::default();
+            state.chat_sessions_open = false;
+        }
+        Message::ChatToggleSessions => {
+            state.chat_sessions_open = !state.chat_sessions_open;
+            if state.chat_sessions_open {
+                return start_loading_chat_sessions(state);
+            }
+        }
+        Message::ChatSessionsLoaded(sessions) => state.chat_sessions = sessions,
         Message::ToggleProjects => state.projects_open = !state.projects_open,
         Message::ToggleOverflow => state.overflow_open = !state.overflow_open,
         Message::CollapseSidebar => {
@@ -1801,6 +2083,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.git_status_in_tree = !state.git_status_in_tree;
             persist_settings(state);
         }
+        Message::ToggleShowHiddenFiles => {
+            state.show_hidden_files = !state.show_hidden_files;
+            persist_settings(state);
+            if !state.root.as_os_str().is_empty() {
+                refresh_tree(state);
+            }
+        }
         Message::ToggleSaveOnFocusLoss => {
             state.save_on_focus_loss = !state.save_on_focus_loss;
             persist_settings(state);
@@ -1832,6 +2121,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 save_all_dirty_files(state);
             }
         }
+        Message::WindowResized(width) => state.window_width = width,
         Message::OpenShortcutsHelp => {
             state.settings_open = true;
             state.settings_category = SettingsCategory::Shortcuts;
@@ -2104,7 +2394,7 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
                 close_tab(state, &key);
             }
         }
-        PaletteAction::ToggleAssist => state.assist_on = !state.assist_on,
+        PaletteAction::ChatToggle => toggle_chat(state),
         PaletteAction::ToggleProjects => state.projects_open = !state.projects_open,
         PaletteAction::ToggleProblemLens => {
             state.problem_lens_enabled = !state.problem_lens_enabled;
@@ -2251,9 +2541,12 @@ fn persist_settings(state: &State) {
         ui_font_scale: state.ui_font_scale,
         editor_font_size: state.editor_font_size,
         git_status_in_tree: state.git_status_in_tree,
+        show_hidden_files: state.show_hidden_files,
         problem_lens_enabled: state.problem_lens_enabled,
         save_on_focus_loss: state.save_on_focus_loss,
         lsp_enabled: state.lsp_enabled,
+        chat_mode: state.chat_mode,
+        chat_panel_width: state.chat_panel_width,
     });
 }
 
@@ -2309,7 +2602,7 @@ pub fn draft_input_id() -> iced::widget::Id {
 /// keyed by absolute path, so existing collapse state for untouched
 /// directories survives a re-walk unchanged.
 fn refresh_tree(state: &mut State) {
-    state.tree = fs_tree::walk(&state.root);
+    state.tree = fs_tree::walk(&state.root, state.show_hidden_files);
 }
 
 fn begin_draft(state: &mut State, kind: DraftKind, dir: PathBuf) -> iced::Task<Message> {
@@ -2494,7 +2787,7 @@ fn delete_path(state: &mut State, target: PathBuf) {
         .map(|t| t.key())
         .filter(|key| match key {
             TabKey::File(path) | TabKey::Diff(path) => path == &target || path.starts_with(&target),
-            TabKey::Search => false,
+            TabKey::Search | TabKey::Chat => false,
         })
         .collect();
     for key in affected {
@@ -2555,7 +2848,7 @@ fn reopen_closed_tab(state: &mut State) {
                 open_or_focus_diff(state, path);
                 return;
             }
-            TabKey::Search => {}
+            TabKey::Search | TabKey::Chat => {}
         }
     }
 }
@@ -2647,7 +2940,7 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
 
     entries.push(PaletteEntry {
         label: "Toggle Assist panel".to_string(),
-        action: PaletteAction::ToggleAssist,
+        action: PaletteAction::ChatToggle,
     });
     entries.push(PaletteEntry {
         label: "Toggle Projects panel".to_string(),
@@ -3101,6 +3394,7 @@ async fn pick_folder() -> Option<PathBuf> {
 fn start_loading_project(state: &mut State, path: PathBuf, init_git: bool) -> iced::Task<Message> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
     state.loading_project = Some(LoadingProject { name, path: path.clone() });
+    let show_hidden = state.show_hidden_files;
 
     iced_runtime::task::blocking(move |mut sender| {
         // Same belt-and-suspenders `catch_unwind` as `start_search`, on top
@@ -3111,7 +3405,7 @@ fn start_loading_project(state: &mut State, path: PathBuf, init_git: bool) -> ic
                 // as a non-repo project rather than losing the pick.
                 Repo::init(&path);
             }
-            LoadedProject { root: path.clone(), snapshot: snapshot_project(&path) }
+            LoadedProject { root: path.clone(), snapshot: snapshot_project(&path, show_hidden) }
         }));
         match outcome {
             Ok(loaded) => {
@@ -3159,6 +3453,16 @@ fn reset_project_scoped_state(state: &mut State) {
     // to `Starting` for a worker that `subscription` won't actually spawn.
     state.lsp_sender = None;
     state.lsp_status = if state.lsp_enabled { LspStatus::default() } else { LspStatus::Disabled };
+    // Same idea as the LSP worker above: `chat_worker` is keyed on
+    // `(root, chat_session_id, ..)`, so a fresh id here (rather than
+    // reusing whatever the previous project was on) is what actually
+    // matters — it guarantees a genuinely new session for the new project
+    // rather than accidentally colliding with an id that happens to mean
+    // something under the old one.
+    state.chat_session_id = claude_agent::new_session_id();
+    state.chat_sessions.clear();
+    state.chat_sessions_open = false;
+    state.chat = ChatThread::default();
 }
 
 fn apply_loaded_project(state: &mut State, loaded: LoadedProject) {
@@ -3198,6 +3502,119 @@ fn is_lsp_language(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .and_then(lsp::LspLanguage::from_extension)
         .is_some()
+}
+
+/// Shared by the title-bar button, `⌘I`, and the command palette entry.
+/// Turns the panel fully off (both the docked/collapsed/window
+/// presentation *and* tab presentation — see `chat_is_active`) if it's on
+/// in any form, else opens it docked. Deliberately doesn't just flip
+/// `chat_mode` between `Docked`/`Closed`: if the panel is currently open as
+/// a tab (`chat_tab_open == true`, which itself already implies
+/// `chat_mode == Closed`), a naive flip would turn `chat_mode` on to
+/// `Docked` *without* clearing `chat_tab_open` — showing both
+/// presentations of the same session at once.
+fn toggle_chat(state: &mut State) {
+    if chat_is_active(state) {
+        state.chat_mode = ChatMode::Closed;
+        state.chat_tab_open = false;
+    } else {
+        state.chat_mode = ChatMode::Docked;
+    }
+    persist_settings(state);
+}
+
+/// Sends the chat input bar's current draft as a new turn: pushes an
+/// `Operator` transcript entry immediately (the wire protocol doesn't echo
+/// the user's own message back in any way worth waiting for) and clears
+/// the draft. A no-op with nothing to send, or with no live session yet
+/// (worker still starting, or `claude` unavailable).
+fn submit_chat_prompt(state: &mut State) {
+    let text = state.chat.input.trim().to_string();
+    if text.is_empty() || state.chat.sender.is_none() {
+        return;
+    }
+    state.chat.input.clear();
+    state.chat.messages.push(ChatMessage::Operator(text.clone()));
+    if let Some(sender) = state.chat.sender.as_mut() {
+        let _ = sender.try_send(ClaudeCommand::SendPrompt(text));
+    }
+}
+
+/// Records the human's decision on `state.chat`'s transcript and forwards
+/// it to the running session so the blocked permission-hook connection
+/// (see `devscribe_core::claude_agent`) can finally answer and let
+/// `claude`'s tool call proceed or fail.
+fn respond_permission(state: &mut State, id: String, approve: bool, reason: Option<String>) {
+    if let Some(tool) = state.chat.find_tool_mut(&id) {
+        tool.permission = Some(if approve { PermissionState::Approved } else { PermissionState::Denied });
+    }
+    if let Some(sender) = state.chat.sender.as_mut() {
+        let _ = sender.try_send(ClaudeCommand::RespondPermission { id, approve, reason });
+    }
+}
+
+/// Applies one event from the running `claude` subprocess to `state.chat`.
+/// `Ready` resets the whole thread rather than just recording the new
+/// sender: it fires once per subprocess spawn (a fresh project, or the
+/// panel re-opening after being fully closed — see `chat_is_active`), and
+/// this pass doesn't resume a previous session (no `--resume`/`--session-id`
+/// yet), so a prior transcript's messages describe a conversation the new
+/// process has no memory of. Leaving them on screen would be misleading,
+/// not just stale.
+fn handle_chat_event(state: &mut State, event: ClaudeEvent) {
+    match event {
+        // Always the first event from a freshly (re)spawned worker — see
+        // its own doc comment. Clearing here, rather than on `Ready`,
+        // matters specifically for a resume: history-replay events land
+        // *before* `Ready` (the worker only sends `Ready` once the live
+        // process is actually up), so clearing on `Ready` would wipe out
+        // the very history it just replayed.
+        ClaudeEvent::SessionStarting => state.chat = ChatThread::default(),
+        ClaudeEvent::Ready(sender) => {
+            state.chat.sender = Some(sender);
+            state.chat.status = ChatStatus::Ready;
+        }
+        ClaudeEvent::SessionInit { session_id, model } => {
+            state.chat.session_id = Some(session_id);
+            state.chat.model = Some(model);
+        }
+        ClaudeEvent::AssistantText(text) => state.chat.messages.push(ChatMessage::Assistant(text)),
+        ClaudeEvent::OperatorText(text) => state.chat.messages.push(ChatMessage::Operator(text)),
+        ClaudeEvent::ToolUseStarted { id, name, input } => {
+            state.chat.messages.push(ChatMessage::Tool(ToolActivity { id, name, input, permission: None, result: None }));
+        }
+        ClaudeEvent::ToolResult { id, is_error, result } => {
+            if let Some(tool) = state.chat.find_tool_mut(&id) {
+                tool.result = Some(ToolActivityResult { is_error, result });
+            }
+        }
+        ClaudeEvent::PermissionRequest { id, tool_name, tool_input } => {
+            if let Some(tool) = state.chat.find_tool_mut(&id) {
+                tool.permission = Some(PermissionState::Pending);
+            } else {
+                // Defensive: every observed real run has `ToolUseStarted`
+                // arrive before the matching `PermissionRequest` for the
+                // same id, but don't silently drop a real pending
+                // permission on the floor if that ordering ever surprises.
+                state.chat.messages.push(ChatMessage::Tool(ToolActivity {
+                    id,
+                    name: tool_name,
+                    input: tool_input,
+                    permission: Some(PermissionState::Pending),
+                    result: None,
+                }));
+            }
+        }
+        ClaudeEvent::TurnResult { cost_usd, input_tokens, output_tokens } => {
+            state.chat.cost_usd += cost_usd;
+            state.chat.input_tokens = input_tokens;
+            state.chat.output_tokens = output_tokens;
+        }
+        ClaudeEvent::Unavailable(reason) => {
+            state.chat.status = ChatStatus::Unavailable(reason);
+            state.chat.sender = None;
+        }
+    }
 }
 
 fn send_did_open_for(state: &mut State, path: &Path) {
@@ -3278,6 +3695,22 @@ fn start_server_install(language: LspLanguage) -> iced::Task<Message> {
     .map(Message::ServerInstallComplete)
 }
 
+/// Scans `~/.claude/projects/...` for this project's past sessions on its
+/// own OS thread (`claude_agent::list_sessions` does real filesystem
+/// I/O — a directory listing plus reading a chunk of each transcript for
+/// its title), same `iced_runtime::task::blocking` vehicle as
+/// `start_server_install`, so opening the session picker can never stall
+/// the UI even on a project with a long chat history.
+fn start_loading_chat_sessions(state: &State) -> iced::Task<Message> {
+    let root = state.root.clone();
+    iced_runtime::task::blocking(move |mut sender| {
+        let sessions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_agent::list_sessions(&root)))
+            .unwrap_or_default();
+        let _ = sender.try_send(sessions);
+    })
+    .map(Message::ChatSessionsLoaded)
+}
+
 fn utf16_col_to_char_col(line: &str, utf16_col: usize) -> usize {
     let mut utf16_count = 0usize;
     for (char_idx, ch) in line.chars().enumerate() {
@@ -3339,6 +3772,59 @@ fn file_watcher(root: &PathBuf) -> impl iced::futures::Stream<Item = Vec<WatchEv
     })
 }
 
+/// Keyed on `(root, chat_restart_token)`, mirroring `lsp_worker`'s
+/// `(root, language, lsp_restart_token)` keying: a project switch tears
+/// down and respawns the session automatically, and bumping the restart
+/// token (not currently wired to any UI — reserved for a future "new
+/// thread" action) forces a respawn on the same project. Binary resolution
+/// and `devscribe_exe` (needed so the generated permission hook re-invokes
+/// *this* binary) happen inside the async body, same as `lsp_worker` does
+/// for its own binary, so the main thread never blocks either.
+/// Keyed on `(root, session_id, chat_restart_token)`: a project switch or
+/// picking a different session (`Message::ChatNewSession`/
+/// `ChatResumeSession`) both change the key, so `subscription()` tears
+/// down and respawns automatically, same as `lsp_worker`.
+fn chat_worker((root, session_id, _token): &(PathBuf, String, u64)) -> impl iced::futures::Stream<Item = ClaudeEvent> + use<> {
+    let root = root.clone();
+    let session_id = session_id.clone();
+    iced::stream::channel(32, async move |mut output| {
+        use iced::futures::SinkExt as _;
+        // First, always — see `ClaudeEvent::SessionStarting`'s own doc.
+        let _ = output.send(ClaudeEvent::SessionStarting).await;
+
+        if !crate::server_install::which_binary("claude") {
+            let _ = output
+                .send(ClaudeEvent::Unavailable(
+                    "claude CLI not found on PATH — install: https://claude.ai/download".to_string(),
+                ))
+                .await;
+            return;
+        }
+        let devscribe_exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = output.send(ClaudeEvent::Unavailable(format!("couldn't resolve devscribe's own path: {err}"))).await;
+                return;
+            }
+        };
+
+        // Whether this id already has a transcript is the sole signal for
+        // new-vs-resume (see `claude_agent::session_exists`) — so e.g.
+        // reopening the panel after closing it (same id, no explicit
+        // "new"/"resume" click in between) naturally becomes a resume, with
+        // nothing else needing to track that it should.
+        let resume = claude_agent::session_exists(&root, &session_id);
+        if resume {
+            for event in claude_agent::load_session_history(&root, &session_id) {
+                if output.send(event).await.is_err() {
+                    return;
+                }
+            }
+        }
+        claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, session_id, resume, output).await;
+    })
+}
+
 /// Ctrl/Cmd+K (palette), Ctrl/Cmd+S (save), and Escape (close whatever
 /// overlay is open) — global shortcuts that work regardless of which widget
 /// has focus. `keyboard::listen()` only sees events no focused widget
@@ -3386,7 +3872,7 @@ fn global_keys(event: keyboard::Event) -> Message {
                 return Message::ViewWorkingTreeDiff;
             }
             if c.eq_ignore_ascii_case("i") {
-                return Message::ToggleAssist;
+                return Message::ChatToggle;
             }
             if c.eq_ignore_ascii_case("/") {
                 return Message::OpenShortcutsHelp;
@@ -3408,12 +3894,13 @@ fn global_keys(event: keyboard::Event) -> Message {
     Message::Noop
 }
 
-/// Maps `iced::window::events()` to `Message::WindowUnfocused` on the one
-/// variant `save_on_focus_loss` cares about — every other window event
-/// (resize, move, redraw…) is a no-op here.
+/// Maps `iced::window::events()` to `Message::WindowUnfocused`/`WindowResized`,
+/// the two variants anything here cares about — every other window event
+/// (move, redraw…) is a no-op.
 fn window_events((_id, event): (iced::window::Id, iced::window::Event)) -> Message {
     match event {
         iced::window::Event::Unfocused => Message::WindowUnfocused,
+        iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size) => Message::WindowResized(size.width),
         _ => Message::Noop,
     }
 }
@@ -3428,6 +3915,16 @@ fn sidebar_resize_events(event: iced::Event, _status: iced::event::Status, _wind
     match event {
         iced::Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::SidebarResizeDragged(position.x)),
         iced::Event::Mouse(mouse::Event::ButtonReleased(_)) => Some(Message::SidebarResizeEnded),
+        _ => None,
+    }
+}
+
+/// Same window-wide cursor tracking as `sidebar_resize_events`, for the
+/// chat panel's own drag handle. Only subscribed while `state.chat_resizing`.
+fn chat_resize_events(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::ChatResizeDragged(position.x)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(_)) => Some(Message::ChatResizeEnded),
         _ => None,
     }
 }
@@ -3453,6 +3950,15 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     if !state.welcome_open {
         subs.push(iced::Subscription::run_with(state.root.clone(), file_watcher).map(Message::FilesChanged));
     }
+    // No chat worker with no project open, and none while the panel is
+    // fully closed (not even as a tab) — see `chat_is_active`. Torn down
+    // and respawned (see `chat_worker`'s own doc comment for exactly when)
+    // whenever this becomes true again, the project changes, the target
+    // session changes, or `chat_restart_token` is bumped.
+    if !state.welcome_open && chat_is_active(state) {
+        let key = (state.root.clone(), state.chat_session_id.clone(), state.chat_restart_token);
+        subs.push(iced::Subscription::run_with(key, chat_worker).map(Message::Chat));
+    }
     // Only ticks while there's an actual pending debounce to check
     // (`search_query_changed_at` goes back to `None` the moment a search
     // starts — see `Message::SearchDebounceTick`/`SearchSubmit`), *not* a
@@ -3468,6 +3974,9 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     }
     if state.sidebar_resizing {
         subs.push(iced::event::listen_with(sidebar_resize_events));
+    }
+    if state.chat_resizing {
+        subs.push(iced::event::listen_with(chat_resize_events));
     }
     iced::Subscription::batch(subs)
 }

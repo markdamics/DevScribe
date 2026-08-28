@@ -1,3 +1,4 @@
+pub mod chat_panel;
 pub mod command_palette;
 pub mod completions;
 pub mod context_menu;

@@ -7,6 +7,7 @@
 //! this gets written, called at the end of every settings-changing
 //! `Message` arm, so no such change can silently forget to save.
 use crate::density::Density;
+use crate::state::ChatMode;
 use devscribe_core::theme::{Accent, ThemeMode};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -22,9 +23,12 @@ pub struct Settings {
     pub ui_font_scale: f32,
     pub editor_font_size: f32,
     pub git_status_in_tree: bool,
+    pub show_hidden_files: bool,
     pub problem_lens_enabled: bool,
     pub save_on_focus_loss: bool,
     pub lsp_enabled: bool,
+    pub chat_mode: ChatMode,
+    pub chat_panel_width: f32,
 }
 
 impl Default for Settings {
@@ -39,9 +43,12 @@ impl Default for Settings {
             ui_font_scale: crate::state::UI_FONT_SCALE_DEFAULT,
             editor_font_size: crate::state::EDITOR_FONT_SIZE_DEFAULT,
             git_status_in_tree: true,
+            show_hidden_files: false,
             problem_lens_enabled: true,
             save_on_focus_loss: false,
             lsp_enabled: true,
+            chat_mode: ChatMode::Docked,
+            chat_panel_width: crate::state::CHAT_DEFAULT_WIDTH,
         }
     }
 }
@@ -69,12 +76,18 @@ struct SettingsFile {
     editor_font_size: f32,
     #[serde(default = "default_true")]
     git_status_in_tree: bool,
+    #[serde(default)]
+    show_hidden_files: bool,
     #[serde(default = "default_true")]
     problem_lens_enabled: bool,
     #[serde(default)]
     save_on_focus_loss: bool,
     #[serde(default = "default_true")]
     lsp_enabled: bool,
+    #[serde(default)]
+    chat_mode: String,
+    #[serde(default = "default_chat_panel_width")]
+    chat_panel_width: f32,
 }
 
 fn default_true() -> bool {
@@ -87,6 +100,10 @@ fn default_ui_font_scale() -> f32 {
 
 fn default_editor_font_size() -> f32 {
     crate::state::EDITOR_FONT_SIZE_DEFAULT
+}
+
+fn default_chat_panel_width() -> f32 {
+    crate::state::CHAT_DEFAULT_WIDTH
 }
 
 fn store_path() -> Option<PathBuf> {
@@ -131,6 +148,19 @@ fn density_from_key(key: &str) -> Option<Density> {
     Density::ALL.into_iter().find(|density| density_key(*density) == key)
 }
 
+fn chat_mode_key(mode: ChatMode) -> &'static str {
+    match mode {
+        ChatMode::Docked => "Docked",
+        ChatMode::Collapsed => "Collapsed",
+        ChatMode::Window => "Window",
+        ChatMode::Closed => "Closed",
+    }
+}
+
+fn chat_mode_from_key(key: &str) -> Option<ChatMode> {
+    ChatMode::ALL.into_iter().find(|mode| chat_mode_key(*mode) == key)
+}
+
 /// The persisted settings, falling back to `Settings::default()` wholesale
 /// (missing file, unreadable file, corrupt JSON) or field-by-field (an
 /// unrecognized enum key — including every key from the pre-Maho
@@ -154,9 +184,12 @@ fn load_from(path: &Path) -> Option<Settings> {
         ui_font_scale: file.ui_font_scale,
         editor_font_size: file.editor_font_size,
         git_status_in_tree: file.git_status_in_tree,
+        show_hidden_files: file.show_hidden_files,
         problem_lens_enabled: file.problem_lens_enabled,
         save_on_focus_loss: file.save_on_focus_loss,
         lsp_enabled: file.lsp_enabled,
+        chat_mode: chat_mode_from_key(&file.chat_mode).unwrap_or(defaults.chat_mode),
+        chat_panel_width: file.chat_panel_width,
     })
 }
 
@@ -183,9 +216,12 @@ fn save_to(path: &Path, settings: &Settings) {
         ui_font_scale: settings.ui_font_scale,
         editor_font_size: settings.editor_font_size,
         git_status_in_tree: settings.git_status_in_tree,
+        show_hidden_files: settings.show_hidden_files,
         problem_lens_enabled: settings.problem_lens_enabled,
         save_on_focus_loss: settings.save_on_focus_loss,
         lsp_enabled: settings.lsp_enabled,
+        chat_mode: chat_mode_key(settings.chat_mode).to_string(),
+        chat_panel_width: settings.chat_panel_width,
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(path, json);
