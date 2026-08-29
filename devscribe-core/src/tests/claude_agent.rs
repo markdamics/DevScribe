@@ -193,6 +193,39 @@ fn load_session_history_is_empty_for_a_missing_transcript() {
     assert!(load_session_history(&project.root, "does-not-exist").is_empty());
 }
 
+/// `--include-partial-messages`'s live-typing chunks — captured against the
+/// real CLI (v2.1.251): `content_block_delta`/`text_delta` is the only
+/// delta shape that should surface as `AssistantTextDelta`. A sibling
+/// `thinking_delta` (extended-thinking output, not shown in the transcript
+/// today) must be ignored rather than mistaken for visible text.
+#[test]
+fn stream_event_text_delta_becomes_an_assistant_text_delta() {
+    let mut model = None;
+    let line = json!({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Hel"}},
+        "session_id": "s1",
+    })
+    .to_string();
+
+    let events = handle_stdout_line(&line, &mut model);
+
+    assert!(matches!(events.as_slice(), [ClaudeEvent::AssistantTextDelta(t)] if t == "Hel"));
+}
+
+#[test]
+fn stream_event_thinking_delta_produces_no_event() {
+    let mut model = None;
+    let line = json!({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}},
+        "session_id": "s1",
+    })
+    .to_string();
+
+    assert!(handle_stdout_line(&line, &mut model).is_empty());
+}
+
 /// Real regression test for `TempFiles`: cancels `run`'s future mid-flight
 /// (via `select!` racing it against a cancellation signal — the same
 /// "future gets dropped mid-`.await`, not run to completion" shape as
@@ -237,7 +270,7 @@ fn temp_files_are_cleaned_up_even_when_run_is_cancelled_mid_await() {
     let handle = std::thread::spawn(move || {
         futures::executor::block_on(async {
             futures::select! {
-                _ = run(root, fake_claude, devscribe_exe(), new_session_id(), false, tx).fuse() => {},
+                _ = run(root, fake_claude, devscribe_exe(), SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Manual }, tx).fuse() => {},
                 _ = cancel_rx.fuse() => {}, // drops `run`'s future here, mid-`.await`
             }
         });
@@ -285,7 +318,7 @@ fn approves_one_edit_and_denies_another_end_to_end() {
     let (tx, mut rx) = fmpsc::channel(64);
     let root = dir.clone();
     std::thread::spawn(move || {
-        futures::executor::block_on(run(root, binary, devscribe_exe, new_session_id(), false, tx));
+        futures::executor::block_on(run(root, binary, devscribe_exe, SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Manual }, tx));
     });
 
     let ready_events = recv_within(&mut rx, Duration::from_secs(20));
@@ -386,7 +419,7 @@ fn resumes_a_session_with_real_memory_and_replayed_history() {
     let handle = std::thread::spawn(move || {
         futures::executor::block_on(async {
             futures::select! {
-                _ = run(root1, binary, devscribe_exe1, session_id1, false, tx1).fuse() => {},
+                _ = run(root1, binary, devscribe_exe1, SessionOptions { session_id: session_id1, resume: false, mode: PermissionMode::Manual }, tx1).fuse() => {},
                 _ = cancel_rx.fuse() => {},
             }
         });
@@ -427,7 +460,7 @@ fn resumes_a_session_with_real_memory_and_replayed_history() {
     let devscribe_exe2 = devscribe_exe();
     let session_id2 = session_id.clone();
     std::thread::spawn(move || {
-        futures::executor::block_on(run(root2, PathBuf::from("claude"), devscribe_exe2, session_id2, true, tx2));
+        futures::executor::block_on(run(root2, PathBuf::from("claude"), devscribe_exe2, SessionOptions { session_id: session_id2, resume: true, mode: PermissionMode::Manual }, tx2));
     });
     let ready2 = recv_within(&mut rx2, Duration::from_secs(20));
     let mut sender2 = find_command_sender(&ready2).expect("expected ClaudeEvent::Ready on resume");
@@ -444,6 +477,79 @@ fn resumes_a_session_with_real_memory_and_replayed_history() {
         turn2.iter().any(|e| matches!(e, ClaudeEvent::AssistantText(t) if t.contains("pineapple-forty-two"))),
         "expected the resumed session to actually remember the fact from turn 1: {turn2:#?}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End-to-end proof that `PermissionMode::Plan` and `PermissionMode::Auto`
+/// actually behave as documented against the real CLI — not just that
+/// `generate_settings`/the `--permission-mode` value compile, but that
+/// `plan` genuinely can't edit and `bypassPermissions` genuinely never
+/// raises a `PermissionRequest` (i.e. `generate_settings`'s empty-hook
+/// `json!({})` for non-`Manual` modes is a valid `--settings` payload the
+/// CLI actually accepts, not just plausible-looking JSON).
+///
+/// **Not run automatically** — real, billed API calls. Run by hand with:
+/// `cargo test -p devscribe-core claude_agent::tests::plan_and_auto -- --ignored --nocapture`
+#[test]
+#[ignore = "spawns the real, billed `claude` CLI — run manually"]
+fn plan_and_auto_modes_behave_as_documented() {
+    let dir = std::env::temp_dir().join(format!("devscribe-claude-agent-modes-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "original\n").unwrap();
+
+    // --- Plan mode: asked to edit, must not actually touch the file. ---
+    let (tx, mut rx) = fmpsc::channel(64);
+    let root = dir.clone();
+    std::thread::spawn(move || {
+        futures::executor::block_on(run(
+            root,
+            PathBuf::from("claude"),
+            devscribe_exe(),
+            SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Plan },
+            tx,
+        ));
+    });
+    let ready = recv_within(&mut rx, Duration::from_secs(20));
+    let mut sender = find_command_sender(&ready).expect("expected ClaudeEvent::Ready");
+    futures::executor::block_on(
+        sender.send(ClaudeCommand::SendPrompt("Append the line 'edited' to note.txt.".to_string())),
+    )
+    .unwrap();
+    let turn = recv_within(&mut rx, Duration::from_secs(30));
+    assert!(
+        !turn.iter().any(|e| matches!(e, ClaudeEvent::PermissionRequest { .. })),
+        "plan mode should never even attempt a gated edit: {turn:#?}"
+    );
+    let contents = std::fs::read_to_string(dir.join("note.txt")).unwrap();
+    assert_eq!(contents, "original\n", "plan mode must not have actually edited the file: {contents:?}");
+
+    // --- Auto mode: same request, must edit with *no* permission card at all. ---
+    let (tx2, mut rx2) = fmpsc::channel(64);
+    let root2 = dir.clone();
+    std::thread::spawn(move || {
+        futures::executor::block_on(run(
+            root2,
+            PathBuf::from("claude"),
+            devscribe_exe(),
+            SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Auto },
+            tx2,
+        ));
+    });
+    let ready2 = recv_within(&mut rx2, Duration::from_secs(20));
+    let mut sender2 = find_command_sender(&ready2).expect("expected ClaudeEvent::Ready");
+    futures::executor::block_on(
+        sender2.send(ClaudeCommand::SendPrompt("Append the line 'edited' to note.txt.".to_string())),
+    )
+    .unwrap();
+    let turn2 = recv_within(&mut rx2, Duration::from_secs(30));
+    assert!(
+        !turn2.iter().any(|e| matches!(e, ClaudeEvent::PermissionRequest { .. })),
+        "auto mode should never raise a permission card: {turn2:#?}"
+    );
+    let contents2 = std::fs::read_to_string(dir.join("note.txt")).unwrap();
+    assert!(contents2.contains("edited"), "auto mode should have actually edited the file: {contents2:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

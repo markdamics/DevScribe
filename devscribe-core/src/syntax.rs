@@ -61,6 +61,23 @@ impl Language {
             _ => None,
         }
     }
+
+    /// Display name for the status bar's language indicator.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::Rust => "Rust",
+            Language::Json => "JSON",
+            Language::Toml => "TOML",
+            Language::Java => "Java",
+            Language::Python => "Python",
+            Language::JavaScript => "JavaScript",
+            Language::TypeScript => "TypeScript",
+            Language::Cpp => "C/C++",
+            Language::Yaml => "YAML",
+            Language::Xml => "XML",
+            Language::Ini => "INI",
+        }
+    }
 }
 
 /// A highlighted region of the document, in byte offsets (tree-sitter's

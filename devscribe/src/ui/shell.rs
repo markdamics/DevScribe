@@ -136,7 +136,7 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-fn content_area(state: &State, p: Palette) -> Element<'static, Message> {
+fn content_area(state: &State, p: Palette) -> Element<'_, Message> {
     let Some(key) = state.active_tab.as_ref() else {
         return no_buffer_state(p);
     };
@@ -157,7 +157,7 @@ fn content_area(state: &State, p: Palette) -> Element<'static, Message> {
     }
 }
 
-pub fn view(state: &State) -> Element<'static, Message> {
+pub fn view(state: &State) -> Element<'_, Message> {
     crate::text_scale::set(state.ui_font_scale);
 
     let p = palette(state.theme_mode, state.accent);
@@ -171,13 +171,14 @@ pub fn view(state: &State) -> Element<'static, Message> {
         return welcome::view(state, p);
     }
 
-    let main_column = column![
-        tab_bar::view(state, p),
-        content_area(state, p),
-        status_bar::view(state, p),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
+    let mut main_column = column![tab_bar::view(state, p), content_area(state, p)];
+    if state.problems_panel_open {
+        main_column = main_column.push(status_bar::dock_panel(state, p));
+    }
+    let main_column = main_column
+        .push(status_bar::view(state, p))
+        .width(Length::Fill)
+        .height(Length::Fill);
 
     let mut body = row![sidebar::view(state, p)];
     if !state.sidebar_collapsed {
@@ -190,7 +191,7 @@ pub fn view(state: &State) -> Element<'static, Message> {
             body = body.push(chat_panel::docked_view(state, p));
         }
         ChatMode::Collapsed => body = body.push(chat_panel::collapsed_rail(p)),
-        ChatMode::Window | ChatMode::Closed => {}
+        ChatMode::Closed => {}
     }
     let body = body.width(Length::Fill).height(Length::Fill);
 
@@ -207,18 +208,17 @@ pub fn view(state: &State) -> Element<'static, Message> {
             ..container::Style::default()
         });
 
-    let mut layers: Vec<Element<'static, Message>> = vec![base.into()];
+    let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
     layers.extend(completions::view(state, p));
     layers.extend(command_palette::view(state));
     layers.extend(settings_panel::view(state));
     layers.extend(tab_bar::overflow_menu(state, p));
     layers.extend(sidebar::projects_menu(state, p));
     layers.extend(context_menu::view(state, p));
+    layers.extend(chat_panel::view_menu(state, p));
+    layers.extend(chat_panel::actions_menu(state, p));
     layers.extend(toast::view(state));
     layers.extend(flash::view(state));
-    if state.chat_mode == ChatMode::Window {
-        layers.push(chat_panel::window_view(state, p));
-    }
 
     iced::widget::Stack::with_children(layers).into()
 }

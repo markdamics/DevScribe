@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent};
+use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent, PermissionMode};
 use devscribe_core::diff::DiffLine;
 use devscribe_core::git::{ChangeKind, Repo};
 use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguage};
@@ -840,17 +840,16 @@ pub const CHAT_DEFAULT_WIDTH: f32 = 340.0;
 pub enum ChatMode {
     Docked,
     Collapsed,
-    Window,
     Closed,
 }
 
 impl ChatMode {
-    pub const ALL: [ChatMode; 4] = [ChatMode::Docked, ChatMode::Collapsed, ChatMode::Window, ChatMode::Closed];
+    pub const ALL: [ChatMode; 3] = [ChatMode::Docked, ChatMode::Collapsed, ChatMode::Closed];
 }
 
 /// `true` whenever a live `claude` session should exist — either the
-/// docked/collapsed/floating presentation is on, *or* it's open as a full
-/// tab. Opening as a tab sets `chat_mode` to `Closed` (the docked panel and
+/// docked/collapsed presentation is on, *or* it's open as a full tab.
+/// Opening as a tab sets `chat_mode` to `Closed` (the docked panel and
 /// the tab view are mutually exclusive presentations of the same session),
 /// so `chat_mode != Closed` alone isn't the right "is chat active" check —
 /// unlike the source mockup's own `chatLamp`, which checks `chatMode`
@@ -870,7 +869,14 @@ pub fn chat_is_active(state: &State) -> bool {
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
     Operator(String),
-    Assistant(String),
+    /// `streaming` is `true` while this bubble is still being live-typed
+    /// from `ClaudeEvent::AssistantTextDelta` chunks — the block's own
+    /// `AssistantText` finalizes it (sets this back to `false`) rather than
+    /// starting a second bubble. Always `false` for a bubble that arrived
+    /// as one complete `AssistantText` with no preceding deltas (e.g.
+    /// replayed session history, which never streams — see
+    /// `ClaudeEvent::AssistantTextDelta`'s own doc comment).
+    Assistant { text: String, streaming: bool },
     Tool(ToolActivity),
 }
 
@@ -921,8 +927,12 @@ pub struct ChatThread {
     pub cost_usd: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// The input bar's current draft text.
-    pub input: String,
+    /// The input bar's current draft — a real multi-line editor
+    /// (`iced::widget::text_editor`, not a single-line `text_input`), for
+    /// proper cursor movement/selection/Shift+Enter newlines. Not
+    /// `#[derive(PartialEq)]`-friendly and doesn't need to be: nothing
+    /// compares two `ChatThread`s for equality.
+    pub input: iced::widget::text_editor::Content,
     pub sender: Option<mpsc::Sender<ClaudeCommand>>,
     pub status: ChatStatus,
 }
@@ -974,6 +984,33 @@ pub struct State {
     /// the moment it was requested.
     pub chat_sessions: Vec<claude_agent::SessionSummary>,
     pub chat_sessions_open: bool,
+    /// The header's "View" popup — lists whichever of Docked/Tab/Collapsed
+    /// the panel *isn't* currently presented as, same backdrop-close popup
+    /// convention as `tab_bar::overflow_menu`. Closed automatically by
+    /// every message that actually switches the presentation
+    /// (`ChatDock`/`ChatCollapse`/`ChatOpenTab`/`ChatDockFromTab`), same as
+    /// `overflow_open` resets after its own menu actions.
+    pub chat_view_menu_open: bool,
+    /// The input bar's "+" Actions popup — attach/mention a file, clear the
+    /// conversation, switch model, toggle thinking, account & usage. Same
+    /// backdrop-close popup convention as `chat_view_menu_open`; every
+    /// action closes it on press.
+    pub chat_actions_open: bool,
+    /// Local-only UI state for the Actions popup's "Thinking" toggle — not
+    /// persisted (like `chat_permission_mode`, this only matters for the
+    /// currently-running subprocess, if any), and not round-tripped from
+    /// `claude` itself: toggling it just sends `/effort high` or `/effort
+    /// auto` as a prompt (confirmed against the real CLI: `claude` answers
+    /// `/effort` in-place, `num_turns: 0`, no model call), so this bool is
+    /// purely "which state did the button last show," not a query of the
+    /// session's actual effort level.
+    pub chat_thinking_enabled: bool,
+    /// How permission decisions are made for the session — see
+    /// `PermissionMode`. Part of `chat_worker`'s subscription key: picking
+    /// a different mode respawns the subprocess (`--permission-mode` is a
+    /// spawn-time flag, can't change on a running process), resuming the
+    /// same session id under the new mode rather than losing the thread.
+    pub chat_permission_mode: PermissionMode,
     pub chat: ChatThread,
     /// Current window width in logical pixels — tracked only for the chat
     /// panel's right-edge resize math (`window_width - cursor_x`, since
@@ -1047,6 +1084,10 @@ pub struct State {
     /// `changed_files`.
     pub ahead_behind: Option<(usize, usize)>,
     pub changes_panel_open: bool,
+    /// `true` while the status bar's Problems dock panel is open, listing
+    /// every diagnostic across all open files. Toggled by clicking the
+    /// status bar's Problems indicator — see `status_bar.rs`.
+    pub problems_panel_open: bool,
     /// The live text in the search box — may be ahead of `search_last_query`
     /// while the user is still typing. Search is debounced (see
     /// `search_query_changed_at`) rather than run on every keystroke or
@@ -1317,6 +1358,15 @@ impl Default for State {
             chat_session_id: claude_agent::new_session_id(),
             chat_sessions: Vec::new(),
             chat_sessions_open: false,
+            chat_view_menu_open: false,
+            chat_actions_open: false,
+            chat_thinking_enabled: false,
+            // Matches the behavior this app has always had before mode
+            // selection existed at all — every prior end-to-end test was
+            // built and verified against "ask for every Edit/Write", so
+            // that stays the default rather than silently becoming more
+            // permissive under this change.
+            chat_permission_mode: PermissionMode::Manual,
             chat: ChatThread::default(),
             window_width: 1280.0,
             projects_open: false,
@@ -1340,6 +1390,7 @@ impl Default for State {
             changed_files: snapshot.changed_files,
             ahead_behind: snapshot.ahead_behind,
             changes_panel_open: false,
+            problems_panel_open: false,
             search_query: String::new(),
             search_query_changed_at: None,
             search_in_progress: false,
@@ -1390,14 +1441,23 @@ pub enum Message {
     SidebarResizeDragged(f32),
     SidebarResizeEnded,
     ToggleChangesPanel,
+    /// Clicked the status bar's Problems indicator — see
+    /// `State::problems_panel_open`.
+    ToggleProblemsPanel,
+    /// Clicked a diagnostic row in the Problems dock panel — opens (or
+    /// focuses) `path` and moves the cursor to the diagnostic's start
+    /// position, same as clicking a location in any other editor's problems
+    /// list.
+    OpenDiagnosticAt(PathBuf, CursorPos),
     /// Opens the panel if closed (docked), closes it if it's presented any
     /// other way — mirrors the title-bar button's old `ToggleAssist`
     /// behavior, and the mockup's own `toggleChat`.
     ChatToggle,
+    /// Opens or closes the header's "View" popup — see
+    /// `State::chat_view_menu_open`'s own doc comment.
+    ChatToggleViewMenu,
     ChatDock,
     ChatCollapse,
-    ChatPopOut,
-    ChatClose,
     /// "Open as tab" — see `TabKey::Chat`/`chat_is_active`.
     ChatOpenTab,
     /// Leaves tab presentation and returns to the docked panel.
@@ -1408,7 +1468,6 @@ pub enum Message {
     /// wherever it already was — `Closed`, since opening as a tab set it
     /// there).
     ChatCloseTab,
-    ChatInputChanged(String),
     /// Enter (or the input bar's send action) — submits `state.chat.input`
     /// as a new turn and clears the draft.
     ChatSubmit,
@@ -1435,6 +1494,45 @@ pub enum Message {
     /// `start_loading_chat_sessions`.
     ChatToggleSessions,
     ChatSessionsLoaded(Vec<claude_agent::SessionSummary>),
+    /// Switches the permission mode (Manual/Auto-Edit/Plan/Auto) — respawns
+    /// the worker (see `State::chat_permission_mode`'s own doc comment),
+    /// resuming the same session under the new mode.
+    ChatSetPermissionMode(PermissionMode),
+    /// Opens a real terminal running `claude` so the human can complete
+    /// `/design-login` (or anything else that genuinely needs an
+    /// interactive TTY) — nothing headless, this session included, can do
+    /// that flow itself. See `launch_terminal_running_claude`.
+    ChatLaunchDesignLogin,
+    /// Opens or closes the input bar's "+" Actions popup — see
+    /// `State::chat_actions_open`'s own doc comment.
+    ChatToggleActions,
+    /// "Attach file…" — opens a native file dialog rooted at the project;
+    /// the chosen file (anywhere on disk) is mentioned by its absolute
+    /// path. See `Message::ChatFileDialogResult`.
+    ChatAttachFileDialog,
+    /// "Mention file from this project…" — same dialog as
+    /// `ChatAttachFileDialog`, but the chosen file is mentioned relative to
+    /// `State::root` when it's actually inside the project.
+    ChatMentionFileDialog,
+    /// A file was (or wasn't) chosen from either dialog above — `bool` is
+    /// whether to mention it relative to the project root (`true`,
+    /// `ChatMentionFileDialog`) or by absolute path (`false`,
+    /// `ChatAttachFileDialog`). `None` means the dialog was cancelled.
+    ChatFileDialogResult(Option<PathBuf>, bool),
+    /// "Switch model…" — sends `/model` (with no argument), which `claude`
+    /// answers in place with the current model and how to change it,
+    /// rather than DevScribe guessing at available model names itself.
+    ChatShowModel,
+    /// "Account & usage…" — sends `/usage`.
+    ChatShowUsage,
+    /// The "Thinking" toggle — flips `State::chat_thinking_enabled` and
+    /// sends `/effort high` or `/effort auto` accordingly.
+    ChatToggleThinking,
+    /// Multi-line input bar: cursor movement, selection, typing — see
+    /// `iced::widget::text_editor`. Plain Enter is intercepted separately
+    /// (see `chat_panel::input_bar`'s `key_binding`) to submit instead of
+    /// inserting a newline; Shift+Enter falls through to here as normal.
+    ChatInputAction(iced::widget::text_editor::Action),
     /// Opens (or focuses) a diff tab for `path`, from a sidebar Changes row.
     /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
     /// targets the currently active tab.
@@ -1618,44 +1716,85 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::FocusSearchTab => focus_search(state),
         Message::ChatToggle => toggle_chat(state),
+        Message::ChatToggleViewMenu => state.chat_view_menu_open = !state.chat_view_menu_open,
         Message::ChatDock => {
+            leave_chat_tab(state);
             state.chat_mode = ChatMode::Docked;
+            state.chat_view_menu_open = false;
             persist_settings(state);
         }
         Message::ChatCollapse => {
+            leave_chat_tab(state);
             state.chat_mode = ChatMode::Collapsed;
-            persist_settings(state);
-        }
-        Message::ChatPopOut => {
-            state.chat_mode = ChatMode::Window;
-            persist_settings(state);
-        }
-        Message::ChatClose => {
-            state.chat_mode = ChatMode::Closed;
+            state.chat_view_menu_open = false;
             persist_settings(state);
         }
         Message::ChatOpenTab => {
             state.chat_tab_open = true;
             state.chat_mode = ChatMode::Closed;
             state.active_tab = Some(TabKey::Chat);
+            state.chat_view_menu_open = false;
             persist_settings(state);
         }
         Message::ChatDockFromTab => {
-            state.chat_tab_open = false;
+            leave_chat_tab(state);
             state.chat_mode = ChatMode::Docked;
-            if state.active_tab == Some(TabKey::Chat) {
-                state.active_tab = state.open_tabs.first().map(|t| t.key());
-            }
+            state.chat_view_menu_open = false;
             persist_settings(state);
         }
         Message::ChatCloseTab => {
-            state.chat_tab_open = false;
-            if state.active_tab == Some(TabKey::Chat) {
-                state.active_tab = state.open_tabs.first().map(|t| t.key());
+            leave_chat_tab(state);
+        }
+        Message::ChatInputAction(action) => state.chat.input.perform(action),
+        Message::ChatSubmit => submit_chat_prompt(state),
+        Message::ChatSetPermissionMode(mode) => state.chat_permission_mode = mode,
+        Message::ChatLaunchDesignLogin => {
+            if launch_terminal_running_claude() {
+                push_toast(state, ToastKind::Success, "Opened a terminal \u{2014} run /design-login there, then retry here.");
+            } else {
+                push_toast(
+                    state,
+                    ToastKind::Warning,
+                    "Couldn't open a terminal automatically \u{2014} open one yourself, run `claude`, then type /design-login.",
+                );
             }
         }
-        Message::ChatInputChanged(text) => state.chat.input = text,
-        Message::ChatSubmit => submit_chat_prompt(state),
+        Message::ChatToggleActions => state.chat_actions_open = !state.chat_actions_open,
+        Message::ChatAttachFileDialog => {
+            state.chat_actions_open = false;
+            let dir = state.root.clone();
+            return iced::Task::perform(pick_chat_mention_file(dir), |path| Message::ChatFileDialogResult(path, false));
+        }
+        Message::ChatMentionFileDialog => {
+            state.chat_actions_open = false;
+            let dir = state.root.clone();
+            return iced::Task::perform(pick_chat_mention_file(dir), |path| Message::ChatFileDialogResult(path, true));
+        }
+        Message::ChatFileDialogResult(path, relative_to_project) => {
+            if let Some(path) = path {
+                insert_chat_mention(state, &path, relative_to_project);
+            }
+        }
+        Message::ChatShowModel => {
+            state.chat_actions_open = false;
+            if state.chat.sender.is_some() {
+                send_chat_text(state, "/model".to_string());
+            }
+        }
+        Message::ChatShowUsage => {
+            state.chat_actions_open = false;
+            if state.chat.sender.is_some() {
+                send_chat_text(state, "/usage".to_string());
+            }
+        }
+        Message::ChatToggleThinking => {
+            state.chat_thinking_enabled = !state.chat_thinking_enabled;
+            state.chat_actions_open = false;
+            if state.chat.sender.is_some() {
+                let cmd = if state.chat_thinking_enabled { "/effort high" } else { "/effort auto" };
+                send_chat_text(state, cmd.to_string());
+            }
+        }
         Message::Chat(event) => handle_chat_event(state, event),
         Message::ChatApprovePermission(id) => respond_permission(state, id, true, None),
         Message::ChatDenyPermission(id) => respond_permission(state, id, false, Some("denied by user".to_string())),
@@ -1673,6 +1812,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.chat_session_id = claude_agent::new_session_id();
             state.chat = ChatThread::default();
             state.chat_sessions_open = false;
+            state.chat_actions_open = false;
         }
         Message::ChatResumeSession(id) => {
             state.chat_session_id = id;
@@ -1704,6 +1844,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::SidebarResizeEnded => state.sidebar_resizing = false,
         Message::ToggleChangesPanel => state.changes_panel_open = !state.changes_panel_open,
+        Message::ToggleProblemsPanel => state.problems_panel_open = !state.problems_panel_open,
+        Message::OpenDiagnosticAt(path, pos) => {
+            open_or_focus_file(state, path.clone());
+            if let Some(editor) = find_editor_mut(state, &path) {
+                editor.click(pos.line, pos.col, false);
+            }
+        }
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
         Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
         Message::SelectFile(path) => open_or_focus_file(state, path),
@@ -3462,6 +3609,7 @@ fn reset_project_scoped_state(state: &mut State) {
     state.chat_session_id = claude_agent::new_session_id();
     state.chat_sessions.clear();
     state.chat_sessions_open = false;
+    state.chat_view_menu_open = false;
     state.chat = ChatThread::default();
 }
 
@@ -3505,22 +3653,33 @@ fn is_lsp_language(path: &Path) -> bool {
 }
 
 /// Shared by the title-bar button, `⌘I`, and the command palette entry.
-/// Turns the panel fully off (both the docked/collapsed/window
-/// presentation *and* tab presentation — see `chat_is_active`) if it's on
-/// in any form, else opens it docked. Deliberately doesn't just flip
-/// `chat_mode` between `Docked`/`Closed`: if the panel is currently open as
-/// a tab (`chat_tab_open == true`, which itself already implies
-/// `chat_mode == Closed`), a naive flip would turn `chat_mode` on to
-/// `Docked` *without* clearing `chat_tab_open` — showing both
-/// presentations of the same session at once.
+/// Turns the panel fully off (both the docked/collapsed presentation *and*
+/// tab presentation — see `chat_is_active`) if it's on in any form, else
+/// opens it as a tab — the default presentation for a freshly opened
+/// session (Docked/Collapsed are reached afterward via the "View" popup).
 fn toggle_chat(state: &mut State) {
     if chat_is_active(state) {
         state.chat_mode = ChatMode::Closed;
         state.chat_tab_open = false;
     } else {
-        state.chat_mode = ChatMode::Docked;
+        state.chat_tab_open = true;
+        state.chat_mode = ChatMode::Closed;
+        state.active_tab = Some(TabKey::Chat);
     }
     persist_settings(state);
+}
+
+/// Clears `chat_tab_open` and, if the chat tab was the active one,
+/// refocuses whatever's now the first open tab instead of one that no
+/// longer exists — the same correction `toggle_chat`'s own doc comment
+/// describes, shared by every "View" menu destination
+/// (`ChatDock`/`ChatCollapse`/`ChatDockFromTab`/`ChatCloseTab`) now that
+/// the menu offers all of them uniformly from every view, tab included.
+fn leave_chat_tab(state: &mut State) {
+    state.chat_tab_open = false;
+    if state.active_tab == Some(TabKey::Chat) {
+        state.active_tab = state.open_tabs.first().map(|t| t.key());
+    }
 }
 
 /// Sends the chat input bar's current draft as a new turn: pushes an
@@ -3529,15 +3688,63 @@ fn toggle_chat(state: &mut State) {
 /// the draft. A no-op with nothing to send, or with no live session yet
 /// (worker still starting, or `claude` unavailable).
 fn submit_chat_prompt(state: &mut State) {
-    let text = state.chat.input.trim().to_string();
+    let text = state.chat.input.text().trim().to_string();
     if text.is_empty() || state.chat.sender.is_none() {
         return;
     }
-    state.chat.input.clear();
+    state.chat.input = iced::widget::text_editor::Content::new();
+    send_chat_text(state, text);
+}
+
+/// Pushes `text` as an `Operator` transcript entry and forwards it to the
+/// running session as a new turn — the shared core of `submit_chat_prompt`
+/// (the input bar's own free-text submissions) and the Actions popup's
+/// built-in `claude` slash commands (`/model`, `/usage`, `/effort ...`).
+/// Those are just prompts like any other from the wire protocol's
+/// perspective (see `devscribe_core::claude_agent`): `claude` recognizes
+/// and answers them itself without invoking the model — confirmed against
+/// the real CLI, a `/model`/`/usage`/`/effort` prompt comes back with
+/// `num_turns: 0`, `total_cost_usd: 0`, and a synthetic assistant reply
+/// that `handle_chat_event` already renders like any other `AssistantText`.
+/// Callers with no live `sender` (e.g. the Actions popup's own callers
+/// check first) simply shouldn't call this — there's nothing to forward to.
+fn send_chat_text(state: &mut State, text: String) {
     state.chat.messages.push(ChatMessage::Operator(text.clone()));
     if let Some(sender) = state.chat.sender.as_mut() {
         let _ = sender.try_send(ClaudeCommand::SendPrompt(text));
     }
+}
+
+async fn pick_chat_mention_file(dir: PathBuf) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new().set_directory(dir).pick_file().await.map(|handle| handle.path().to_path_buf())
+}
+
+/// Appends `@<path>` to the chat draft (with a leading space if the draft
+/// isn't already empty/whitespace-terminated) — `@`-prefixed paths are
+/// `claude`'s own built-in file-reference syntax, confirmed against the
+/// real CLI: a prompt containing `@some/file` gets that file's content
+/// folded into context automatically, no `Read` tool call needed.
+/// `relative_to_project` writes `path` relative to `state.root` when it
+/// actually is inside the project (falling back to the absolute path
+/// otherwise, e.g. a file `ChatAttachFileDialog` picked from elsewhere on
+/// disk).
+fn insert_chat_mention(state: &mut State, path: &Path, relative_to_project: bool) {
+    let shown = if relative_to_project {
+        path.strip_prefix(&state.root).unwrap_or(path).to_string_lossy().into_owned()
+    } else {
+        path.to_string_lossy().into_owned()
+    };
+    let existing = state.chat.input.text();
+    let needs_space = !existing.is_empty() && !existing.ends_with(char::is_whitespace);
+    let mut insertion = String::new();
+    if needs_space {
+        insertion.push(' ');
+    }
+    insertion.push('@');
+    insertion.push_str(&shown);
+    insertion.push(' ');
+    state.chat.input.perform(iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd));
+    state.chat.input.perform(iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(insertion))));
 }
 
 /// Records the human's decision on `state.chat`'s transcript and forwards
@@ -3578,7 +3785,21 @@ fn handle_chat_event(state: &mut State, event: ClaudeEvent) {
             state.chat.session_id = Some(session_id);
             state.chat.model = Some(model);
         }
-        ClaudeEvent::AssistantText(text) => state.chat.messages.push(ChatMessage::Assistant(text)),
+        ClaudeEvent::AssistantText(text) => match state.chat.messages.last_mut() {
+            // Finalize the bubble the deltas were building rather than
+            // pushing a duplicate — see `ChatMessage::Assistant`'s own doc
+            // comment. `text` here is authoritative, so it replaces
+            // whatever was accumulated (a safety net against any drift).
+            Some(ChatMessage::Assistant { text: existing, streaming }) if *streaming => {
+                *existing = text;
+                *streaming = false;
+            }
+            _ => state.chat.messages.push(ChatMessage::Assistant { text, streaming: false }),
+        },
+        ClaudeEvent::AssistantTextDelta(chunk) => match state.chat.messages.last_mut() {
+            Some(ChatMessage::Assistant { text, streaming: true }) => text.push_str(&chunk),
+            _ => state.chat.messages.push(ChatMessage::Assistant { text: chunk, streaming: true }),
+        },
         ClaudeEvent::OperatorText(text) => state.chat.messages.push(ChatMessage::Operator(text)),
         ClaudeEvent::ToolUseStarted { id, name, input } => {
             state.chat.messages.push(ChatMessage::Tool(ToolActivity { id, name, input, permission: None, result: None }));
@@ -3711,6 +3932,28 @@ fn start_loading_chat_sessions(state: &State) -> iced::Task<Message> {
     .map(Message::ChatSessionsLoaded)
 }
 
+/// Best-effort: tries a handful of common Linux terminal emulators in
+/// turn, launching each with bare `claude` as its command, stopping at the
+/// first one that actually spawns. There's no portable "open the user's
+/// terminal" API to call instead — every desktop environment ships (or
+/// symlinks) a different one, hence the list rather than one guess.
+/// `Command::spawn` here is a detached, fire-and-forget launch (the new
+/// terminal process runs independently of DevScribe) — quick to call
+/// directly from a message handler, no `iced_runtime::task::blocking`
+/// needed the way an actually-blocking operation would.
+fn launch_terminal_running_claude() -> bool {
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("x-terminal-emulator", &["-e", "claude"]),
+        ("gnome-terminal", &["--", "claude"]),
+        ("konsole", &["-e", "claude"]),
+        ("xfce4-terminal", &["-e", "claude"]),
+        ("alacritty", &["-e", "claude"]),
+        ("kitty", &["claude"]),
+        ("xterm", &["-e", "claude"]),
+    ];
+    CANDIDATES.iter().any(|(terminal, args)| std::process::Command::new(terminal).args(*args).spawn().is_ok())
+}
+
 fn utf16_col_to_char_col(line: &str, utf16_col: usize) -> usize {
     let mut utf16_count = 0usize;
     for (char_idx, ch) in line.chars().enumerate() {
@@ -3780,13 +4023,18 @@ fn file_watcher(root: &PathBuf) -> impl iced::futures::Stream<Item = Vec<WatchEv
 /// and `devscribe_exe` (needed so the generated permission hook re-invokes
 /// *this* binary) happen inside the async body, same as `lsp_worker` does
 /// for its own binary, so the main thread never blocks either.
-/// Keyed on `(root, session_id, chat_restart_token)`: a project switch or
-/// picking a different session (`Message::ChatNewSession`/
-/// `ChatResumeSession`) both change the key, so `subscription()` tears
-/// down and respawns automatically, same as `lsp_worker`.
-fn chat_worker((root, session_id, _token): &(PathBuf, String, u64)) -> impl iced::futures::Stream<Item = ClaudeEvent> + use<> {
+/// Keyed on `(root, session_id, permission_mode, chat_restart_token)`: a
+/// project switch, picking a different session
+/// (`Message::ChatNewSession`/`ChatResumeSession`), or switching modes
+/// (`Message::ChatSetPermissionMode`) all change the key, so
+/// `subscription()` tears down and respawns automatically, same as
+/// `lsp_worker`.
+fn chat_worker(
+    (root, session_id, mode, _token): &(PathBuf, String, PermissionMode, u64),
+) -> impl iced::futures::Stream<Item = ClaudeEvent> + use<> {
     let root = root.clone();
     let session_id = session_id.clone();
+    let mode = *mode;
     iced::stream::channel(32, async move |mut output| {
         use iced::futures::SinkExt as _;
         // First, always — see `ClaudeEvent::SessionStarting`'s own doc.
@@ -3821,7 +4069,8 @@ fn chat_worker((root, session_id, _token): &(PathBuf, String, u64)) -> impl iced
                 }
             }
         }
-        claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, session_id, resume, output).await;
+        let options = claude_agent::SessionOptions { session_id, resume, mode };
+        claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, options, output).await;
     })
 }
 
@@ -3873,6 +4122,9 @@ fn global_keys(event: keyboard::Event) -> Message {
             }
             if c.eq_ignore_ascii_case("i") {
                 return Message::ChatToggle;
+            }
+            if c.eq_ignore_ascii_case("u") {
+                return Message::ChatAttachFileDialog;
             }
             if c.eq_ignore_ascii_case("/") {
                 return Message::OpenShortcutsHelp;
@@ -3956,7 +4208,7 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     // whenever this becomes true again, the project changes, the target
     // session changes, or `chat_restart_token` is bumped.
     if !state.welcome_open && chat_is_active(state) {
-        let key = (state.root.clone(), state.chat_session_id.clone(), state.chat_restart_token);
+        let key = (state.root.clone(), state.chat_session_id.clone(), state.chat_permission_mode, state.chat_restart_token);
         subs.push(iced::Subscription::run_with(key, chat_worker).map(Message::Chat));
     }
     // Only ticks while there's an actual pending debounce to check

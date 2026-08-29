@@ -47,7 +47,12 @@ impl Default for Settings {
             problem_lens_enabled: true,
             save_on_focus_loss: false,
             lsp_enabled: true,
-            chat_mode: ChatMode::Docked,
+            // Not `Docked`: a freshly opened session's default presentation
+            // is now the tab view (see `state.rs`'s `toggle_chat`), which
+            // `ChatMode` can't represent on its own (see `chat_tab_open`) —
+            // so nothing auto-opens on a brand-new install; the first
+            // `ChatToggle` press is what actually shows it, as a tab.
+            chat_mode: ChatMode::Closed,
             chat_panel_width: crate::state::CHAT_DEFAULT_WIDTH,
         }
     }
@@ -152,7 +157,6 @@ fn chat_mode_key(mode: ChatMode) -> &'static str {
     match mode {
         ChatMode::Docked => "Docked",
         ChatMode::Collapsed => "Collapsed",
-        ChatMode::Window => "Window",
         ChatMode::Closed => "Closed",
     }
 }

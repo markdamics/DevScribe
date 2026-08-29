@@ -844,15 +844,17 @@ fn delete_path_on_a_missing_path_toasts_an_error_instead_of_panicking() {
 // `ChatThread`/`ChatMode` changes.
 
 #[test]
-fn chat_toggle_opens_docked_from_fully_closed() {
+fn chat_toggle_opens_as_a_tab_from_fully_closed() {
     let mut state = State { chat_mode: ChatMode::Closed, chat_tab_open: false, ..State::default() };
     let _ = update(&mut state, Message::ChatToggle);
-    assert_eq!(state.chat_mode, ChatMode::Docked);
+    assert_eq!(state.chat_mode, ChatMode::Closed);
+    assert!(state.chat_tab_open);
+    assert_eq!(state.active_tab, Some(TabKey::Chat));
 }
 
 #[test]
 fn chat_toggle_closes_from_any_open_presentation() {
-    for mode in [ChatMode::Docked, ChatMode::Collapsed, ChatMode::Window] {
+    for mode in [ChatMode::Docked, ChatMode::Collapsed] {
         let mut state = State { chat_mode: mode, ..State::default() };
         let _ = update(&mut state, Message::ChatToggle);
         assert_eq!(state.chat_mode, ChatMode::Closed, "toggling off from {mode:?} should fully close");
@@ -905,13 +907,48 @@ fn chat_dock_from_tab_returns_to_docked_and_refocuses_away_from_the_chat_tab() {
 }
 
 #[test]
+fn chat_toggle_view_menu_flips_the_field() {
+    let mut state = State::default();
+    assert!(!state.chat_view_menu_open);
+
+    let _ = update(&mut state, Message::ChatToggleViewMenu);
+    assert!(state.chat_view_menu_open);
+
+    let _ = update(&mut state, Message::ChatToggleViewMenu);
+    assert!(!state.chat_view_menu_open);
+}
+
+/// The "View" popup now offers every destination from every view,
+/// including switching straight to Collapsed from Tab — so `ChatCollapse`
+/// (not just `ChatDockFromTab`) must also leave tab presentation cleanly,
+/// the same correction `chat_dock_from_tab_*` exercises for docking.
+/// Otherwise picking "Collapse" from Tab's own menu would show the chat
+/// both as a tab and as the collapsed rail at once.
+#[test]
+fn chat_collapse_leaves_tab_presentation_cleanly_when_triggered_from_a_tab() {
+    let mut state = State { chat_tab_open: true, chat_mode: ChatMode::Closed, active_tab: Some(TabKey::Chat), ..State::default() };
+    let _ = update(&mut state, Message::ChatCollapse);
+    assert!(!state.chat_tab_open, "ChatCollapse should clear chat_tab_open");
+    assert_ne!(state.active_tab, Some(TabKey::Chat), "ChatCollapse should refocus away from the now-closed chat tab");
+}
+
+#[test]
+fn every_view_switching_message_closes_the_view_menu() {
+    for message in [Message::ChatDock, Message::ChatCollapse, Message::ChatOpenTab, Message::ChatDockFromTab] {
+        let mut state = State { chat_view_menu_open: true, ..State::default() };
+        let _ = update(&mut state, message.clone());
+        assert!(!state.chat_view_menu_open, "{message:?} should close the view menu");
+    }
+}
+
+#[test]
 fn chat_ready_event_installs_the_sender_without_touching_the_transcript() {
     // `Ready` no longer resets the thread — `SessionStarting` does that,
     // specifically *before* a resume's history-replay events arrive (see
     // the test below), so `Ready` arriving afterward must leave whatever
     // was just replayed alone.
     let mut state = State::default();
-    state.chat.messages.push(ChatMessage::Assistant("replayed history".to_string()));
+    state.chat.messages.push(ChatMessage::Assistant { text: "replayed history".to_string(), streaming: false });
     let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
 
     let _ = update(&mut state, Message::Chat(ClaudeEvent::Ready(tx)));
@@ -924,7 +961,7 @@ fn chat_ready_event_installs_the_sender_without_touching_the_transcript() {
 #[test]
 fn chat_session_starting_event_clears_any_prior_thread() {
     let mut state = State::default();
-    state.chat.messages.push(ChatMessage::Assistant("leftover from a previous worker instance".to_string()));
+    state.chat.messages.push(ChatMessage::Assistant { text: "leftover from a previous worker instance".to_string(), streaming: false });
     state.chat.cost_usd = 1.23;
 
     let _ = update(&mut state, Message::Chat(ClaudeEvent::SessionStarting));
@@ -956,7 +993,43 @@ fn chat_session_init_records_session_id_and_model() {
 fn chat_assistant_text_appends_a_transcript_entry() {
     let mut state = State::default();
     let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantText("hello".to_string())));
-    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Assistant(text)] if text == "hello"));
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Assistant { text, streaming: false }] if text == "hello"));
+}
+
+#[test]
+fn chat_assistant_text_delta_accumulates_into_one_streaming_bubble() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantTextDelta("Hel".to_string())));
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantTextDelta("lo".to_string())));
+    assert!(
+        matches!(state.chat.messages.as_slice(), [ChatMessage::Assistant { text, streaming: true }] if text == "Hello"),
+        "deltas should accumulate into a single still-streaming bubble, got {:?}",
+        state.chat.messages
+    );
+
+    // The block's final `AssistantText` finalizes that same bubble rather
+    // than appending a duplicate.
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantText("Hello".to_string())));
+    assert!(
+        matches!(state.chat.messages.as_slice(), [ChatMessage::Assistant { text, streaming: false }] if text == "Hello"),
+        "AssistantText should finalize the streamed bubble in place, got {:?}",
+        state.chat.messages
+    );
+}
+
+#[test]
+fn chat_assistant_text_delta_after_a_finalized_bubble_starts_a_new_one() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantText("first".to_string())));
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantTextDelta("sec".to_string())));
+
+    assert!(matches!(
+        state.chat.messages.as_slice(),
+        [
+            ChatMessage::Assistant { text: first, streaming: false },
+            ChatMessage::Assistant { text: second, streaming: true },
+        ] if first == "first" && second == "sec"
+    ));
 }
 
 #[test]
@@ -1108,7 +1181,7 @@ fn chat_submit_pushes_an_operator_message_clears_the_draft_and_sends_the_prompt(
     let mut state = State::default();
     let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
     state.chat.sender = Some(tx);
-    state.chat.input = "  explain this bug  ".to_string();
+    state.chat.input = iced::widget::text_editor::Content::with_text("  explain this bug  ");
 
     let _ = update(&mut state, Message::ChatSubmit);
 
@@ -1123,9 +1196,9 @@ fn chat_submit_pushes_an_operator_message_clears_the_draft_and_sends_the_prompt(
 #[test]
 fn chat_submit_with_no_live_session_does_nothing() {
     let mut state = State::default();
-    state.chat.input = "hello".to_string();
+    state.chat.input = iced::widget::text_editor::Content::with_text("hello");
     let _ = update(&mut state, Message::ChatSubmit);
-    assert_eq!(state.chat.input, "hello", "nothing to send to, so the draft should be left alone");
+    assert_eq!(state.chat.input.text(), "hello", "nothing to send to, so the draft should be left alone");
     assert!(state.chat.messages.is_empty());
 }
 
@@ -1134,9 +1207,126 @@ fn chat_submit_ignores_a_blank_draft() {
     let mut state = State::default();
     let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
     state.chat.sender = Some(tx);
-    state.chat.input = "   ".to_string();
+    state.chat.input = iced::widget::text_editor::Content::with_text("   ");
     let _ = update(&mut state, Message::ChatSubmit);
     assert!(state.chat.messages.is_empty());
+}
+
+#[test]
+fn chat_toggle_actions_flips_the_field() {
+    let mut state = State::default();
+    assert!(!state.chat_actions_open);
+    let _ = update(&mut state, Message::ChatToggleActions);
+    assert!(state.chat_actions_open);
+    let _ = update(&mut state, Message::ChatToggleActions);
+    assert!(!state.chat_actions_open);
+}
+
+#[test]
+fn chat_show_model_and_usage_are_no_ops_with_no_live_session() {
+    for message in [Message::ChatShowModel, Message::ChatShowUsage] {
+        let mut state = State { chat_actions_open: true, ..State::default() };
+        let _ = update(&mut state, message);
+        assert!(state.chat.messages.is_empty(), "nothing to send to, so no operator entry should appear");
+        assert!(!state.chat_actions_open, "should still close the popup even when it can't send");
+    }
+}
+
+#[test]
+fn chat_show_model_pushes_an_operator_entry_and_sends_the_slash_command() {
+    let mut state = State { chat_actions_open: true, ..State::default() };
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+
+    let _ = update(&mut state, Message::ChatShowModel);
+
+    assert!(!state.chat_actions_open);
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Operator(text)] if text == "/model"));
+    match rx.try_recv() {
+        Ok(ClaudeCommand::SendPrompt(text)) => assert_eq!(text, "/model"),
+        other => panic!("expected SendPrompt(\"/model\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_show_usage_sends_the_usage_slash_command() {
+    let mut state = State::default();
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+
+    let _ = update(&mut state, Message::ChatShowUsage);
+
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Operator(text)] if text == "/usage"));
+    match rx.try_recv() {
+        Ok(ClaudeCommand::SendPrompt(text)) => assert_eq!(text, "/usage"),
+        other => panic!("expected SendPrompt(\"/usage\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_toggle_thinking_flips_the_field_closes_the_popup_and_sends_effort() {
+    let mut state = State { chat_actions_open: true, ..State::default() };
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    assert!(!state.chat_thinking_enabled, "sanity: off by default");
+
+    let _ = update(&mut state, Message::ChatToggleThinking);
+    assert!(state.chat_thinking_enabled);
+    assert!(!state.chat_actions_open);
+    match rx.try_recv() {
+        Ok(ClaudeCommand::SendPrompt(text)) => assert_eq!(text, "/effort high"),
+        other => panic!("expected SendPrompt(\"/effort high\"), got {other:?}"),
+    }
+
+    let _ = update(&mut state, Message::ChatToggleThinking);
+    assert!(!state.chat_thinking_enabled);
+    match rx.try_recv() {
+        Ok(ClaudeCommand::SendPrompt(text)) => assert_eq!(text, "/effort auto"),
+        other => panic!("expected SendPrompt(\"/effort auto\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_toggle_thinking_still_flips_locally_with_no_live_session() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::ChatToggleThinking);
+    assert!(state.chat_thinking_enabled, "the button's own on/off state should still track clicks even before a session exists");
+}
+
+#[test]
+fn chat_file_dialog_result_mentions_a_project_file_relative_to_root() {
+    let mut state = State { root: PathBuf::from("/some/project"), ..State::default() };
+    let _ = update(&mut state, Message::ChatFileDialogResult(Some(PathBuf::from("/some/project/src/engine.rs")), true));
+    assert_eq!(state.chat.input.text(), "@src/engine.rs ");
+}
+
+#[test]
+fn chat_file_dialog_result_attaches_by_absolute_path_when_not_relative() {
+    let mut state = State { root: PathBuf::from("/some/project"), ..State::default() };
+    let _ = update(&mut state, Message::ChatFileDialogResult(Some(PathBuf::from("/elsewhere/notes.txt")), false));
+    assert_eq!(state.chat.input.text(), "@/elsewhere/notes.txt ");
+}
+
+#[test]
+fn chat_file_dialog_result_falls_back_to_absolute_when_outside_the_project() {
+    let mut state = State { root: PathBuf::from("/some/project"), ..State::default() };
+    let _ = update(&mut state, Message::ChatFileDialogResult(Some(PathBuf::from("/elsewhere/notes.txt")), true));
+    assert_eq!(state.chat.input.text(), "@/elsewhere/notes.txt ");
+}
+
+#[test]
+fn chat_file_dialog_result_appends_with_a_leading_space_to_an_existing_draft() {
+    let mut state = State { root: PathBuf::from("/some/project"), ..State::default() };
+    state.chat.input = iced::widget::text_editor::Content::with_text("look at");
+    let _ = update(&mut state, Message::ChatFileDialogResult(Some(PathBuf::from("/some/project/README.md")), true));
+    assert_eq!(state.chat.input.text(), "look at @README.md ");
+}
+
+#[test]
+fn chat_file_dialog_result_is_a_no_op_when_the_dialog_was_cancelled() {
+    let mut state = State { root: PathBuf::from("/some/project"), ..State::default() };
+    let _ = update(&mut state, Message::ChatFileDialogResult(None, true));
+    assert!(state.chat.input.text().is_empty());
 }
 
 #[test]
@@ -1164,7 +1354,7 @@ fn chat_resize_dragged_is_ignored_when_not_resizing() {
 fn chat_new_session_picks_a_fresh_id_and_clears_the_transcript() {
     let mut state = State::default();
     let old_id = state.chat_session_id.clone();
-    state.chat.messages.push(ChatMessage::Assistant("old conversation".to_string()));
+    state.chat.messages.push(ChatMessage::Assistant { text: "old conversation".to_string(), streaming: false });
     state.chat_sessions_open = true;
 
     let _ = update(&mut state, Message::ChatNewSession);
@@ -1176,9 +1366,19 @@ fn chat_new_session_picks_a_fresh_id_and_clears_the_transcript() {
 }
 
 #[test]
+fn chat_new_session_also_closes_the_actions_popup() {
+    // "Clear conversation" in the Actions popup is just `ChatNewSession` —
+    // it should close that popup like every other action in it does,
+    // rather than leaving it floating over the now-empty transcript.
+    let mut state = State { chat_actions_open: true, ..State::default() };
+    let _ = update(&mut state, Message::ChatNewSession);
+    assert!(!state.chat_actions_open);
+}
+
+#[test]
 fn chat_resume_session_switches_the_target_id_and_clears_the_transcript() {
     let mut state = State::default();
-    state.chat.messages.push(ChatMessage::Assistant("wrong conversation".to_string()));
+    state.chat.messages.push(ChatMessage::Assistant { text: "wrong conversation".to_string(), streaming: false });
     state.chat_sessions_open = true;
 
     let _ = update(&mut state, Message::ChatResumeSession("some-other-session-id".to_string()));
@@ -1206,4 +1406,49 @@ fn chat_sessions_loaded_replaces_the_list() {
     }];
     let _ = update(&mut state, Message::ChatSessionsLoaded(sessions.clone()));
     assert_eq!(state.chat_sessions, sessions);
+}
+
+#[test]
+fn chat_set_permission_mode_updates_the_field() {
+    let mut state = State::default();
+    assert_eq!(state.chat_permission_mode, devscribe_core::claude_agent::PermissionMode::Manual, "sanity: the documented default");
+
+    let _ = update(&mut state, Message::ChatSetPermissionMode(devscribe_core::claude_agent::PermissionMode::Plan));
+
+    assert_eq!(state.chat_permission_mode, devscribe_core::claude_agent::PermissionMode::Plan);
+}
+
+#[test]
+fn chat_input_action_edits_the_draft_content() {
+    use iced::widget::text_editor;
+
+    let mut state = State::default();
+    assert!(state.chat.input.is_empty());
+
+    let _ = update(&mut state, Message::ChatInputAction(text_editor::Action::Edit(text_editor::Edit::Insert('h'))));
+    let _ = update(&mut state, Message::ChatInputAction(text_editor::Action::Edit(text_editor::Edit::Insert('i'))));
+
+    assert_eq!(state.chat.input.text(), "hi");
+}
+
+#[test]
+fn chat_input_action_enter_inserts_a_newline_not_a_submit() {
+    // Shift+Enter's actual key detection lives in `chat_panel::input_bar`'s
+    // `key_binding` closure (a UI-layer concern, not reducer logic) — what
+    // belongs here is confirming the reducer side does the right thing
+    // once that closure decides a newline is wanted: `Edit::Enter` must
+    // insert a line break, not be confused with `Message::ChatSubmit`.
+    use iced::widget::text_editor;
+
+    let mut state = State::default();
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+
+    let _ = update(&mut state, Message::ChatInputAction(text_editor::Action::Edit(text_editor::Edit::Insert('a'))));
+    let _ = update(&mut state, Message::ChatInputAction(text_editor::Action::Edit(text_editor::Edit::Enter)));
+    let _ = update(&mut state, Message::ChatInputAction(text_editor::Action::Edit(text_editor::Edit::Insert('b'))));
+
+    assert_eq!(state.chat.input.line_count(), 2);
+    assert!(state.chat.messages.is_empty(), "inserting a newline must not submit anything");
+    assert!(rx.try_recv().is_err(), "nothing should have been sent to the worker");
 }

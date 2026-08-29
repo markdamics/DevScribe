@@ -618,7 +618,11 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
             .width(Length::Fixed(18.0))
             .height(Length::Fixed(18.0))
             .on_press(Message::CloseSettings)
-            .style(|_theme, _status| button::Style::default()),
+            .style(move |_theme, status| button::Style {
+                background: if status == button::Status::Hovered { Some(color(p.surface_hover).into()) } else { None },
+                border: Border { radius: 3.0.into(), ..Border::default() },
+                ..button::Style::default()
+            }),
     ]
     .align_y(Alignment::Center)
     .padding([12.0, 16.0]);

@@ -60,10 +60,20 @@ pub enum ClaudeEvent {
     /// message arrives — the CLI doesn't echo the requested `--model`
     /// verbatim in `init`).
     SessionInit { session_id: String, model: String },
-    /// A completed assistant text block (this module doesn't request
-    /// `--include-partial-messages`, so these arrive whole, not streamed
-    /// token-by-token).
+    /// A completed assistant text block — the authoritative, final text for
+    /// that block. Also fires for a block that was previously live-typed via
+    /// `AssistantTextDelta`, in which case it's a finalize/replace signal
+    /// (a safety net against any drift between concatenated deltas and the
+    /// block's true final text) rather than a second, duplicate bubble.
     AssistantText(String),
+    /// One chunk of a text block still being generated (`--include-partial-
+    /// messages`'s `content_block_delta`/`text_delta`) — a consumer
+    /// accumulates these into a growing bubble for the live-typed look.
+    /// Never appears in a resumed session's replayed history (see
+    /// `load_session_history`): saved transcripts only ever contain the
+    /// final `assistant`/`user`/`result` lines, not the `stream_event`
+    /// lines these come from.
+    AssistantTextDelta(String),
     /// The operator's own message, replayed from a resumed session's saved
     /// transcript (see `load_session_history`) — never produced by the live
     /// stdout stream, which only ever echoes the operator's *prior* turns
@@ -195,7 +205,71 @@ fn spawn_permission_listener(socket_path: PathBuf, pending: PendingMap, requests
     Ok(())
 }
 
-fn generate_settings(devscribe_exe: &std::path::Path, socket_path: &std::path::Path) -> Value {
+/// How permission decisions are made for a session — mirrors VS Code's own
+/// Claude Code mode picker. `Bash` is deliberately left out of this
+/// entirely: it stays disallowed (`--disallowedTools Bash`) in every mode,
+/// a boundary this app draws regardless of how permissive the selected
+/// mode otherwise is (a deliberate choice, not an oversight — "Auto"
+/// bypasses everything *DevScribe itself* exposes, not literally
+/// everything the CLI could do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PermissionMode {
+    /// Ask a human for every `Edit`/`Write` via the permission-hook card —
+    /// nothing mutates without an explicit decision.
+    Manual,
+    /// `Edit`/`Write` are silently auto-approved (`--permission-mode
+    /// acceptEdits`, no hook registered at all for them) — VS Code's
+    /// "auto-accept edits".
+    EditAuto,
+    /// Read-only: `claude` can explore but not modify anything
+    /// (`--permission-mode plan`) — no hook needed, since nothing
+    /// mutating can fire in the first place.
+    Plan,
+    /// No prompts for anything DevScribe exposes (`--permission-mode
+    /// bypassPermissions`) — still short of *actual* full autonomy, since
+    /// Bash stays off regardless.
+    Auto,
+}
+
+impl PermissionMode {
+    pub const ALL: [PermissionMode; 4] = [PermissionMode::Manual, PermissionMode::EditAuto, PermissionMode::Plan, PermissionMode::Auto];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "Manual",
+            PermissionMode::EditAuto => "Auto-Edit",
+            PermissionMode::Plan => "Plan",
+            PermissionMode::Auto => "Auto",
+        }
+    }
+
+    fn cli_value(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "acceptEdits",
+            PermissionMode::EditAuto => "acceptEdits",
+            PermissionMode::Plan => "plan",
+            PermissionMode::Auto => "bypassPermissions",
+        }
+    }
+
+    /// Whether `Edit`/`Write` should be routed through the permission-hook
+    /// card for a human decision. `Manual` is the only mode that does —
+    /// note this is independent of `cli_value`: `Manual` and `EditAuto`
+    /// share the same underlying `--permission-mode acceptEdits`, and only
+    /// differ in whether this hook intercepts it. The hook, once
+    /// registered, is authoritative (see `handle_permission_connection` —
+    /// it always resolves to an explicit approve/deny, never a silent
+    /// pass-through), so which base mode is running underneath doesn't
+    /// matter for the tools it actually gates.
+    fn gates_edits(self) -> bool {
+        matches!(self, PermissionMode::Manual)
+    }
+}
+
+fn generate_settings(devscribe_exe: &std::path::Path, socket_path: &std::path::Path, mode: PermissionMode) -> Value {
+    if !mode.gates_edits() {
+        return json!({});
+    }
     let command = format!(
         "\"{}\" --claude-permission-hook \"{}\"",
         devscribe_exe.display(),
@@ -301,6 +375,18 @@ fn parse_event_line(v: &Value, model: &mut Option<String>) -> Vec<ClaudeEvent> {
                     }
                     _ => {}
                 }
+            }
+        }
+        // Only ever present in the live stdout stream (`--include-partial-
+        // messages`) — never in a saved transcript file, so this arm can't
+        // fire during `load_session_history` replay.
+        Some("stream_event") => {
+            if let Some(delta) = v.get("event").filter(|e| e.get("type").and_then(Value::as_str) == Some("content_block_delta")).and_then(|e| e.get("delta"))
+                && delta.get("type").and_then(Value::as_str) == Some("text_delta")
+                && let Some(text) = delta.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                events.push(ClaudeEvent::AssistantTextDelta(text.to_string()));
             }
         }
         Some("result") => {
@@ -454,24 +540,35 @@ pub fn session_exists(root: &Path, session_id: &str) -> bool {
     project_session_dir(root).map(|dir| dir.join(format!("{session_id}.jsonl")).exists()).unwrap_or(false)
 }
 
+/// Everything about *which* session `run` spawns and how permissively —
+/// bundled into one struct (rather than more positional `bool`/enum
+/// arguments) specifically because this has already grown three times
+/// across separate features (session id/resume, permission mode, personal
+/// MCP access) and is a plausible place for a fourth; a struct absorbs
+/// that growth without `run`'s own signature getting harder to read each
+/// time.
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    /// Always DevScribe's own choice (see `new_session_id`) — passed as
+    /// `--session-id` for a brand-new session (`resume: false`) or
+    /// `--resume` to continue an existing one (`resume: true`), never left
+    /// for the CLI to pick on its own.
+    pub session_id: String,
+    pub resume: bool,
+    /// Governs both the base `--permission-mode` and whether `Edit`/`Write`
+    /// route through the permission-hook card — see `PermissionMode`.
+    pub mode: PermissionMode,
+}
+
 /// Spawns `claude` for `root` and drives it — reading its stream-json
 /// stdout, writing prompts as stream-json stdin, and answering its
 /// permission-hook connections — until the process dies or `output` is
 /// dropped. `binary` and `devscribe_exe` are resolved paths; callers (see
 /// `devscribe`'s `chat_worker`) are responsible for locating `claude` on
 /// PATH first and emitting `Unavailable` if it isn't found, same
-/// convention as `lsp::run`. `session_id` is always DevScribe's own choice
-/// (see `new_session_id`) — passed as `--session-id` for a brand-new
-/// session (`resume: false`) or `--resume` to continue an existing one
-/// (`resume: true`), never left for the CLI to pick on its own.
-pub async fn run(
-    root: PathBuf,
-    binary: PathBuf,
-    devscribe_exe: PathBuf,
-    session_id: String,
-    resume: bool,
-    mut output: mpsc::Sender<ClaudeEvent>,
-) {
+/// convention as `lsp::run`. See `SessionOptions` for the rest.
+pub async fn run(root: PathBuf, binary: PathBuf, devscribe_exe: PathBuf, options: SessionOptions, mut output: mpsc::Sender<ClaudeEvent>) {
+    let SessionOptions { session_id, resume, mode } = options;
     let run_id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default());
     let socket_path = std::env::temp_dir().join(format!("devscribe-claude-{run_id}.sock"));
     let settings_path = std::env::temp_dir().join(format!("devscribe-claude-{run_id}-settings.json"));
@@ -487,7 +584,7 @@ pub async fn run(
         return;
     }
 
-    let settings = generate_settings(&devscribe_exe, &socket_path);
+    let settings = generate_settings(&devscribe_exe, &socket_path, mode);
     let Ok(settings_json) = serde_json::to_string(&settings) else {
         let _ = output.send(ClaudeEvent::Unavailable("couldn't serialize the generated hook settings".into())).await;
         return;
@@ -505,13 +602,17 @@ pub async fn run(
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
+        .arg("--include-partial-messages")
         .arg("--permission-mode")
-        .arg("acceptEdits")
+        .arg(mode.cli_value())
         .arg("--disallowedTools")
         .arg("Bash")
-        .arg("--strict-mcp-config")
         .arg("--settings")
         .arg(&settings_path);
+    // No `--strict-mcp-config`: the session loads whatever MCP servers are
+    // actually configured for this machine/account (Gmail, Calendar,
+    // Drive, DesignSync once authorized, anything else), same as a normal
+    // interactive `claude` session or VS Code's Claude Code extension.
     if resume {
         command.arg("--resume").arg(&session_id);
     } else {
