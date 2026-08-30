@@ -94,8 +94,26 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
     let errors = editor.diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::ERROR).count();
     let warnings = editor.diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::WARNING).count();
     let lang_label = editor.language.map(|l| l.label()).unwrap_or("Plain Text");
+    let diff_counts = editor.diff_counts();
 
     let mut right = row![].spacing(12.0).align_y(Alignment::Center);
+    if let Some((inserted, deleted)) = diff_counts {
+        if inserted > 0 || deleted > 0 {
+            right = right.push(
+                row![
+                    text(format!("+{inserted}"))
+                        .font(fonts::mono(Weight::Medium))
+                        .size(crate::text_scale::px(11.0))
+                        .color(color(p.status_success)),
+                    text(format!("-{deleted}"))
+                        .font(fonts::mono(Weight::Medium))
+                        .size(crate::text_scale::px(11.0))
+                        .color(color(p.status_danger)),
+                ]
+                .spacing(6.0),
+            );
+        }
+    }
     if errors > 0 {
         right = right.push(
             text(format!("{errors} error{}", if errors == 1 { "" } else { "s" }))

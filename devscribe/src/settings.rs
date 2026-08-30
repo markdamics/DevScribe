@@ -153,7 +153,10 @@ fn density_from_key(key: &str) -> Option<Density> {
     Density::ALL.into_iter().find(|density| density_key(*density) == key)
 }
 
-fn chat_mode_key(mode: ChatMode) -> &'static str {
+/// `pub(crate)`, not private — `state.rs`'s `capture_session`/`restore_session`
+/// reuse this same stable-key round-trip for the per-project persisted
+/// session's `chat_mode` field, rather than duplicating the mapping.
+pub(crate) fn chat_mode_key(mode: ChatMode) -> &'static str {
     match mode {
         ChatMode::Docked => "Docked",
         ChatMode::Collapsed => "Collapsed",
@@ -161,7 +164,7 @@ fn chat_mode_key(mode: ChatMode) -> &'static str {
     }
 }
 
-fn chat_mode_from_key(key: &str) -> Option<ChatMode> {
+pub(crate) fn chat_mode_from_key(key: &str) -> Option<ChatMode> {
     ChatMode::ALL.into_iter().find(|mode| chat_mode_key(*mode) == key)
 }
 

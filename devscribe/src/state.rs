@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent, PermissionMode};
-use devscribe_core::diff::{DiffLine, GutterMark, Hunk};
+use devscribe_core::diff::{DiffLine, DiffLineKind, GutterMark, Hunk};
 use devscribe_core::git::{ChangeKind, Repo};
 use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguage};
 use devscribe_core::outline;
@@ -20,6 +20,7 @@ use iced::mouse;
 use crate::density::Density;
 use crate::fs_tree::{self, Node};
 use crate::recent_projects;
+use crate::session;
 use crate::settings;
 use crate::ui::editor_canvas;
 
@@ -595,6 +596,19 @@ impl EditorState {
             .text()
             .char_to_byte(self.document.char_index(self.cursor.line, self.cursor.col));
         outline::breadcrumbs_at(tree, self.document.text(), byte, lang)
+    }
+
+    /// Inserted/deleted line counts for this file's diff against `HEAD` —
+    /// the breadcrumb bar's `+N -N` readout. `None` when `diff` isn't
+    /// `Changed` (no repo, untracked, or up to date), same as `gutter_marks`
+    /// and `hunks` being empty in those cases.
+    pub fn diff_counts(&self) -> Option<(usize, usize)> {
+        let DiffStatus::Changed(lines) = &self.diff else {
+            return None;
+        };
+        let inserted = lines.iter().filter(|l| l.kind == DiffLineKind::Insert).count();
+        let deleted = lines.iter().filter(|l| l.kind == DiffLineKind::Delete).count();
+        Some((inserted, deleted))
     }
 
     /// Inserts at `char_idx`, keeping `highlights` aligned — see
@@ -1197,6 +1211,12 @@ pub struct State {
     pub open_tabs: Vec<OpenTab>,
     /// `None` only when `open_tabs` is empty.
     pub active_tab: Option<TabKey>,
+    /// `true` only while `restore_session` is re-opening tabs from a
+    /// persisted session — suppresses `persist_session`'s writes for that
+    /// duration so restoring a session doesn't immediately re-save a
+    /// partially-restored one over top of the file it's reading from. Never
+    /// persisted itself.
+    restoring_session: bool,
     pub chat_mode: ChatMode,
     /// `true` while the AI Chat Assist panel is open as a full tab instead
     /// of docked/collapsed/floating — see `TabKey::Chat`/`chat_is_active`.
@@ -1615,11 +1635,12 @@ impl Default for State {
         let settings = startup_settings();
         let Startup { welcome_open, root, snapshot, repo, recent_projects, welcome_rows } = startup(settings.show_hidden_files);
 
-        Self {
+        let mut state = Self {
             theme_mode: settings.theme_mode,
             accent: settings.accent,
             open_tabs: Vec::new(),
             active_tab: None,
+            restoring_session: false,
             chat_mode: settings.chat_mode,
             chat_tab_open: false,
             chat_panel_width: settings.chat_panel_width,
@@ -1691,7 +1712,12 @@ impl Default for State {
             flash: None,
             closed_tabs: Vec::new(),
             next_untitled_id: 0,
+        };
+
+        if !state.welcome_open {
+            restore_session(&mut state);
         }
+        state
     }
 }
 
@@ -2032,6 +2058,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::SelectOpenTab(key) => {
             if state.open_tabs.iter().any(|t| t.key() == key) {
                 state.active_tab = Some(key);
+                persist_session(state);
             }
         }
         Message::CloseTab(key) => close_tab(state, &key),
@@ -2048,12 +2075,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.chat_mode = ChatMode::Docked;
             state.chat_view_menu_open = false;
             persist_settings(state);
+            persist_session(state);
         }
         Message::ChatCollapse => {
             leave_chat_tab(state);
             state.chat_mode = ChatMode::Collapsed;
             state.chat_view_menu_open = false;
             persist_settings(state);
+            persist_session(state);
         }
         Message::ChatOpenTab => {
             state.chat_tab_open = true;
@@ -2061,15 +2090,18 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.active_tab = Some(TabKey::Chat);
             state.chat_view_menu_open = false;
             persist_settings(state);
+            persist_session(state);
         }
         Message::ChatDockFromTab => {
             leave_chat_tab(state);
             state.chat_mode = ChatMode::Docked;
             state.chat_view_menu_open = false;
             persist_settings(state);
+            persist_session(state);
         }
         Message::ChatCloseTab => {
             leave_chat_tab(state);
+            persist_session(state);
         }
         Message::ChatInputAction(action) => state.chat.input.perform(action),
         Message::ChatSubmit => submit_chat_prompt(state),
@@ -2164,17 +2196,30 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             // disappear, same as the mockup's own `collapseSidebar` handler.
             state.projects_open = false;
             state.ctx_menu = None;
+            persist_session(state);
         }
-        Message::ExpandSidebar => state.sidebar_collapsed = false,
+        Message::ExpandSidebar => {
+            state.sidebar_collapsed = false;
+            persist_session(state);
+        }
         Message::SidebarResizeStarted => state.sidebar_resizing = true,
         Message::SidebarResizeDragged(x) => {
             if state.sidebar_resizing {
                 state.sidebar_width = x.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
             }
         }
-        Message::SidebarResizeEnded => state.sidebar_resizing = false,
-        Message::ToggleChangesPanel => state.changes_panel_open = !state.changes_panel_open,
-        Message::ToggleProblemsPanel => state.problems_panel_open = !state.problems_panel_open,
+        Message::SidebarResizeEnded => {
+            state.sidebar_resizing = false;
+            persist_session(state);
+        }
+        Message::ToggleChangesPanel => {
+            state.changes_panel_open = !state.changes_panel_open;
+            persist_session(state);
+        }
+        Message::ToggleProblemsPanel => {
+            state.problems_panel_open = !state.problems_panel_open;
+            persist_session(state);
+        }
         Message::OpenDiagnosticAt(path, pos) => {
             open_or_focus_file(state, path.clone());
             if let Some(editor) = find_editor_mut(state, &path) {
@@ -2462,6 +2507,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if !state.collapsed_dirs.remove(&path) {
                 state.collapsed_dirs.insert(path);
             }
+            persist_session(state);
         }
         Message::JsonToggle(key) => {
             if let Some(path) = active_file_path(state)
@@ -2616,6 +2662,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if state.save_on_focus_loss {
                 save_all_dirty_files(state);
             }
+            // A checkpoint for whatever drifted since the last discrete
+            // session-changing action (`persist_session`'s other call
+            // sites) without saving on every keystroke/cursor move — most
+            // notably the active tab's cursor position, which otherwise
+            // only gets captured on a tab switch/open/close. Unconditional,
+            // unlike `save_on_focus_loss` above: that toggle is about
+            // writing file *contents* to disk, a materially bigger
+            // decision than recording where tabs/cursors/panels are.
+            persist_session(state);
         }
         Message::WindowFocused => {
             if !state.welcome_open {
@@ -3102,6 +3157,120 @@ fn persist_settings(state: &State) {
     });
 }
 
+/// Builds the persisted-session shape (`session::Session`) from the live
+/// `State` — the inverse of `restore_session`. `TabKey::Search`/`TabKey::Chat`
+/// and untitled scratch buffers (`EditorState.document.path().is_none()`)
+/// are never recorded — see `session::Session`'s doc for why.
+fn capture_session(state: &State) -> session::Session {
+    let open_tabs: Vec<session::SessionTab> = state
+        .open_tabs
+        .iter()
+        .filter_map(|tab| match tab {
+            OpenTab::File(editor) => {
+                editor.document.path()?;
+                Some(session::SessionTab {
+                    path: editor.path.clone(),
+                    is_diff: false,
+                    cursor_line: editor.cursor.line,
+                    cursor_col: editor.cursor.col,
+                })
+            }
+            OpenTab::Diff(path) => {
+                Some(session::SessionTab { path: path.clone(), is_diff: true, cursor_line: 0, cursor_col: 0 })
+            }
+        })
+        .collect();
+    let active_tab = state.active_tab.as_ref().and_then(|active| match active {
+        TabKey::File(path) => open_tabs.iter().position(|t| !t.is_diff && &t.path == path),
+        TabKey::Diff(path) => open_tabs.iter().position(|t| t.is_diff && &t.path == path),
+        TabKey::Search | TabKey::Chat => None,
+    });
+    session::Session {
+        open_tabs,
+        active_tab,
+        sidebar_width: state.sidebar_width,
+        sidebar_collapsed: state.sidebar_collapsed,
+        collapsed_dirs: state.collapsed_dirs.iter().cloned().collect(),
+        changes_panel_open: state.changes_panel_open,
+        problems_panel_open: state.problems_panel_open,
+        chat_mode: settings::chat_mode_key(state.chat_mode).to_string(),
+        chat_tab_open: state.chat_tab_open,
+        chat_tab_active: state.active_tab == Some(TabKey::Chat),
+    }
+}
+
+/// The single place any tab/sidebar/panel layout change gets persisted
+/// (`session::save`), keyed by `state.root` — same shape as
+/// `persist_settings`. A no-op with no project open (`state.root` is
+/// meaningless then) or while `restore_session` is actively re-opening tabs
+/// (`state.restoring_session`), so restoring a session can't stomp the very
+/// file it's mid-read from with a partially-restored snapshot.
+fn persist_session(state: &State) {
+    if state.restoring_session || state.welcome_open {
+        return;
+    }
+    session::save(&state.root, &capture_session(state));
+}
+
+/// Re-opens `state.root`'s persisted session (`session::load`), if one was
+/// ever recorded for it — every open tab (with its cursor position), which
+/// one was active, the sidebar/panel layout, and the AI Chat Assist panel's
+/// presentation (open/closed, docked/collapsed/tab). Deliberately does *not*
+/// restore which `claude` session was live — `state.chat_session_id` stays
+/// whatever `reset_project_scoped_state` just minted, so a restored-open
+/// panel always starts a brand new conversation rather than resuming the
+/// last one. Called after a project's tree/git snapshot is already in place
+/// (`apply_loaded_project`, and `State::default()`'s startup auto-reopen),
+/// so opening each tab's file can immediately diff it against `HEAD` the
+/// same as any other open.
+///
+/// A no-op, leaving the fresh-snapshot defaults already in `state` (every
+/// directory collapsed, no tabs, chat closed), when nothing was ever saved
+/// for this root — otherwise a project's very first-ever open would restore
+/// an empty-but-not-default session (e.g. an unclamped `sidebar_width` of
+/// `0.0`) instead of `snapshot_project`'s/`reset_project_scoped_state`'s
+/// intended first-run defaults.
+fn restore_session(state: &mut State) {
+    let session = session::load(&state.root);
+    if session == session::Session::default() {
+        return;
+    }
+    state.restoring_session = true;
+    for tab in &session.open_tabs {
+        if tab.is_diff {
+            open_or_focus_diff(state, tab.path.clone());
+            continue;
+        }
+        open_or_focus_file(state, tab.path.clone());
+        if let Some(editor) = find_editor_mut(state, &tab.path) {
+            // Clamped rather than trusted outright: the file may have
+            // shrunk (or been emptied) on disk since the session was saved.
+            let line = tab.cursor_line.min(editor.document.line_count().saturating_sub(1));
+            let col = tab.cursor_col.min(editor.document.line_len_chars(line));
+            editor.click(line, col, false);
+        }
+    }
+    if let Some(tab) = session.active_tab.and_then(|i| session.open_tabs.get(i)) {
+        let key = if tab.is_diff { TabKey::Diff(tab.path.clone()) } else { TabKey::File(tab.path.clone()) };
+        if state.open_tabs.iter().any(|t| t.key() == key) {
+            state.active_tab = Some(key);
+        }
+    }
+    state.sidebar_width = session.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    state.sidebar_collapsed = session.sidebar_collapsed;
+    state.collapsed_dirs = session.collapsed_dirs.into_iter().collect();
+    state.changes_panel_open = session.changes_panel_open;
+    state.problems_panel_open = session.problems_panel_open;
+    if let Some(mode) = settings::chat_mode_from_key(&session.chat_mode) {
+        state.chat_mode = mode;
+    }
+    state.chat_tab_open = session.chat_tab_open;
+    if session.chat_tab_open && session.chat_tab_active {
+        state.active_tab = Some(TabKey::Chat);
+    }
+    state.restoring_session = false;
+}
+
 fn set_theme_mode(state: &mut State, mode: ThemeMode) {
     state.theme_mode = mode;
     persist_settings(state);
@@ -3302,6 +3471,7 @@ fn rename_open_tab(state: &mut State, old_path: &Path, new_path: &Path) {
         Some(ref key) if *key == old_diff_key => state.active_tab = Some(new_diff_key),
         _ => {}
     }
+    persist_session(state);
 }
 
 /// Finishes a Save As (`save_file_as`'s dialog result): repoints the tab
@@ -3713,6 +3883,7 @@ fn open_or_focus_file(state: &mut State, path: PathBuf) {
     let key = TabKey::File(path.clone());
     if state.open_tabs.iter().any(|t| t.key() == key) {
         state.active_tab = Some(key);
+        persist_session(state);
         return;
     }
     if let Ok(document) = Document::open(&path) {
@@ -3720,6 +3891,7 @@ fn open_or_focus_file(state: &mut State, path: PathBuf) {
         state.active_tab = Some(key);
         send_did_open_for(state, &path);
         recompute_diff_for(state, &path);
+        persist_session(state);
     }
 }
 
@@ -3748,6 +3920,7 @@ fn open_or_focus_diff(state: &mut State, path: PathBuf) {
         state.open_tabs.push(OpenTab::Diff(path));
     }
     state.active_tab = Some(key);
+    persist_session(state);
 }
 
 /// Opens a blank tab with no file on disk yet — command palette's "New
@@ -3829,6 +4002,7 @@ fn close_tab(state: &mut State, key: &TabKey) {
             .get(pos.min(state.open_tabs.len().saturating_sub(1)))
             .map(|t| t.key());
     }
+    persist_session(state);
 }
 
 /// Recomputes `path`'s diff against its `HEAD` version, if it's open.
@@ -4070,11 +4244,6 @@ fn start_search(state: &mut State) -> iced::Task<Message> {
     state.search_in_progress = true;
 
     let (task, handle) = iced_runtime::task::blocking(move |mut sender| {
-        // Belt-and-suspenders alongside `logging::init`'s process-wide panic
-        // hook: that hook already logs *that* a panic happened on this
-        // thread, but `catch_unwind` here lets this specific call site say
-        // *what it was doing* (a plain "search thread panicked" beats
-        // hunting for which of several background threads a hook fired on).
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_search(&files, &query))) {
             Ok(outcome) => {
                 let _ = sender.try_send(outcome);
@@ -4138,7 +4307,14 @@ fn start_loading_project(state: &mut State, path: PathBuf, init_git: bool) -> ic
 /// dirty-file guard anywhere else either (`close_tab` already discards
 /// silently), so this matches existing precedent rather than introducing a
 /// new one.
+///
+/// Checkpoints the outgoing project's session first (`persist_session`,
+/// using `state.root` before it's reassigned/cleared below) — otherwise
+/// whatever drifted since the last discrete session-changing action (e.g.
+/// the active tab's cursor position) would be lost the moment the tabs it
+/// belongs to are cleared.
 fn reset_project_scoped_state(state: &mut State) {
+    persist_session(state);
     state.open_tabs.clear();
     state.active_tab = None;
     state.closed_tabs.clear();
@@ -4192,6 +4368,7 @@ fn apply_loaded_project(state: &mut State, loaded: LoadedProject) {
     state.loading_project = None;
     recent_projects::touch(&mut state.recent_projects, root);
     state.welcome_rows = compute_welcome_rows(&state.recent_projects);
+    restore_session(state);
 }
 
 fn close_project(state: &mut State) {
@@ -4233,6 +4410,7 @@ fn toggle_chat(state: &mut State) {
         state.active_tab = Some(TabKey::Chat);
     }
     persist_settings(state);
+    persist_session(state);
 }
 
 /// Clears `chat_tab_open` and, if the chat tab was the active one,

@@ -580,31 +580,12 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, pending_discard: bool, p: Palet
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let mut stats = row![].spacing(8.0).align_y(Alignment::Center);
-    if entry.insertions > 0 {
-        stats = stats.push(
-            text(format!("+{}", entry.insertions))
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(15.0))
-                .color(color(p.status_success)),
-        );
-    }
-    if entry.deletions > 0 {
-        stats = stats.push(
-            text(format!("\u{2212}{}", entry.deletions))
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(15.0))
-                .color(color(p.status_danger)),
-        );
-    }
-
     let contents = row![
         text(name)
             .font(fonts::sans(Weight::Medium))
             .size(crate::text_scale::px(15.0))
             .color(color(p.text_strong))
             .width(Length::Fill),
-        stats,
         widgets::lang_badge(letter, color(kind_color), tint(kind_color, 0.16)),
     ]
     .spacing(8.0)

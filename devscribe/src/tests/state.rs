@@ -1875,3 +1875,193 @@ fn cancel_revert_selected_hunks_leaves_the_buffer_and_selection_untouched() {
     assert!(editor.diff_selected_hunks.contains(&hunk_id), "cancel must not clear the checked hunks, only the confirm step");
     assert_eq!(editor.document.text().to_string(), "a\nx\n");
 }
+
+/// A `State` primed as if a real project were open at `root` — `State::default()`
+/// always builds with `welcome_open: true` in test builds (see `startup`'s
+/// `#[cfg(test)]` doc), so session persistence tests flip these two fields
+/// by hand afterward rather than going through the real project-loading
+/// path.
+fn state_with_project_open(root: PathBuf) -> State {
+    let mut state = State::default();
+    state.welcome_open = false;
+    state.root = root;
+    state
+}
+
+#[test]
+fn capture_session_records_open_tabs_active_tab_and_cursor() {
+    let files = TempFiles::new("capture");
+    let mut state = state_with_project_open(files.a.parent().unwrap().to_path_buf());
+
+    open_or_focus_file(&mut state, files.a.clone());
+    find_editor_mut(&mut state, &files.a).unwrap().cursor = CursorPos { line: 0, col: 1 };
+    open_or_focus_file(&mut state, files.b.clone());
+    open_or_focus_diff(&mut state, files.a.clone());
+
+    let session = capture_session(&state);
+    assert_eq!(session.open_tabs.len(), 3);
+    assert_eq!(session.open_tabs[0], session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 1 });
+    assert_eq!(session.open_tabs[1].path, files.b);
+    assert!(!session.open_tabs[1].is_diff);
+    assert_eq!(session.open_tabs[2], session::SessionTab { path: files.a.clone(), is_diff: true, cursor_line: 0, cursor_col: 0 });
+    assert_eq!(session.active_tab, Some(2), "the diff tab, opened last, should be active");
+}
+
+#[test]
+fn capture_session_skips_untitled_buffers() {
+    let files = TempFiles::new("capture-untitled");
+    let mut state = state_with_project_open(files.a.parent().unwrap().to_path_buf());
+
+    open_or_focus_file(&mut state, files.a.clone());
+    begin_untitled_buffer(&mut state);
+
+    let session = capture_session(&state);
+    assert_eq!(session.open_tabs.len(), 1, "an untitled buffer has no disk identity to restore, so it must not be recorded");
+    assert_eq!(session.open_tabs[0].path, files.a);
+    assert_eq!(session.active_tab, None, "the active tab (untitled) isn't in open_tabs, so there's no index to record");
+}
+
+#[test]
+fn restore_session_reopens_tabs_places_cursor_and_restores_layout() {
+    let files = TempFiles::new("restore");
+    let root = files.a.parent().unwrap().to_path_buf();
+    session::save(
+        &root,
+        &session::Session {
+            open_tabs: vec![
+                session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 1 },
+                session::SessionTab { path: files.b.clone(), is_diff: false, cursor_line: 0, cursor_col: 0 },
+            ],
+            active_tab: Some(1),
+            sidebar_width: 400.0,
+            sidebar_collapsed: true,
+            collapsed_dirs: vec![root.join("target")],
+            changes_panel_open: true,
+            problems_panel_open: true,
+            chat_mode: "Docked".to_string(),
+            chat_tab_open: false,
+            chat_tab_active: false,
+        },
+    );
+
+    let mut state = state_with_project_open(root.clone());
+    let session_id_before_restore = state.chat_session_id.clone();
+    restore_session(&mut state);
+
+    assert_eq!(state.open_tabs.len(), 2);
+    assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())));
+    assert_eq!(find_editor(&state, &files.a).unwrap().cursor, CursorPos { line: 0, col: 1 });
+    assert_eq!(state.sidebar_width, 400.0);
+    assert!(state.sidebar_collapsed);
+    assert!(state.collapsed_dirs.contains(&root.join("target")));
+    assert!(state.changes_panel_open);
+    assert!(state.problems_panel_open);
+    assert_eq!(state.chat_mode, ChatMode::Docked);
+    assert_eq!(
+        state.chat_session_id, session_id_before_restore,
+        "the conversation itself must never resume across a restore — only its presentation does"
+    );
+}
+
+#[test]
+fn restore_session_reopens_the_chat_tab_and_makes_it_active() {
+    let files = TempFiles::new("restore-chat-tab");
+    let root = files.a.parent().unwrap().to_path_buf();
+    session::save(
+        &root,
+        &session::Session {
+            open_tabs: vec![session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 0 }],
+            active_tab: Some(0),
+            sidebar_width: 300.0,
+            sidebar_collapsed: false,
+            collapsed_dirs: Vec::new(),
+            changes_panel_open: false,
+            problems_panel_open: false,
+            chat_mode: "Closed".to_string(),
+            chat_tab_open: true,
+            chat_tab_active: true,
+        },
+    );
+
+    let mut state = state_with_project_open(root);
+    let session_id_before_restore = state.chat_session_id.clone();
+    restore_session(&mut state);
+
+    assert!(state.chat_tab_open);
+    assert_eq!(state.active_tab, Some(TabKey::Chat), "the chat tab was active at save time, so it must win over the last-opened file tab");
+    assert_eq!(
+        state.chat_session_id, session_id_before_restore,
+        "reopening the chat tab on restore must start a new conversation, not resume the old one"
+    );
+}
+
+#[test]
+fn capture_session_records_chat_presentation() {
+    let files = TempFiles::new("capture-chat");
+    let mut state = state_with_project_open(files.a.parent().unwrap().to_path_buf());
+    state.chat_tab_open = true;
+    state.chat_mode = ChatMode::Closed;
+    state.active_tab = Some(TabKey::Chat);
+
+    let session = capture_session(&state);
+    assert_eq!(session.chat_mode, "Closed");
+    assert!(session.chat_tab_open);
+    assert!(session.chat_tab_active);
+    assert_eq!(session.active_tab, None, "TabKey::Chat has no backing OpenTab entry to index");
+}
+
+#[test]
+fn restore_session_is_a_noop_when_nothing_was_ever_saved() {
+    let files = TempFiles::new("restore-fresh");
+    let root = files.a.parent().unwrap().to_path_buf();
+
+    let mut state = state_with_project_open(root);
+    let sidebar_width_before = state.sidebar_width;
+    restore_session(&mut state);
+
+    assert!(state.open_tabs.is_empty(), "nothing was ever saved for this root, so no tabs should open");
+    assert_eq!(state.sidebar_width, sidebar_width_before, "must leave the fresh-snapshot default in place, not an unclamped 0.0");
+}
+
+#[test]
+fn restore_session_clamps_a_cursor_past_the_files_current_end() {
+    let files = TempFiles::new("restore-clamp");
+    let root = files.a.parent().unwrap().to_path_buf();
+    session::save(
+        &root,
+        &session::Session {
+            open_tabs: vec![session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 50, cursor_col: 50 }],
+            active_tab: Some(0),
+            sidebar_width: 300.0,
+            sidebar_collapsed: false,
+            collapsed_dirs: Vec::new(),
+            changes_panel_open: false,
+            problems_panel_open: false,
+            chat_mode: String::new(),
+            chat_tab_open: false,
+            chat_tab_active: false,
+        },
+    );
+
+    let mut state = state_with_project_open(root);
+    restore_session(&mut state);
+
+    let cursor = find_editor(&state, &files.a).unwrap().cursor;
+    assert_eq!(cursor.line, 0, "a.txt is a single line, so line 50 must clamp down to the last real line");
+    assert!(cursor.col <= 1, "a.txt's only line is one char (\"a\"), so col must clamp down to it");
+}
+
+#[test]
+fn open_and_close_a_tab_round_trips_through_the_real_session_file() {
+    let files = TempFiles::new("round-trip");
+    let root = files.a.parent().unwrap().to_path_buf();
+    let mut state = state_with_project_open(root.clone());
+
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+
+    let mut reopened = state_with_project_open(root);
+    restore_session(&mut reopened);
+    assert_eq!(reopened.open_tabs.len(), 2, "both real message-driven opens must have persisted, not just the direct capture_session call");
+    assert_eq!(reopened.active_tab, Some(TabKey::File(files.b.clone())));
+}
