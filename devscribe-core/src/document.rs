@@ -104,9 +104,24 @@ impl Document {
     }
 
     /// The text of `line`, excluding its trailing line terminator.
+    ///
+    /// A real project can hold lines with hundreds of thousands of chars
+    /// (a minified bundle, a generated blob) — anything rendering only a
+    /// prefix of the line should reach for `line_text_capped` instead of
+    /// materializing the whole thing.
     pub fn line_text(&self, line: usize) -> String {
+        self.line_text_capped(line, usize::MAX)
+    }
+
+    /// The first `max_chars` chars of `line`, excluding its trailing line
+    /// terminator. Identical to `line_text` for ordinary lines; the point is
+    /// pathological ones, where materializing the full line allocates
+    /// megabytes per call. The editor canvas cannot show more columns than
+    /// fit its width (there is no horizontal scrolling), so it asks only for
+    /// what it will actually draw.
+    pub fn line_text_capped(&self, line: usize, max_chars: usize) -> String {
         let line = line.min(self.text.len_lines().saturating_sub(1));
-        let len = self.line_len_chars(line);
+        let len = self.line_len_chars(line).min(max_chars);
         let start = self.text.line_to_char(line);
         self.text.slice(start..start + len).to_string()
     }
@@ -126,6 +141,22 @@ impl Document {
         let line = self.text.char_to_line(char_idx);
         let col = char_idx - self.text.line_to_char(line);
         (line, col)
+    }
+
+    /// The char range of `line` including its trailing line terminator, so
+    /// removing it deletes the line as a whole rather than leaving a blank
+    /// one behind. If `line` is the last line and has no terminator of its
+    /// own (the common case: files don't end with a blank line), the range
+    /// extends to the document's end instead of past it.
+    pub fn line_char_range_with_terminator(&self, line: usize) -> std::ops::Range<usize> {
+        let line = line.min(self.text.len_lines().saturating_sub(1));
+        let start = self.text.line_to_char(line);
+        let end = if line + 1 < self.text.len_lines() {
+            self.text.line_to_char(line + 1)
+        } else {
+            self.text.len_chars()
+        };
+        start..end
     }
 }
 

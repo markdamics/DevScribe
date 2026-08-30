@@ -8,8 +8,8 @@ use crate::fonts;
 use crate::state::{self, ChatMode, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
-    chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash, json_view,
-    search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
+    breadcrumb_bar, chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash,
+    json_view, search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
 
@@ -28,6 +28,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     let caret_visible = state.caret_visible;
     let highlights = editor.highlights.clone();
     let diagnostics = editor.diagnostics.clone();
+    let gutter_marks = editor.gutter_marks.clone();
     let problem_lens_enabled = state.problem_lens_enabled;
     let font_size = state.editor_font_size;
     let scroll_offset = editor.scroll_offset;
@@ -44,6 +45,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             caret_visible,
             highlights: highlights.clone(),
             diagnostics: diagnostics.clone(),
+            gutter_marks: gutter_marks.clone(),
             problem_lens_enabled,
             font_size,
             find_matches: find_matches.clone(),
@@ -59,7 +61,11 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             )));
 
         scrollable(canvas_widget)
-            .on_scroll(|viewport| Message::EditorScrolled(viewport.absolute_offset().y))
+            .id(state::editor_scroll_id())
+            .on_scroll(|viewport| Message::EditorScrolled {
+                offset: viewport.absolute_offset().y,
+                viewport_height: viewport.bounds().height,
+            })
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -73,11 +79,16 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             ..container::Style::default()
         });
 
-    if editor.find.is_some() {
+    let editor_area: Element<'static, Message> = if editor.find.is_some() {
         iced::widget::stack![base, find_bar::view(editor, p)].into()
     } else {
         base.into()
-    }
+    };
+
+    column![breadcrumb_bar::view(editor, p), editor_area]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 /// The mockup's styled "no buffer open" state (item 22): a two-line message

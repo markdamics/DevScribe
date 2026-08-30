@@ -6,8 +6,10 @@
 //! was nudged from 32 to 30 to match `--control-h-sm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Density {
-    #[default]
     Spacious,
+    /// The mockup's own default — its shell renders at 38px title/tab bars,
+    /// and `DevScribe.dc.html`'s `density()` falls back to `"Comfortable"`.
+    #[default]
     Comfortable,
     Compact,
 }

@@ -378,6 +378,68 @@ fn window_unfocused_only_saves_when_the_toggle_is_on() {
     );
 }
 
+/// Drives the real `git` CLI — same rationale as
+/// `devscribe_core::git::tests::git`: simplest way to get a realistic
+/// index/worktree/HEAD combination without hand-assembling `gix` objects.
+fn git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .status()
+        .expect("git must be on PATH for this test");
+    assert!(status.success(), "`git {args:?}` failed");
+}
+
+#[test]
+fn window_focused_catches_up_a_change_the_watcher_never_saw() {
+    // The regression this guards: a `git commit` (or `push`, or `checkout`
+    // of a branch that touches no tracked file) never fires the file
+    // watcher, since `.git` itself is in `SKIP_DIRS`. Before `WindowFocused`
+    // existed, `state.changed_files` had no way to learn about that until
+    // the next save.
+    let dir = std::env::temp_dir().join(format!("devscribe-window-focused-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q"]);
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "initial"]);
+
+    let mut state = State { root: dir.clone(), repo: Repo::open(&dir), welcome_open: false, ..State::default() };
+    assert!(state.changed_files.is_empty(), "sanity: nothing changed yet");
+
+    // Simulate an external edit + commit that never touched the watcher,
+    // landing while `state.changed_files` is still the stale, pre-edit
+    // snapshot from before this "terminal" round-trip.
+    std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+
+    let _ = update(&mut state, Message::WindowFocused);
+
+    assert_eq!(state.changed_files.len(), 1, "regaining focus should have re-scanned git status");
+    assert_eq!(state.changed_files[0].path, dir.join("f.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn window_focused_is_a_noop_before_a_project_is_open() {
+    let mut state = State { welcome_open: true, ..State::default() };
+    state.changed_files = vec![ChangesEntry {
+        path: PathBuf::from("stale.txt"),
+        kind: ChangeKind::Modified,
+        insertions: 1,
+        deletions: 0,
+    }];
+
+    let _ = update(&mut state, Message::WindowFocused);
+
+    assert_eq!(state.changed_files.len(), 1, "no project open — must not touch changed_files");
+}
+
 #[test]
 fn recompute_search_caps_a_single_file_with_many_matches_on_one_line() {
     // The real-world failure mode this guards: one file with many
@@ -1294,6 +1356,19 @@ fn chat_toggle_thinking_still_flips_locally_with_no_live_session() {
 }
 
 #[test]
+fn chat_toggle_shell_access_flips_the_field_and_closes_the_popup() {
+    let mut state = State { chat_actions_open: true, ..State::default() };
+    assert!(!state.chat_shell_access_enabled, "sanity: off by default");
+
+    let _ = update(&mut state, Message::ChatToggleShellAccess);
+    assert!(state.chat_shell_access_enabled);
+    assert!(!state.chat_actions_open);
+
+    let _ = update(&mut state, Message::ChatToggleShellAccess);
+    assert!(!state.chat_shell_access_enabled);
+}
+
+#[test]
 fn chat_file_dialog_result_mentions_a_project_file_relative_to_root() {
     let mut state = State { root: PathBuf::from("/some/project"), ..State::default() };
     let _ = update(&mut state, Message::ChatFileDialogResult(Some(PathBuf::from("/some/project/src/engine.rs")), true));
@@ -1451,4 +1526,352 @@ fn chat_input_action_enter_inserts_a_newline_not_a_submit() {
     assert_eq!(state.chat.input.line_count(), 2);
     assert!(state.chat.messages.is_empty(), "inserting a newline must not submit anything");
     assert!(rx.try_recv().is_err(), "nothing should have been sent to the worker");
+}
+
+#[test]
+fn an_edit_updates_find_immediately_and_the_rest_once_the_buffer_settles() {
+    // The split that keeps typing responsive: find matches must track the
+    // buffer keystroke by keystroke (their highlight sits on screen), while
+    // the tree-sitter reparse and JSON reparse — 33 ms on an 850-line file
+    // in a debug build — wait for `EDIT_SETTLE`. A regression in either
+    // direction matters: matches going stale is a visible bug, and the
+    // reparse creeping back onto the keystroke path is the freeze.
+    let dir = std::env::temp_dir().join(format!("devscribe-resync-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.json");
+    std::fs::write(&path, "{\"a\": 1}").unwrap();
+
+    let mut editor = EditorState::new(Document::open(&path).unwrap(), path.clone());
+    editor.find = Some(FindState { query: "a".into(), matches: Vec::new(), current: 0 });
+    editor.refind();
+    assert_eq!(editor.find.as_ref().unwrap().matches.len(), 1);
+    assert!(editor.json.as_ref().unwrap().is_ok(), "sanity: valid JSON parses");
+    assert!(!editor.highlights.is_empty(), "sanity: .json has a wired grammar");
+
+    // Type a second "a" at the end: adds a find match, and breaks the JSON.
+    editor.cursor = editor.document.line_col(editor.document.text().len_chars()).into();
+    editor.insert_text("a");
+
+    assert_eq!(
+        editor.find.as_ref().unwrap().matches.len(),
+        2,
+        "find matches must be recomputed against the edited buffer immediately"
+    );
+    assert!(editor.needs_reparse, "the edit must have armed a deferred reparse");
+    assert!(
+        editor.json.as_ref().unwrap().is_ok(),
+        "the JSON tree is deliberately still the pre-edit one until the buffer settles"
+    );
+
+    editor.reparse_now();
+    assert!(!editor.needs_reparse);
+    assert!(
+        editor.json.as_ref().unwrap().is_err(),
+        "settling must reparse against the edited buffer"
+    );
+    assert!(!editor.highlights.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_matches_stay_document_ordered_so_the_canvas_can_binary_search_them() {
+    // `EditorCanvas::draw` narrows `find_matches` to the visible range with
+    // `partition_point`, which is only correct while the list is sorted by
+    // position. Nothing else enforces that, so pin it here.
+    let mut editor = EditorState::new(
+        Document::from_str("token a\nb token\ntoken token\n"),
+        PathBuf::from("t.txt"),
+    );
+    editor.find = Some(FindState { query: "token".into(), matches: Vec::new(), current: 0 });
+    editor.refind();
+
+    let matches = &editor.find.as_ref().unwrap().matches;
+    assert_eq!(matches.len(), 4);
+    assert!(
+        matches.windows(2).all(|w| w[0].start <= w[1].start && w[0].end <= w[1].end),
+        "matches must be ascending in both start and end: {matches:?}"
+    );
+}
+
+
+#[test]
+fn typing_defers_the_expensive_work_and_one_settle_covers_the_whole_burst() {
+    // The freeze this guards: a tree-sitter reparse, a `HEAD` blob read and
+    // a whole-file LSP `didChange` on *every* keystroke measured ~37 ms per
+    // character on an 850-line file in a debug build. A burst of typing must
+    // arm the timer once and leave exactly one path queued, not N.
+    let files = TempFiles::new("settle");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+
+    assert!(state.edit_settled_at.is_none(), "nothing pending before any edit");
+
+    for _ in 0..5 {
+        update(&mut state, Message::EditorInsertText("x".into()));
+    }
+    assert!(state.edit_settled_at.is_some(), "typing must arm the settle timer");
+    assert_eq!(
+        state.pending_edits,
+        vec![files.a.clone()],
+        "a burst on one file must queue that file once, not once per keystroke"
+    );
+    assert!(
+        find_editor(&state, &files.a).unwrap().needs_reparse,
+        "the reparse must still be pending, not already done"
+    );
+
+    // A tick before the buffer has settled must not fire.
+    update(&mut state, Message::EditSettleTick);
+    assert!(state.edit_settled_at.is_some(), "must not flush before EDIT_SETTLE elapses");
+
+    state.edit_settled_at = Some(Instant::now() - EDIT_SETTLE);
+    update(&mut state, Message::EditSettleTick);
+    assert!(state.edit_settled_at.is_none(), "a settled buffer must flush");
+    assert!(state.pending_edits.is_empty());
+    assert!(!find_editor(&state, &files.a).unwrap().needs_reparse);
+}
+
+#[test]
+fn saving_flushes_pending_work_so_the_diff_is_not_left_stale() {
+    // Deferred work must never outlive the moment it matters. Save is one
+    // such moment: the on-disk file changes, so a diff computed from the
+    // pre-edit buffer would be wrong and would stay wrong.
+    let files = TempFiles::new("settle-save");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    update(&mut state, Message::EditorInsertText("x".into()));
+    assert!(state.edit_settled_at.is_some());
+
+    let _ = save_current_file(&mut state);
+    assert!(state.edit_settled_at.is_none(), "save must flush the settle queue");
+    assert!(state.pending_edits.is_empty());
+}
+
+#[test]
+fn highlight_spans_slide_across_an_edit_instead_of_going_out_of_register() {
+    // Between a keystroke and the deferred reparse, spans point into a
+    // buffer that has moved. A typing burst never lets the debounce fire, so
+    // without this shift the colouring of everything after the cursor would
+    // drift further out of alignment with every character typed.
+    let mut editor = EditorState::new(
+        Document::from_str("let a = 1;
+let b = 2;
+"),
+        PathBuf::from("t.rs"),
+    );
+    let second_line_byte = editor.document.text().line_to_byte(1);
+    let before: Vec<_> = editor
+        .highlights
+        .iter()
+        .filter(|s| s.start >= second_line_byte)
+        .copied()
+        .collect();
+    assert!(!before.is_empty(), "sanity: the second line is highlighted");
+
+    // Insert 3 chars at the very start of the buffer.
+    editor.cursor = CursorPos { line: 0, col: 0 };
+    editor.insert_text("xyz");
+
+    let after: Vec<_> = editor
+        .highlights
+        .iter()
+        .filter(|s| s.start >= second_line_byte + 3)
+        .copied()
+        .collect();
+    assert_eq!(after.len(), before.len());
+    for (b, a) in before.iter().zip(&after) {
+        assert_eq!(a.start, b.start + 3, "every span past the edit shifts by the insert");
+        assert_eq!(a.end, b.end + 3);
+        assert_eq!(a.kind, b.kind);
+    }
+
+    // And a deletion pulls them back.
+    editor.cursor = CursorPos { line: 0, col: 3 };
+    for _ in 0..3 {
+        editor.backspace();
+    }
+    let restored: Vec<_> = editor
+        .highlights
+        .iter()
+        .filter(|s| s.start >= second_line_byte)
+        .copied()
+        .collect();
+    assert_eq!(restored, before, "deleting what was typed must restore the offsets");
+}
+
+#[test]
+fn breadcrumbs_do_not_touch_the_whole_buffer_on_every_cursor_move() {
+    // The regression this guards against: `outline::breadcrumbs_at` reads
+    // small ranges straight off the rope via `get_byte_slice`. Materializing
+    // the whole buffer here — the mistake `resync_after_edit` was built to
+    // stop making — would put a per-frame full-document allocation back on
+    // the cursor-move path this whole feature runs on (every `view()`).
+    let dir = std::env::temp_dir().join(format!("devscribe-breadcrumb-perf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("big.rs");
+    // A large-ish file so a whole-buffer copy would show up in the timing,
+    // not just be lost in noise.
+    let body: String = (0..2000).map(|i| format!("fn f{i}() {{\n    let x = {i};\n}}\n")).collect();
+    std::fs::write(&path, &body).unwrap();
+
+    let mut editor = EditorState::new(Document::open(&path).unwrap(), path.clone());
+    assert!(!editor.needs_reparse, "a fresh EditorState must already have parsed once");
+    let last_line = editor.document.line_count() - 1;
+
+    let start = Instant::now();
+    for line in 0..last_line {
+        editor.cursor = CursorPos { line, col: 4 };
+        let _ = std::hint::black_box(editor.breadcrumbs());
+    }
+    let elapsed = start.elapsed();
+    // Generous budget (a real whole-buffer copy here would run into
+    // milliseconds per call on a file this size, i.e. seconds total) — this
+    // is a regression tripwire, not a tight perf assertion.
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "computing breadcrumbs for every line took {elapsed:?} — looks like it's touching the whole buffer"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn breadcrumbs_go_empty_mid_edit_and_come_back_after_settling() {
+    let dir = std::env::temp_dir().join(format!("devscribe-breadcrumb-settle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.rs");
+    std::fs::write(&path, "fn settle_batch() {\n    let a = 1;\n}\n").unwrap();
+
+    let mut editor = EditorState::new(Document::open(&path).unwrap(), path.clone());
+    editor.cursor = CursorPos { line: 1, col: 4 };
+    assert_eq!(
+        editor.breadcrumbs().iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+        vec!["settle_batch".to_string()],
+        "sanity: breadcrumbs resolve before any edit"
+    );
+
+    editor.insert_text("x");
+    assert!(editor.needs_reparse);
+    assert!(
+        editor.breadcrumbs().is_empty(),
+        "must not show a breadcrumb computed against a tree the live cursor may have outrun"
+    );
+
+    editor.reparse_now();
+    assert_eq!(
+        editor.breadcrumbs().iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+        vec!["settle_batch".to_string()],
+        "must come back once the tree is back in sync"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Builds an `EditorState` whose `diff`/`gutter_marks`/`hunks` are already
+/// populated as if `recompute_diff_for` had run `old` against `new`'s text —
+/// the diff view's "revert selected changes" tests don't need a real git
+/// repo, just this derived state.
+fn editor_with_diff(old: &str, new: &str, path: PathBuf) -> EditorState {
+    let mut editor = EditorState::new(Document::from_str(new), path);
+    let lines = devscribe_core::diff::diff_lines(old, new);
+    let line_count = editor.document.line_count();
+    editor.gutter_marks = Rc::new(devscribe_core::diff::gutter_marks(&lines, line_count));
+    editor.hunks = Rc::new(devscribe_core::diff::hunks(&lines, line_count));
+    editor.diff = DiffStatus::Changed(lines);
+    editor
+}
+
+#[test]
+fn revert_lines_reverts_every_target_as_a_single_undo_step() {
+    let mut editor = editor_with_diff("a\nb\nc\nd\ne\n", "a\nx\nc\ny\ne\n", PathBuf::from("t.txt"));
+    let targets: Vec<usize> = editor.hunks.iter().flat_map(|h| h.marks.iter().map(|(l, _)| *l)).collect();
+    assert_eq!(targets.len(), 2, "sanity: two separate one-line replacements");
+
+    assert!(editor.revert_lines(&targets));
+    assert_eq!(editor.document.text().to_string(), "a\nb\nc\nd\ne\n");
+    assert_eq!(editor.undo_stack.len(), 1, "a batch revert must be one undo step, not one per hunk");
+
+    assert!(editor.undo());
+    assert_eq!(editor.document.text().to_string(), "a\nx\nc\ny\ne\n", "undo should restore the pre-revert buffer in one step");
+}
+
+#[test]
+fn revert_lines_processes_descending_so_an_earlier_target_does_not_shift_a_later_ones_line_number() {
+    // A `RemovedAbove` revert re-inserts a line above its target, shifting
+    // every line at or below it down by one. If targets were applied in
+    // ascending order, reverting the first (lowest) target here would push
+    // the second target's line number out from under it.
+    let mut editor = editor_with_diff("a\nb\nc\nd\n", "a\nc\n", PathBuf::from("t.txt"));
+    let targets: Vec<usize> = editor.hunks.iter().flat_map(|h| h.marks.iter().map(|(l, _)| *l)).collect();
+
+    assert!(editor.revert_lines(&targets));
+    assert_eq!(editor.document.text().to_string(), "a\nb\nc\nd\n");
+}
+
+#[test]
+fn revert_lines_is_a_noop_for_targets_with_no_mark() {
+    let mut editor = editor_with_diff("a\nb\n", "a\nx\n", PathBuf::from("t.txt"));
+    assert!(!editor.revert_lines(&[5, 6]), "no such lines have a gutter mark");
+    assert_eq!(editor.document.text().to_string(), "a\nx\n");
+}
+
+#[test]
+fn toggle_diff_hunk_selected_flips_membership() {
+    let files = TempFiles::new("diff-toggle");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    *find_editor_mut(&mut state, &files.a).unwrap() = editor_with_diff("a\n", "x\n", files.a.clone());
+    let hunk_id = find_editor(&state, &files.a).unwrap().hunks[0].range.start;
+
+    let _ = update(&mut state, Message::ToggleDiffHunkSelected { path: files.a.clone(), hunk_id });
+    assert!(find_editor(&state, &files.a).unwrap().diff_selected_hunks.contains(&hunk_id));
+
+    let _ = update(&mut state, Message::ToggleDiffHunkSelected { path: files.a.clone(), hunk_id });
+    assert!(!find_editor(&state, &files.a).unwrap().diff_selected_hunks.contains(&hunk_id));
+}
+
+#[test]
+fn confirm_revert_selected_hunks_reverts_only_the_checked_hunks() {
+    let files = TempFiles::new("diff-revert-selected");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    *find_editor_mut(&mut state, &files.a).unwrap() =
+        editor_with_diff("a\nb\nc\nd\ne\n", "a\nx\nc\ny\ne\n", files.a.clone());
+    let path = files.a.clone();
+    let first_hunk_id = find_editor(&state, &path).unwrap().hunks[0].range.start;
+
+    let _ = update(&mut state, Message::ToggleDiffHunkSelected { path: path.clone(), hunk_id: first_hunk_id });
+    let _ = update(&mut state, Message::PromptRevertSelectedHunks(path.clone()));
+    assert!(find_editor(&state, &path).unwrap().pending_hunk_revert);
+
+    let _ = update(&mut state, Message::ConfirmRevertSelectedHunks(path.clone()));
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert!(!editor.pending_hunk_revert);
+    assert!(editor.diff_selected_hunks.is_empty());
+    assert_eq!(
+        editor.document.text().to_string(),
+        "a\nb\nc\ny\ne\n",
+        "only the checked hunk (b -> x) should revert; the other (d -> y) stays"
+    );
+}
+
+#[test]
+fn cancel_revert_selected_hunks_leaves_the_buffer_and_selection_untouched() {
+    let files = TempFiles::new("diff-revert-cancel");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    *find_editor_mut(&mut state, &files.a).unwrap() = editor_with_diff("a\nb\n", "a\nx\n", files.a.clone());
+    let path = files.a.clone();
+    let hunk_id = find_editor(&state, &path).unwrap().hunks[0].range.start;
+
+    let _ = update(&mut state, Message::ToggleDiffHunkSelected { path: path.clone(), hunk_id });
+    let _ = update(&mut state, Message::PromptRevertSelectedHunks(path.clone()));
+    let _ = update(&mut state, Message::CancelRevertSelectedHunks(path.clone()));
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert!(!editor.pending_hunk_revert);
+    assert!(editor.diff_selected_hunks.contains(&hunk_id), "cancel must not clear the checked hunks, only the confirm step");
+    assert_eq!(editor.document.text().to_string(), "a\nx\n");
 }

@@ -180,7 +180,7 @@ pub const fn palette(mode: ThemeMode, accent: Accent) -> Palette {
             surface_raised: Rgba::hex(0x111823),
             surface_sunken: Rgba::hex(0x04060A),
             surface_inset: Rgba::hex_a(0x0B1017, 0.502),
-            surface_hover: Rgba::hex_a(0x2A3B52, 0.22),
+            surface_hover: Rgba::hex_a(0x182230, 0.059),
             overlay_scrim: Rgba::hex_a(0x04060A, 0.788),
 
             text_strong: Rgba::hex(0xF5F7FA),
@@ -215,7 +215,7 @@ pub const fn palette(mode: ThemeMode, accent: Accent) -> Palette {
             surface_raised: Rgba::hex(0xFFFFFF),
             surface_sunken: Rgba::hex(0xE9EDF3),
             surface_inset: Rgba::hex_a(0xE9EDF3, 0.702),
-            surface_hover: Rgba::hex_a(0x0B1017, 0.15),
+            surface_hover: Rgba::hex_a(0x0B1017, 0.039),
             overlay_scrim: Rgba::hex_a(0x0B1017, 0.651),
 
             text_strong: Rgba::hex(0x070A0F),
@@ -375,3 +375,7 @@ impl Default for Theme {
         Self::new(ThemeMode::default(), Accent::default())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/theme.rs"]
+mod tests;

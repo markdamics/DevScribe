@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent, PermissionMode};
-use devscribe_core::diff::DiffLine;
+use devscribe_core::diff::{DiffLine, GutterMark, Hunk};
 use devscribe_core::git::{ChangeKind, Repo};
 use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguage};
+use devscribe_core::outline;
 use devscribe_core::search::{self, SearchHit};
 use devscribe_core::syntax::{self, Span};
 use devscribe_core::theme::{Accent, ThemeMode};
@@ -19,6 +21,7 @@ use crate::density::Density;
 use crate::fs_tree::{self, Node};
 use crate::recent_projects;
 use crate::settings;
+use crate::ui::editor_canvas;
 
 /// Identifies one open tab. Doubles as the dedup/focus key: opening a file
 /// or diff that's already open focuses the matching tab instead of opening
@@ -372,9 +375,23 @@ pub struct EditorState {
     pub cursor: CursorPos,
     pub selection_anchor: Option<CursorPos>,
     pub language: Option<syntax::Language>,
-    pub highlights: Vec<Span>,
+    /// `Rc` because `shell.rs` clones this into the canvas program on every
+    /// `view()` — and again per layout pass inside `responsive`. A large
+    /// file's span list runs to hundreds of thousands of entries, so a real
+    /// clone there was megabytes of copying several times a second (the
+    /// caret-blink subscription alone redraws 2x/sec).
+    pub highlights: Rc<Vec<Span>>,
     highlighter: syntax::Highlighter,
-    pub diagnostics: Vec<EditorDiagnostic>,
+    /// A second, independent parse of the same buffer — see
+    /// `devscribe_core::outline`'s module doc for why `highlighter` above
+    /// can't supply this itself. `None` for a file with no landmark table
+    /// wired for its language, or one that hasn't parsed successfully.
+    /// Recomputed alongside `highlights` at settle time; while
+    /// `needs_reparse` is set, `breadcrumbs()` doesn't read it — a tree
+    /// this stale could point past the live buffer's own end.
+    tree: Option<outline::Tree>,
+    /// `Rc` for the same reason as `highlights`.
+    pub diagnostics: Rc<Vec<EditorDiagnostic>>,
     /// `Some(Ok(_))`/`Some(Err(parse_message))` for `.json` files, `None`
     /// otherwise. Recomputed on every edit, like `highlights`.
     pub json: Option<Result<serde_json::Value, String>>,
@@ -382,13 +399,44 @@ pub struct EditorState {
     pub json_collapsed: HashSet<String>,
     /// This file's content at `HEAD` diffed against the live buffer.
     pub diff: DiffStatus,
+    /// One entry per buffer line, derived from `diff` — the editor gutter's
+    /// per-line added/modified/removed indicator, and what `revert_line`
+    /// acts on. Empty when `diff` isn't `Changed`. `Rc` for the same reason
+    /// as `highlights`: cloned into the canvas program on every `view()`.
+    pub gutter_marks: Rc<Vec<Option<GutterMark>>>,
+    /// Same grouping as `gutter_marks`, kept as hunks rather than flattened
+    /// per-line — what the diff view's "revert selected changes" selects
+    /// and acts on. Empty when `diff` isn't `Changed`, recomputed alongside
+    /// it.
+    pub hunks: Rc<Vec<Hunk>>,
+    /// Hunks currently checked in the diff view, keyed by `Hunk::range.start`
+    /// (stable while `diff`/`hunks` don't change, which is the only time
+    /// this is read). Cleared whenever `diff` is recomputed, since a hunk at
+    /// that index may no longer be the same change once the buffer or `HEAD`
+    /// has moved.
+    pub diff_selected_hunks: HashSet<usize>,
+    /// Whether the diff view's "Revert selected" has been clicked once and
+    /// is waiting on its confirm/cancel step — same two-step shape as the
+    /// sidebar's `State::pending_discard`.
+    pub pending_hunk_revert: bool,
+    /// Set by every edit, cleared by `reparse_now`. The expensive derived
+    /// views (tree-sitter spans, the JSON tree) are recomputed once the
+    /// buffer settles rather than on every keystroke — see `EDIT_SETTLE`.
+    needs_reparse: bool,
     /// `Some` while this tab's find widget (Ctrl+F) is open.
     pub find: Option<FindState>,
     /// Vertical scroll offset (px from the top) of this tab's editor
-    /// canvas, last reported by the `scrollable`'s `on_scroll`. Used only
-    /// to virtualize `EditorCanvas::draw` (skip lines outside the visible
-    /// range) — not meaningful outside that.
+    /// canvas, last reported by the `scrollable`'s `on_scroll`. Used to
+    /// virtualize `EditorCanvas::draw` (skip lines outside the visible
+    /// range) and, together with `viewport_height`, to decide whether a
+    /// Find match is already on-screen before scrolling to it.
     pub scroll_offset: f32,
+    /// Height (px) of this tab's editor scroll viewport, last reported
+    /// alongside `scroll_offset`. `0.0` until the first `on_scroll` fires
+    /// (e.g. a fresh tab that hasn't been scrolled or resized yet) —
+    /// `find_step` falls back to an assumed height in that case rather
+    /// than refusing to scroll.
+    pub viewport_height: f32,
     /// Active completion popup: `None` = closed, `Some(items)` = showing.
     pub completions: Option<Vec<CompletionItem>>,
     /// Keyboard-navigation index into `completions`.
@@ -446,9 +494,17 @@ impl EditorState {
             .and_then(|ext| ext.to_str())
             .and_then(syntax::Language::from_extension);
         let mut highlighter = syntax::Highlighter::new();
-        let highlights = match language {
-            Some(lang) => highlighter.highlight(lang, &document.text().to_string()),
-            None => Vec::new(),
+        // One materialization, shared with `reparse_json_with` below — see
+        // `resync_after_edit`. Skipped entirely for files with no grammar,
+        // which are also the files JSON parsing never looks at.
+        let text = language.map(|_| document.text().to_string());
+        let highlights = match (language, text.as_deref()) {
+            (Some(lang), Some(text)) => highlighter.highlight(lang, text),
+            _ => Vec::new(),
+        };
+        let tree = match (language, text.as_deref()) {
+            (Some(lang), Some(text)) => outline::parse(lang, text),
+            _ => None,
         };
         let mut this = Self {
             document,
@@ -456,14 +512,21 @@ impl EditorState {
             cursor: CursorPos::default(),
             selection_anchor: None,
             language,
-            highlights,
+            highlights: Rc::new(highlights),
             highlighter,
-            diagnostics: Vec::new(),
+            tree,
+            diagnostics: Rc::new(Vec::new()),
             json: None,
             json_collapsed: HashSet::new(),
             diff: DiffStatus::default(),
+            gutter_marks: Rc::new(Vec::new()),
+            hunks: Rc::new(Vec::new()),
+            diff_selected_hunks: HashSet::new(),
+            pending_hunk_revert: false,
+            needs_reparse: false,
             find: None,
             scroll_offset: 0.0,
+            viewport_height: 0.0,
             completions: None,
             completion_selected: 0,
             completion_anchor: CursorPos::default(),
@@ -471,47 +534,165 @@ impl EditorState {
             redo_stack: Vec::new(),
             last_edit_kind: None,
         };
-        this.reparse_json();
+        this.reparse_json_with(text.as_deref().unwrap_or(""));
         this
     }
 
-    /// Recomputes `highlights` from the current buffer contents. Cheap
-    /// relative to a full reparse would suggest otherwise, but tree-sitter
-    /// is fast enough that doing this on every edit is fine — see
-    /// `devscribe_core::syntax` for why this isn't true incremental reparsing.
-    fn rehighlight(&mut self) {
+    /// Brings the buffer's derived views back in step after an edit.
+    ///
+    /// Only the cheap half runs here. A full tree-sitter reparse measured
+    /// **33 ms** on an 850-line Rust file in a debug build (7.4 ms in
+    /// release) — running that, a git blob read and a whole-file LSP
+    /// `didChange` on *every keystroke* is what made typing lag and then
+    /// wedge the app. Those are deferred to `reparse_now`, which
+    /// `Message::EditSettleTick` calls once the buffer stops changing.
+    ///
+    /// Find matches stay immediate: they are cheap, and the on-screen
+    /// highlight would visibly drift from the text otherwise.
+    fn resync_after_edit(&mut self) {
+        self.needs_reparse = true;
+        self.refind();
+    }
+
+    /// Recomputes the expensive derived views — syntax spans and the JSON
+    /// tree — from the current buffer. A no-op unless an edit is pending, so
+    /// it is safe to call speculatively (see `flush_pending_edits`).
+    ///
+    /// Materializes the buffer as a `String` **once** and shares it; the two
+    /// used to call `Rope::to_string()` apiece.
+    fn reparse_now(&mut self) {
+        if !self.needs_reparse {
+            return;
+        }
+        self.needs_reparse = false;
+        let owned = self.language.map(|_| self.document.text().to_string());
+        let text = owned.as_deref().unwrap_or("");
+        self.rehighlight_with(text);
+        self.reparse_json_with(text);
+        self.tree = self.language.and_then(|lang| outline::parse(lang, text));
+    }
+
+    /// The stack of enclosing scopes at the cursor, for the breadcrumb
+    /// strip (`ui::breadcrumb_bar`) — outermost first. Empty while
+    /// `needs_reparse` is set: `tree` is up to `EDIT_SETTLE` stale then,
+    /// and showing a breadcrumb computed against a buffer the cursor has
+    /// since moved out of would be actively wrong, not just late (e.g.
+    /// still claiming "inside settle_batch" after the whole function was
+    /// just deleted). This is cheap enough to call on every `view()` —
+    /// see `devscribe_core::outline`'s module doc for why.
+    pub fn breadcrumbs(&self) -> Vec<outline::Crumb> {
+        if self.needs_reparse {
+            return Vec::new();
+        }
+        let Some(tree) = self.tree.as_ref() else {
+            return Vec::new();
+        };
+        let Some(lang) = self.language else {
+            return Vec::new();
+        };
+        let byte = self
+            .document
+            .text()
+            .char_to_byte(self.document.char_index(self.cursor.line, self.cursor.col));
+        outline::breadcrumbs_at(tree, self.document.text(), byte, lang)
+    }
+
+    /// Inserts at `char_idx`, keeping `highlights` aligned — see
+    /// `shift_highlights`.
+    fn edit_insert(&mut self, char_idx: usize, text: &str) {
+        let at = self.document.text().char_to_byte(char_idx);
+        self.document.insert(char_idx, text);
+        self.shift_highlights(at, 0, text.len());
+    }
+
+    /// Removes `range` (chars), keeping `highlights` aligned — see
+    /// `shift_highlights`.
+    fn edit_remove(&mut self, range: std::ops::Range<usize>) {
+        let rope = self.document.text();
+        let at = rope.char_to_byte(range.start);
+        let removed = rope.char_to_byte(range.end) - at;
+        self.document.remove(range);
+        self.shift_highlights(at, removed, 0);
+    }
+
+    /// Slides existing highlight spans across an edit that replaced
+    /// `removed` bytes at `at` with `inserted` bytes.
+    ///
+    /// Spans are byte offsets into a buffer that has just moved underneath
+    /// them, and the real reparse is up to `EDIT_SETTLE` away. Without this
+    /// the colouring of everything after the cursor would visibly slide out
+    /// of register for the whole of a typing burst — the debounce never
+    /// fires while keys keep arriving. This is an approximation (it cannot
+    /// know that the token under the cursor just became a keyword), and the
+    /// reparse corrects it the moment typing stops.
+    fn shift_highlights(&mut self, at: usize, removed: usize, inserted: usize) {
+        if self.highlights.is_empty() || (removed == 0 && inserted == 0) {
+            return;
+        }
+        let removed_end = at + removed;
+        let shift = |x: usize| {
+            if x <= at {
+                x
+            } else if x >= removed_end {
+                x - removed + inserted
+            } else {
+                // Inside the removed region: collapses onto the edit point.
+                at
+            }
+        };
+        let spans = Rc::make_mut(&mut self.highlights);
+        for span in spans.iter_mut() {
+            span.start = shift(span.start);
+            span.end = shift(span.end);
+        }
+        spans.retain(|s| s.start < s.end);
+    }
+
+    /// Recomputes `highlights` from `text`, which must be the current buffer
+    /// contents. Cheap relative to a full reparse would suggest otherwise,
+    /// but tree-sitter is fast enough that doing this on every edit is fine —
+    /// see `devscribe_core::syntax` for why this isn't true incremental
+    /// reparsing.
+    fn rehighlight_with(&mut self, text: &str) {
         if let Some(lang) = self.language {
-            self.highlights = self
-                .highlighter
-                .highlight(lang, &self.document.text().to_string());
+            self.highlights = Rc::new(self.highlighter.highlight(lang, text));
         }
     }
 
-    /// Recomputes `json` from the current buffer contents, for `.json` files.
-    fn reparse_json(&mut self) {
+    /// Recomputes `json` from `text` (the current buffer contents), for
+    /// `.json` files.
+    fn reparse_json_with(&mut self, text: &str) {
         self.json = (self.language == Some(syntax::Language::Json)).then(|| {
-            serde_json::from_str::<serde_json::Value>(&self.document.text().to_string())
-                .map_err(|e| e.to_string())
+            serde_json::from_str::<serde_json::Value>(text).map_err(|e| e.to_string())
         });
     }
 
-    /// Recomputes `find`'s matches from its current query against the
-    /// current buffer contents, for `.find.is_some()` files. Called both
-    /// when the query changes and on every edit, like `rehighlight`.
+    /// `refind_with`, materializing the buffer itself. For the two callers
+    /// that change the query without editing the document; every edit goes
+    /// through `resync_after_edit` instead, which shares one materialization
+    /// across all three recomputations.
     fn refind(&mut self) {
+        let needs_text = self.find.as_ref().is_some_and(|f| !f.query.is_empty());
+        let owned = needs_text.then(|| self.document.text().to_string());
+        self.refind_with(owned.as_deref().unwrap_or(""));
+    }
+
+    /// Recomputes `find`'s matches from its current query against `text`
+    /// (the current buffer contents), for `.find.is_some()` files. Called
+    /// both when the query changes and on every edit, like `rehighlight_with`.
+    fn refind_with(&mut self, text: &str) {
         let Some(query) = self.find.as_ref().map(|f| f.query.clone()) else {
             return;
         };
         let matches = if query.is_empty() {
             Vec::new()
         } else {
-            let text = self.document.text().to_string();
             let query_len = query.chars().count();
             // Same unbounded-memory risk `recompute_search` guards against
             // (every match clones its whole line) — capped here too, even
             // though a single already-open buffer is a smaller blast radius
             // than the whole project.
-            search::search_text(&text, &query, MAX_SEARCH_RESULTS)
+            search::search_text(text, &query, MAX_SEARCH_RESULTS)
                 .into_iter()
                 .map(|hit| {
                     let start = self.document.char_index(hit.line, hit.col);
@@ -547,11 +728,90 @@ impl EditorState {
         let range = self.selection();
         self.selection_anchor = None;
         if let Some((start, end)) = range {
-            self.document.remove(start..end);
+            self.edit_remove(start..end);
             self.cursor = self.document.line_col(start).into();
             true
         } else {
             false
+        }
+    }
+
+    /// The editor gutter's click-to-revert action: restores `line`'s content
+    /// (or, for a `RemovedAbove` mark, re-inserts the deleted lines above
+    /// it) back to `HEAD`, per whatever `gutter_marks` says about it. `false`
+    /// if `line` has no mark — gone stale, e.g. a concurrent external edit —
+    /// in which case there's nothing to do and the caller has nothing new to
+    /// recompute.
+    pub fn revert_line(&mut self, line: usize) -> bool {
+        if self.gutter_marks.get(line).and_then(|m| m.as_ref()).is_none() {
+            return false;
+        }
+        self.record_undo_boundary(EditKind::Other);
+        self.apply_revert_mark(line);
+        self.cursor = self.document.line_col(self.document.char_index(line, 0)).into();
+        self.resync_after_edit();
+        true
+    }
+
+    /// The diff view's "revert selected changes": reverts several new-buffer
+    /// lines back to `HEAD`, per `gutter_marks`, as a single undo step —
+    /// a batch of hunks undoes together rather than one `Ctrl+Z` per hunk.
+    /// `false` (no-op) if none of `lines` still carries a mark.
+    ///
+    /// Applies in descending line order so that editing a higher-numbered
+    /// target — which can shift line numbers below it, e.g. `RemovedAbove`
+    /// inserting lines — never moves a not-yet-processed (necessarily
+    /// lower-numbered) target out from under it. Callers don't need to sort
+    /// `lines` themselves.
+    pub fn revert_lines(&mut self, lines: &[usize]) -> bool {
+        let mut targets: Vec<usize> = lines
+            .iter()
+            .copied()
+            .filter(|&line| self.gutter_marks.get(line).and_then(|m| m.as_ref()).is_some())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let Some(&first) = targets.first() else {
+            return false;
+        };
+
+        self.record_undo_boundary(EditKind::Other);
+        for &line in targets.iter().rev() {
+            self.apply_revert_mark(line);
+        }
+        self.cursor = self.document.line_col(self.document.char_index(first, 0)).into();
+        self.resync_after_edit();
+        true
+    }
+
+    /// The actual document edit behind both `revert_line` and
+    /// `revert_lines` — restores `line`'s content (or, for a `RemovedAbove`
+    /// mark, re-inserts the deleted lines above it) back to `HEAD`, per
+    /// whatever `gutter_marks` says about it. A no-op if `line` has no mark.
+    fn apply_revert_mark(&mut self, line: usize) {
+        let Some(mark) = self.gutter_marks.get(line).and_then(|m| m.clone()) else {
+            return;
+        };
+        match mark {
+            GutterMark::Modified { head_text } => {
+                let start = self.document.char_index(line, 0);
+                let end = start + self.document.line_len_chars(line);
+                self.edit_remove(start..end);
+                self.edit_insert(start, &head_text);
+            }
+            GutterMark::Added => {
+                let range = self.document.line_char_range_with_terminator(line);
+                self.edit_remove(range);
+            }
+            GutterMark::RemovedAbove { head_lines } => {
+                let at = self.document.char_index(line, 0);
+                let mut text = String::new();
+                for head_line in &head_lines {
+                    text.push_str(head_line);
+                    text.push('\n');
+                }
+                self.edit_insert(at, &text);
+            }
         }
     }
 
@@ -588,50 +848,40 @@ impl EditorState {
         self.record_undo_boundary(kind);
         self.delete_selection();
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
-        self.document.insert(idx, text);
+        self.edit_insert(idx, text);
         let new_idx = idx + text.chars().count();
         self.cursor = self.document.line_col(new_idx).into();
-        self.rehighlight();
-        self.reparse_json();
-        self.refind();
+        self.resync_after_edit();
     }
 
     pub fn backspace(&mut self) {
         self.record_undo_boundary(EditKind::Delete);
         if self.delete_selection() {
-            self.rehighlight();
-            self.reparse_json();
-            self.refind();
+            self.resync_after_edit();
             return;
         }
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
         if idx == 0 {
             return;
         }
-        self.document.remove(idx - 1..idx);
+        self.edit_remove(idx - 1..idx);
         self.cursor = self.document.line_col(idx - 1).into();
-        self.rehighlight();
-        self.reparse_json();
-        self.refind();
+        self.resync_after_edit();
     }
 
     pub fn delete_forward(&mut self) {
         self.record_undo_boundary(EditKind::Delete);
         if self.delete_selection() {
-            self.rehighlight();
-            self.reparse_json();
-            self.refind();
+            self.resync_after_edit();
             return;
         }
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
         if idx >= self.document.text().len_chars() {
             return;
         }
-        self.document.remove(idx..idx + 1);
+        self.edit_remove(idx..idx + 1);
         self.cursor = self.document.line_col(idx).into();
-        self.rehighlight();
-        self.reparse_json();
-        self.refind();
+        self.resync_after_edit();
     }
 
     /// `Ctrl+Z`. `false` if there was nothing left to undo.
@@ -648,9 +898,7 @@ impl EditorState {
         self.cursor = prev.cursor;
         self.selection_anchor = prev.selection_anchor;
         self.last_edit_kind = None;
-        self.rehighlight();
-        self.reparse_json();
-        self.refind();
+        self.resync_after_edit();
         true
     }
 
@@ -668,9 +916,7 @@ impl EditorState {
         self.cursor = next.cursor;
         self.selection_anchor = next.selection_anchor;
         self.last_edit_kind = None;
-        self.rehighlight();
-        self.reparse_json();
-        self.refind();
+        self.resync_after_edit();
         true
     }
 
@@ -796,9 +1042,7 @@ impl EditorState {
         if text.is_some() {
             self.record_undo_boundary(EditKind::Other);
             self.delete_selection();
-            self.rehighlight();
-            self.reparse_json();
-            self.refind();
+            self.resync_after_edit();
         }
         text
     }
@@ -1005,6 +1249,18 @@ pub struct State {
     /// purely "which state did the button last show," not a query of the
     /// session's actual effort level.
     pub chat_thinking_enabled: bool,
+    /// The Actions popup's "Shell Access" toggle — whether `Bash` is
+    /// allowed at all for this session (see
+    /// `claude_agent::SessionOptions::allow_bash`). Off by default every
+    /// time, like `chat_thinking_enabled`, and never persisted: running
+    /// real shell commands is a materially different risk than editing
+    /// files, so it has to be turned on deliberately each session rather
+    /// than remembered. Once on, `Bash` is gated by `chat_permission_mode`
+    /// exactly like `Edit`/`Write` already are. Part of `chat_worker`'s
+    /// subscription key for the same reason `chat_permission_mode` is:
+    /// `--disallowedTools` is a spawn-time flag, so toggling this respawns
+    /// the subprocess.
+    pub chat_shell_access_enabled: bool,
     /// How permission decisions are made for the session — see
     /// `PermissionMode`. Part of `chat_worker`'s subscription key: picking
     /// a different mode respawns the subprocess (`--permission-mode` is a
@@ -1084,10 +1340,24 @@ pub struct State {
     /// `changed_files`.
     pub ahead_behind: Option<(usize, usize)>,
     pub changes_panel_open: bool,
+    /// The Changes-panel row currently showing its confirm/cancel step for
+    /// "Discard changes" — mirrors `ContextMenu::confirm_delete`'s two-step
+    /// pattern for the file tree's Delete action, since discarding a file's
+    /// changes is equally destructive and irreversible.
+    pub pending_discard: Option<PathBuf>,
     /// `true` while the status bar's Problems dock panel is open, listing
     /// every diagnostic across all open files. Toggled by clicking the
     /// status bar's Problems indicator — see `status_bar.rs`.
     pub problems_panel_open: bool,
+    /// When the most recent edit landed, or `None` when nothing is pending.
+    /// Drives the `EditSettleTick` subscription, which only exists while
+    /// this is `Some` — an unconditional tick would rebuild the entire view
+    /// ten times a second forever (the same trap the search debounce
+    /// documents).
+    edit_settled_at: Option<Instant>,
+    /// Files edited since the last settle, in first-edited order. Almost
+    /// always one, but a fast tab switch mid-burst can leave two.
+    pending_edits: Vec<PathBuf>,
     /// The live text in the search box — may be ahead of `search_last_query`
     /// while the user is still typing. Search is debounced (see
     /// `search_query_changed_at`) rather than run on every keystroke or
@@ -1361,6 +1631,7 @@ impl Default for State {
             chat_view_menu_open: false,
             chat_actions_open: false,
             chat_thinking_enabled: false,
+            chat_shell_access_enabled: false,
             // Matches the behavior this app has always had before mode
             // selection existed at all — every prior end-to-end test was
             // built and verified against "ask for every Edit/Write", so
@@ -1390,7 +1661,10 @@ impl Default for State {
             changed_files: snapshot.changed_files,
             ahead_behind: snapshot.ahead_behind,
             changes_panel_open: false,
+            pending_discard: None,
             problems_panel_open: false,
+            edit_settled_at: None,
+            pending_edits: Vec::new(),
             search_query: String::new(),
             search_query_changed_at: None,
             search_in_progress: false,
@@ -1528,6 +1802,13 @@ pub enum Message {
     /// The "Thinking" toggle — flips `State::chat_thinking_enabled` and
     /// sends `/effort high` or `/effort auto` accordingly.
     ChatToggleThinking,
+    /// The "Shell Access" toggle — flips
+    /// `State::chat_shell_access_enabled`. Unlike `ChatToggleThinking`,
+    /// there's no live slash-command for this: `--disallowedTools`/the
+    /// permission-hook matcher are spawn-time settings, so this relies on
+    /// the field being part of `chat_worker`'s subscription key to take
+    /// effect (a respawn, not an in-place command).
+    ChatToggleShellAccess,
     /// Multi-line input bar: cursor movement, selection, typing — see
     /// `iced::widget::text_editor`. Plain Enter is intercepted separately
     /// (see `chat_panel::input_bar`'s `key_binding`) to submit instead of
@@ -1570,10 +1851,15 @@ pub enum Message {
     /// happens in `EditorPasteWithText` once it resolves.
     EditorPaste,
     EditorPasteWithText(Option<String>),
-    /// The editor's `scrollable` reported a new vertical offset — stored so
-    /// `EditorCanvas::draw` can skip lines outside the visible range.
-    EditorScrolled(f32),
+    /// The editor's `scrollable` reported a new vertical offset (and its
+    /// current viewport height) — stored so `EditorCanvas::draw` can skip
+    /// lines outside the visible range, and so Find navigation knows
+    /// whether a match is already on-screen.
+    EditorScrolled { offset: f32, viewport_height: f32 },
     CaretTick,
+    /// Fires only while an edit is pending; runs the deferred per-edit work
+    /// once the buffer has been still for `EDIT_SETTLE`.
+    EditSettleTick,
     Lsp(LspEvent),
     /// A debounced batch of on-disk changes from `file_watcher` — an edit
     /// made outside DevScribe (another terminal, `git checkout`, and later
@@ -1616,6 +1902,17 @@ pub enum Message {
     /// `save_on_focus_loss` is on, else a no-op. Fired from
     /// `iced::window::events()`, not a keybinding.
     WindowUnfocused,
+    /// The window regained focus — re-scans git status (`refresh_changed_files`)
+    /// and the file tree (`refresh_tree`). The watcher subscription only
+    /// covers the project directory (`.git` itself is in `SKIP_DIRS`), so a
+    /// `git commit`/`push`/`checkout` run from an external terminal — which
+    /// can move `HEAD` or the upstream ref without touching any watched file
+    /// — would otherwise leave the Changes panel and ahead/behind count
+    /// stale until the next save. Coming back to the window is the one
+    /// moment that kind of external change is actually likely to have
+    /// happened, so it's a cheap, natural point to catch up. A no-op before
+    /// a project is open, same guard the watcher subscription itself uses.
+    WindowFocused,
     /// The window was opened or resized — tracked only for the chat
     /// panel's right-edge resize math; see `State::window_width`.
     WindowResized(f32),
@@ -1661,6 +1958,31 @@ pub enum Message {
     /// or, recursively, directory) from disk. Permanent: no OS trash/
     /// recycle-bin integration.
     DeletePath(PathBuf),
+    /// The Changes panel's rollback icon — shows `path`'s confirm/cancel
+    /// step (`State::pending_discard`) rather than discarding immediately.
+    PromptDiscardChange(PathBuf),
+    CancelDiscardChange,
+    /// The confirm step's "Discard changes" button — restores `path`'s
+    /// working-tree content from `HEAD` (or deletes it, if it has no `HEAD`
+    /// version), via `devscribe_core::git::Repo::discard_file`. Permanent:
+    /// this is a `git checkout -- path`, not covered by the editor's own
+    /// undo stack.
+    ConfirmDiscardChange(PathBuf),
+    /// A click on a changed line's gutter marker — reverts just that line
+    /// (or, for `GutterMark::RemovedAbove`, re-inserts the deleted lines
+    /// above it) back to its `HEAD` content. One undo step.
+    RevertLine { line: usize },
+    /// A click on a hunk in the diff view — toggles whether it's checked,
+    /// keyed by that hunk's `Hunk::range.start` in `EditorState::hunks`.
+    ToggleDiffHunkSelected { path: PathBuf, hunk_id: usize },
+    /// The diff view's "Revert selected" button — arms the confirm/cancel
+    /// step (`EditorState::pending_hunk_revert`) rather than reverting
+    /// immediately.
+    PromptRevertSelectedHunks(PathBuf),
+    CancelRevertSelectedHunks(PathBuf),
+    /// Reverts every hunk checked in `path`'s diff view back to `HEAD`, as
+    /// one undo step (see `EditorState::revert_lines`).
+    ConfirmRevertSelectedHunks(PathBuf),
     CloseOtherTabs,
     RevealActiveInTree,
     ReopenClosedTab,
@@ -1795,7 +2117,11 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 send_chat_text(state, cmd.to_string());
             }
         }
-        Message::Chat(event) => handle_chat_event(state, event),
+        Message::ChatToggleShellAccess => {
+            state.chat_shell_access_enabled = !state.chat_shell_access_enabled;
+            state.chat_actions_open = false;
+        }
+        Message::Chat(event) => return handle_chat_event(state, event),
         Message::ChatApprovePermission(id) => respond_permission(state, id, true, None),
         Message::ChatDenyPermission(id) => respond_permission(state, id, false, Some("denied by user".to_string())),
         Message::ChatResizeStarted => state.chat_resizing = true,
@@ -1872,8 +2198,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     }
                     editor.insert_text(&text);
                 }
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
 
                 // Trigger completion on '.' or second ':' of '::'
                 if matches!(state.lsp_status, LspStatus::Ready) && (text == "." || text == ":") {
@@ -1893,6 +2218,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                         }
                     });
                     if let Some((cursor, utf16_char)) = trigger_info {
+                        // The `didChange` for the character that triggered
+                        // this is still sitting in the settle queue; send it
+                        // before asking, or the server completes against a
+                        // buffer it has not seen. Only the notification —
+                        // running the whole settle here would put the 30 ms
+                        // reparse back on the keystroke path, and on exactly
+                        // the keystrokes (`.`, `::`) that need to feel fast.
+                        // The reparse and diff stay queued.
+                        send_did_change_for(state, &path);
                         if let Some(uri) = lsp_uri(&path) {
                             if let Some(sender) = state.lsp_sender.as_mut() {
                                 let _ = sender.try_send(LspCommand::Completion {
@@ -1914,8 +2248,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if let Some(editor) = find_editor_mut(state, &path) {
                     editor.backspace();
                 }
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
             }
         }
         Message::EditorDelete => {
@@ -1923,8 +2256,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if let Some(editor) = find_editor_mut(state, &path) {
                     editor.delete_forward();
                 }
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
             }
         }
         Message::EditorMove { dir, extend } => {
@@ -2003,8 +2335,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
                 && let Some(text) = editor.cut_selection()
             {
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
                 return iced::clipboard::write(text);
             }
         }
@@ -2013,8 +2344,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
                 && editor.undo()
             {
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
             }
         }
         Message::EditorRedo => {
@@ -2022,8 +2352,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
                 && editor.redo()
             {
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
             }
         }
         Message::EditorPaste => return iced::clipboard::read().map(Message::EditorPasteWithText),
@@ -2034,18 +2363,23 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 editor.completions = None;
                 editor.insert_text(&text);
-                send_did_change_for(state, &path);
-                recompute_diff_for(state, &path);
+                mark_edited(state, &path);
             }
         }
-        Message::EditorScrolled(offset) => {
+        Message::EditorScrolled { offset, viewport_height } => {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.scroll_offset = offset;
+                editor.viewport_height = viewport_height;
             }
         }
         Message::CaretTick => state.caret_visible = !state.caret_visible,
+        Message::EditSettleTick => {
+            if state.edit_settled_at.is_some_and(|at| at.elapsed() >= EDIT_SETTLE) {
+                flush_pending_edits(state);
+            }
+        }
         Message::Lsp(event) => match event {
             LspEvent::Ready(sender) => {
                 let was_starting = matches!(state.lsp_status, LspStatus::Starting);
@@ -2063,7 +2397,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if let Some(path) = uri.to_file_path().ok()
                     && let Some(editor) = find_editor_mut(state, &path)
                 {
-                    editor.diagnostics = convert_diagnostics(&editor.document, diagnostics);
+                    editor.diagnostics =
+                        Rc::new(convert_diagnostics(&editor.document, diagnostics));
                 }
             }
             LspEvent::Completions { uri, line, character, items } => {
@@ -2258,7 +2593,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.lsp_status = LspStatus::Disabled;
                 for tab in &mut state.open_tabs {
                     if let OpenTab::File(editor) = tab {
-                        editor.diagnostics.clear();
+                        editor.diagnostics = Rc::new(Vec::new());
                     }
                 }
             }
@@ -2266,6 +2601,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::WindowUnfocused => {
             if state.save_on_focus_loss {
                 save_all_dirty_files(state);
+            }
+        }
+        Message::WindowFocused => {
+            if !state.welcome_open {
+                refresh_tree(state);
+                refresh_changed_files(state);
             }
         }
         Message::WindowResized(width) => state.window_width = width,
@@ -2328,8 +2669,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.refind();
             }
         }
-        Message::FindNext => find_step(state, 1),
-        Message::FindPrev => find_step(state, -1),
+        Message::FindNext => return find_step(state, 1),
+        Message::FindPrev => return find_step(state, -1),
         Message::BeginDraft(kind) => {
             // Pre-existing gap, fixed alongside this feature: `⌘N`/`⇧⌘N`
             // (`global_keys`) aren't otherwise gated on a project being
@@ -2372,6 +2713,50 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::DeletePath(path) => delete_path(state, path),
+        Message::PromptDiscardChange(path) => state.pending_discard = Some(path),
+        Message::CancelDiscardChange => state.pending_discard = None,
+        Message::ConfirmDiscardChange(path) => discard_change(state, path),
+        Message::RevertLine { line } => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && editor.revert_line(line)
+            {
+                recompute_diff_for(state, &path);
+            }
+        }
+        Message::ToggleDiffHunkSelected { path, hunk_id } => {
+            if let Some(editor) = find_editor_mut(state, &path)
+                && !editor.diff_selected_hunks.remove(&hunk_id)
+            {
+                editor.diff_selected_hunks.insert(hunk_id);
+            }
+        }
+        Message::PromptRevertSelectedHunks(path) => {
+            if let Some(editor) = find_editor_mut(state, &path) {
+                editor.pending_hunk_revert = true;
+            }
+        }
+        Message::CancelRevertSelectedHunks(path) => {
+            if let Some(editor) = find_editor_mut(state, &path) {
+                editor.pending_hunk_revert = false;
+            }
+        }
+        Message::ConfirmRevertSelectedHunks(path) => {
+            let reverted = find_editor_mut(state, &path).is_some_and(|editor| {
+                editor.pending_hunk_revert = false;
+                let targets: Vec<usize> = editor
+                    .hunks
+                    .iter()
+                    .filter(|hunk| editor.diff_selected_hunks.contains(&hunk.range.start))
+                    .flat_map(|hunk| hunk.marks.iter().map(|(new_line, _)| *new_line))
+                    .collect();
+                editor.diff_selected_hunks.clear();
+                editor.revert_lines(&targets)
+            });
+            if reverted {
+                recompute_diff_for(state, &path);
+            }
+        }
         Message::CloseOtherTabs => {
             state.overflow_open = false;
             close_other_tabs(state);
@@ -2498,13 +2883,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                         let start = editor.document.char_index(anchor.line, anchor.col);
                         let end = editor.document.char_index(cursor.line, cursor.col);
                         if start <= end {
-                            editor.document.remove(start..end);
+                            // `edit_remove`, not `document.remove`: accepting a
+                            // completion is an edit like any other, and its
+                            // highlight spans have to slide with it.
+                            editor.edit_remove(start..end);
                             editor.cursor = editor.document.line_col(start).into();
                         }
                         editor.insert_text(&text);
                     }
-                    send_did_change_for(state, &path);
-                    recompute_diff_for(state, &path);
+                    mark_edited(state, &path);
                 }
             }
         }
@@ -2579,6 +2966,9 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
 /// (the native Save As dialog) instead of calling `document.save()` — which
 /// would just produce its existing "document has no path" error.
 fn save_current_file(state: &mut State) -> iced::Task<Message> {
+    // Land any deferred reparse/diff/`didChange` first, so what gets written
+    // and what the diff and the language server think was written agree.
+    flush_pending_edits(state);
     let Some(path) = active_file_path(state) else {
         return iced::Task::none();
     };
@@ -2636,6 +3026,7 @@ fn save_all_dirty_files(state: &mut State) {
     // moment the user alt-tabs away would be a genuinely bad surprise, not
     // just a missed save. They're saved (via the dialog) whenever the user
     // explicitly asks, same as any other dirty file.
+    flush_pending_edits(state);
     let dirty_paths: Vec<PathBuf> = state
         .open_tabs
         .iter()
@@ -2735,6 +3126,25 @@ pub fn palette_query_id() -> iced::widget::Id {
 /// focus it the moment Ctrl+F opens it.
 pub fn find_query_id() -> iced::widget::Id {
     iced::widget::Id::new("find-query")
+}
+
+/// A stable id for the active file's editor scroll area, so `find_step` can
+/// scroll a Find match into view. Only one editor pane is ever shown at a
+/// time (the active tab's), so a single fixed id is enough — same pattern
+/// as `find_query_id`.
+pub fn editor_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("editor-scroll-area")
+}
+
+/// A stable id for the chat message-list `scrollable` — Docked and Tab
+/// presentation are mutually exclusive (see `chat_panel.rs`'s own module
+/// doc comment), so at most one of these is ever actually on screen at a
+/// time, making one global id safe to share between them. Used by
+/// `handle_chat_event` to snap to the latest message whenever a session
+/// (re)connects — a brand-new spawn, a resumed one replaying its saved
+/// history, or a respawn from switching modes.
+pub fn chat_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("chat-scroll-area")
 }
 
 /// A stable id for the sidebar tree's inline draft text input, so `update()`
@@ -2901,8 +3311,7 @@ fn complete_save_as(state: &mut State, old_path: PathBuf, new_path: PathBuf) {
         return;
     };
     editor.language = new_path.extension().and_then(|e| e.to_str()).and_then(syntax::Language::from_extension);
-    editor.rehighlight();
-    editor.reparse_json();
+    editor.resync_after_edit();
 
     let name = new_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match editor.document.save() {
@@ -3000,26 +3409,57 @@ fn reopen_closed_tab(state: &mut State) {
     }
 }
 
-/// Moves the active file tab's find selection by `delta` (wrapping) and
-/// moves the cursor to the newly-current match.
-fn find_step(state: &mut State, delta: i32) {
+/// Assumed editor viewport height (px) when `EditorState::viewport_height`
+/// hasn't been reported yet (no `on_scroll` has fired for this tab) — used
+/// so the very first `FindNext`/`FindPrev` still scrolls sensibly instead of
+/// treating an unknown height as "nothing is visible".
+const ASSUMED_VIEWPORT_HEIGHT: f32 = 400.0;
+
+/// Moves the active file tab's find selection by `delta` (wrapping), moves
+/// the cursor to the newly-current match, and — if that match isn't already
+/// within the visible scroll range — scrolls it into view, centered in the
+/// viewport.
+fn find_step(state: &mut State, delta: i32) -> iced::Task<Message> {
     let Some(path) = active_file_path(state) else {
-        return;
+        return iced::Task::none();
     };
+    let font_size = state.editor_font_size;
     let Some(editor) = find_editor_mut(state, &path) else {
-        return;
+        return iced::Task::none();
     };
     let Some(find) = editor.find.as_mut() else {
-        return;
+        return iced::Task::none();
     };
     if find.matches.is_empty() {
-        return;
+        return iced::Task::none();
     }
     let len = find.matches.len() as i32;
     find.current = (find.current as i32 + delta).rem_euclid(len) as usize;
     let target = find.matches[find.current];
-    editor.cursor = editor.document.line_col(target.start).into();
+    let cursor: CursorPos = editor.document.line_col(target.start).into();
+    editor.cursor = cursor;
     editor.selection_anchor = None;
+
+    let line_height = editor_canvas::line_height_px(font_size);
+    let line_top = editor_canvas::line_top(cursor.line, font_size);
+    let line_bottom = line_top + line_height;
+    let viewport_height = if editor.viewport_height > 0.0 {
+        editor.viewport_height
+    } else {
+        ASSUMED_VIEWPORT_HEIGHT
+    };
+    let visible_top = editor.scroll_offset;
+    let visible_bottom = visible_top + viewport_height;
+
+    if line_top >= visible_top && line_bottom <= visible_bottom {
+        return iced::Task::none();
+    }
+
+    let target_offset = (line_top - viewport_height / 2.0).max(0.0);
+    iced::widget::operation::scroll_to(
+        editor_scroll_id(),
+        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target_offset },
+    )
 }
 
 const MAX_PALETTE_RESULTS: usize = 50;
@@ -3168,27 +3608,68 @@ fn find_editor_mut<'a>(state: &'a mut State, path: &Path) -> Option<&'a mut Edit
     })
 }
 
-/// Reloads an open, *unmodified* buffer's content from disk after
-/// `Message::FilesChanged` reports an external change to `path` — a dirty
-/// buffer is left alone rather than clobbering in-progress local edits;
-/// the git-changes panel and the tab's own modified indicator already make
-/// that divergence visible without DevScribe silently picking a side.
-/// Rebuilds the `EditorState` the same way opening the file fresh would
-/// (`open_or_focus_file`), so highlights/undo history/etc. all stay
-/// consistent with the new content instead of being patched piecemeal.
-fn reload_editor_from_disk(state: &mut State, path: &Path) {
-    let Some(editor) = find_editor_mut(state, path) else {
-        return;
-    };
-    if editor.document.is_dirty() {
+/// Rebuilds `path`'s open `EditorState` from its on-disk content, the same
+/// way opening the file fresh would (`open_or_focus_file`) — highlights/undo
+/// history/etc. all come along consistently rather than being patched
+/// piecemeal. A no-op if `path` isn't open as a tab or can't be read.
+/// Unconditional: callers that must not clobber in-progress local edits
+/// (see `reload_editor_from_disk`) check `is_dirty()` themselves first.
+fn rebuild_editor_from_disk(state: &mut State, path: &Path) {
+    if find_editor(state, path).is_none() {
         return;
     }
     let Ok(document) = Document::open(path) else {
         return;
     };
-    *editor = EditorState::new(document, path.to_path_buf());
+    if let Some(editor) = find_editor_mut(state, path) {
+        *editor = EditorState::new(document, path.to_path_buf());
+    }
     send_did_change_for(state, path);
     recompute_diff_for(state, path);
+}
+
+/// Reloads an open, *unmodified* buffer's content from disk after
+/// `Message::FilesChanged` reports an external change to `path` — a dirty
+/// buffer is left alone rather than clobbering in-progress local edits;
+/// the git-changes panel and the tab's own modified indicator already make
+/// that divergence visible without DevScribe silently picking a side.
+fn reload_editor_from_disk(state: &mut State, path: &Path) {
+    if find_editor(state, path).is_some_and(|e| e.document.is_dirty()) {
+        return;
+    }
+    rebuild_editor_from_disk(state, path);
+}
+
+/// The Changes panel's "Discard changes" confirm step — restores `path`'s
+/// working-tree content via `Repo::discard_file`, then brings any open tab
+/// and the diff/Changes views back in step with the result. Unlike
+/// `reload_editor_from_disk`, this always overwrites an open buffer
+/// regardless of its dirty state: discarding is the explicit, destructive
+/// action the user just confirmed, not an incidental external change to
+/// tiptoe around.
+fn discard_change(state: &mut State, path: PathBuf) {
+    state.pending_discard = None;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(kind) = state.changed_files.iter().find(|e| e.path == path).map(|e| e.kind) else {
+        return;
+    };
+    let result = state.repo.as_ref().map(|repo| repo.discard_file(&path, kind));
+    match result {
+        Some(Ok(())) => {
+            if path.exists() {
+                rebuild_editor_from_disk(state, &path);
+            } else {
+                let key = TabKey::File(path.clone());
+                if state.open_tabs.iter().any(|t| t.key() == key) {
+                    close_tab(state, &key);
+                }
+            }
+            refresh_changed_files(state);
+            push_flash(state, format!("REVERTED // {}", name.to_uppercase()));
+        }
+        Some(Err(err)) => push_toast(state, ToastKind::Error, format!("Couldn't revert {name}: {err}")),
+        None => {}
+    }
 }
 
 /// The active tab's `EditorState`, if the active tab is a `File`.
@@ -3325,8 +3806,47 @@ fn close_tab(state: &mut State, key: &TabKey) {
 }
 
 /// Recomputes `path`'s diff against its `HEAD` version, if it's open.
+/// How long the buffer must sit still before the expensive per-edit work
+/// runs: a full tree-sitter reparse, a `HEAD` blob read plus whole-file
+/// diff, and a full-text LSP `didChange`.
+///
+/// Measured on an 850-line Rust file in a debug build, those cost ~33 ms,
+/// ~3.4 ms and a fresh round of `rust-analyzer` analysis *per keystroke*
+/// respectively. Doing that work per character is what made typing lag, and
+/// the `didChange` storm is what pushed the load past this app and onto the
+/// machine. Short enough to feel immediate, long enough that a burst of
+/// typing collapses into one pass.
+const EDIT_SETTLE: Duration = Duration::from_millis(90);
+
+/// Records that `path`'s buffer changed, arming the settle timer. The
+/// expensive follow-up work happens in `flush_pending_edits`.
+fn mark_edited(state: &mut State, path: &Path) {
+    state.edit_settled_at = Some(Instant::now());
+    if !state.pending_edits.iter().any(|p| p == path) {
+        state.pending_edits.push(path.to_path_buf());
+    }
+}
+
+/// Runs the deferred per-edit work now, for every buffer waiting on it.
+///
+/// Called by `EditSettleTick` once typing stops, and directly by anything
+/// that needs a buffer's derived state to be current *before* it acts —
+/// notably an LSP completion request, which would otherwise be answered
+/// against a document the server has not been told about yet.
+fn flush_pending_edits(state: &mut State) {
+    state.edit_settled_at = None;
+    for path in std::mem::take(&mut state.pending_edits) {
+        if let Some(editor) = find_editor_mut(state, &path) {
+            editor.reparse_now();
+        }
+        send_did_change_for(state, &path);
+        recompute_diff_for(state, &path);
+    }
+}
+
 fn recompute_diff_for(state: &mut State, path: &Path) {
-    let Some(current_text) = find_editor(state, path).map(|e| e.document.text().to_string())
+    let Some((current_text, line_count)) =
+        find_editor(state, path).map(|e| (e.document.text().to_string(), e.document.line_count()))
     else {
         return;
     };
@@ -3344,8 +3864,27 @@ fn recompute_diff_for(state: &mut State, path: &Path) {
         }
     };
 
+    // Sized off the buffer's own `line_count()` (which, unlike `diff_lines`'
+    // `new_line` indices, counts the trailing empty line `ropey` reports for
+    // a file ending in a newline) so the gutter can always index it safely
+    // by buffer line number without a bounds check.
+    let (gutter_marks, hunks) = match &status {
+        DiffStatus::Changed(lines) => (
+            Rc::new(devscribe_core::diff::gutter_marks(lines, line_count)),
+            devscribe_core::diff::hunks(lines, line_count),
+        ),
+        _ => (Rc::new(Vec::new()), Vec::new()),
+    };
+
     if let Some(editor) = find_editor_mut(state, path) {
         editor.diff = status;
+        editor.gutter_marks = gutter_marks;
+        editor.hunks = Rc::new(hunks);
+        // A hunk id (`Hunk::range.start`) only means the same change while
+        // `hunks` is unchanged — the diff/buffer just moved, so any
+        // selection made against the old grouping no longer applies.
+        editor.diff_selected_hunks.clear();
+        editor.pending_hunk_revert = false;
     }
 }
 
@@ -3386,11 +3925,11 @@ fn compute_changed_files(repo: Option<&Repo>) -> Vec<ChangesEntry> {
 /// Re-scans the working tree for `state.changed_files`, and the upstream
 /// comparison for `state.ahead_behind` alongside it — both are cheap-ish
 /// `gix` walks with the same staleness story, so one refresh point covers
-/// both. Not run on every keystroke — only after actions known to change
-/// the working tree, i.e. saving a file. Edits made outside DevScribe (a
-/// `git commit`/`git fetch` in another terminal, say) won't be reflected
-/// until the next save; there's no file-watcher wired up yet (same
-/// limitation `tree`/`fs_tree` already has for the file browser).
+/// both. Run after actions known to change the working tree (saving a file,
+/// discarding/reverting a change), after a `FilesChanged` watcher event, and
+/// on `WindowFocused` — the watcher itself never fires for a `.git`-only
+/// change (a commit, push, or branch switch that doesn't touch a tracked
+/// file), so regaining focus is what catches those up.
 fn refresh_changed_files(state: &mut State) {
     state.changed_files = compute_changed_files(state.repo.as_ref());
     state.ahead_behind = state.repo.as_ref().and_then(Repo::ahead_behind);
@@ -3580,6 +4119,7 @@ fn reset_project_scoped_state(state: &mut State) {
     state.draft = None;
     state.ctx_menu = None;
     state.changes_panel_open = false;
+    state.pending_discard = None;
     state.search_query.clear();
     state.search_query_changed_at = None;
     state.search_in_progress = false;
@@ -3768,7 +4308,7 @@ fn respond_permission(state: &mut State, id: String, approve: bool, reason: Opti
 /// yet), so a prior transcript's messages describe a conversation the new
 /// process has no memory of. Leaving them on screen would be misleading,
 /// not just stale.
-fn handle_chat_event(state: &mut State, event: ClaudeEvent) {
+fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Message> {
     match event {
         // Always the first event from a freshly (re)spawned worker — see
         // its own doc comment. Clearing here, rather than on `Ready`,
@@ -3780,6 +4320,11 @@ fn handle_chat_event(state: &mut State, event: ClaudeEvent) {
         ClaudeEvent::Ready(sender) => {
             state.chat.sender = Some(sender);
             state.chat.status = ChatStatus::Ready;
+            // Whatever just got replayed (a resumed session's full saved
+            // history) or didn't (a brand-new, still-empty one) is now all
+            // in `state.chat.messages` — jump to the latest message rather
+            // than leaving a resumed conversation scrolled to its start.
+            return iced::widget::operation::snap_to_end(chat_scroll_id());
         }
         ClaudeEvent::SessionInit { session_id, model } => {
             state.chat.session_id = Some(session_id);
@@ -3836,6 +4381,7 @@ fn handle_chat_event(state: &mut State, event: ClaudeEvent) {
             state.chat.sender = None;
         }
     }
+    iced::Task::none()
 }
 
 fn send_did_open_for(state: &mut State, path: &Path) {
@@ -4023,18 +4569,20 @@ fn file_watcher(root: &PathBuf) -> impl iced::futures::Stream<Item = Vec<WatchEv
 /// and `devscribe_exe` (needed so the generated permission hook re-invokes
 /// *this* binary) happen inside the async body, same as `lsp_worker` does
 /// for its own binary, so the main thread never blocks either.
-/// Keyed on `(root, session_id, permission_mode, chat_restart_token)`: a
-/// project switch, picking a different session
-/// (`Message::ChatNewSession`/`ChatResumeSession`), or switching modes
-/// (`Message::ChatSetPermissionMode`) all change the key, so
+/// Keyed on `(root, session_id, permission_mode, allow_bash,
+/// chat_restart_token)`: a project switch, picking a different session
+/// (`Message::ChatNewSession`/`ChatResumeSession`), switching modes
+/// (`Message::ChatSetPermissionMode`), or flipping shell access
+/// (`Message::ChatToggleShellAccess`) all change the key, so
 /// `subscription()` tears down and respawns automatically, same as
 /// `lsp_worker`.
 fn chat_worker(
-    (root, session_id, mode, _token): &(PathBuf, String, PermissionMode, u64),
+    (root, session_id, mode, allow_bash, _token): &(PathBuf, String, PermissionMode, bool, u64),
 ) -> impl iced::futures::Stream<Item = ClaudeEvent> + use<> {
     let root = root.clone();
     let session_id = session_id.clone();
     let mode = *mode;
+    let allow_bash = *allow_bash;
     iced::stream::channel(32, async move |mut output| {
         use iced::futures::SinkExt as _;
         // First, always — see `ClaudeEvent::SessionStarting`'s own doc.
@@ -4069,7 +4617,7 @@ fn chat_worker(
                 }
             }
         }
-        let options = claude_agent::SessionOptions { session_id, resume, mode };
+        let options = claude_agent::SessionOptions { session_id, resume, mode, allow_bash };
         claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, options, output).await;
     })
 }
@@ -4146,12 +4694,13 @@ fn global_keys(event: keyboard::Event) -> Message {
     Message::Noop
 }
 
-/// Maps `iced::window::events()` to `Message::WindowUnfocused`/`WindowResized`,
-/// the two variants anything here cares about — every other window event
-/// (move, redraw…) is a no-op.
+/// Maps `iced::window::events()` to `Message::WindowUnfocused`/`WindowFocused`/
+/// `WindowResized`, the variants anything here cares about — every other
+/// window event (move, redraw…) is a no-op.
 fn window_events((_id, event): (iced::window::Id, iced::window::Event)) -> Message {
     match event {
         iced::window::Event::Unfocused => Message::WindowUnfocused,
+        iced::window::Event::Focused => Message::WindowFocused,
         iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size) => Message::WindowResized(size.width),
         _ => Message::Noop,
     }
@@ -4208,7 +4757,13 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     // whenever this becomes true again, the project changes, the target
     // session changes, or `chat_restart_token` is bumped.
     if !state.welcome_open && chat_is_active(state) {
-        let key = (state.root.clone(), state.chat_session_id.clone(), state.chat_permission_mode, state.chat_restart_token);
+        let key = (
+            state.root.clone(),
+            state.chat_session_id.clone(),
+            state.chat_permission_mode,
+            state.chat_shell_access_enabled,
+            state.chat_restart_token,
+        );
         subs.push(iced::Subscription::run_with(key, chat_worker).map(Message::Chat));
     }
     // Only ticks while there's an actual pending debounce to check
@@ -4221,6 +4776,11 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     // screen, that's real, sustained, unbounded-duration load, easily
     // enough to look like the app hanging even though nothing is actually
     // stuck (see the roadmap's search bug-fix writeup, "seventh pass").
+    // Same shape, and for the same reason, as the search debounce below:
+    // subscribed only while there is actually an edit waiting to settle.
+    if state.edit_settled_at.is_some() {
+        subs.push(iced::time::every(EDIT_SETTLE / 3).map(|_| Message::EditSettleTick));
+    }
     if state.search_query_changed_at.is_some() {
         subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::SearchDebounceTick));
     }

@@ -100,3 +100,47 @@ fn stops_scanning_as_soon_as_max_hits_is_reached() {
 fn max_hits_zero_matches_nothing() {
     assert!(search_text("aa aa aa", "aa", 0).is_empty());
 }
+
+#[test]
+fn matches_every_mix_of_query_and_haystack_casing() {
+    // The byte-level scan folds case on both sides — the needle is
+    // pre-lowered, each candidate haystack byte is lowered as it is compared.
+    for query in ["token", "TOKEN", "ToKeN"] {
+        let hits = search_text("a Token b TOKEN c token", query, usize::MAX);
+        assert_eq!(hits.len(), 3, "query {query:?}");
+        assert_eq!(hits.iter().map(|h| h.col).collect::<Vec<_>>(), vec![2, 10, 18]);
+    }
+}
+
+#[test]
+fn multibyte_chars_before_a_match_do_not_shift_its_column() {
+    // `col` is a *char* column while the scan runs in bytes, so anything
+    // wider than one byte ahead of the match would skew it if the running
+    // byte/char cursor were wrong.
+    let hits = search_text("ünïcödé token", "token", usize::MAX);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].col, 8);
+}
+
+#[test]
+fn a_query_that_is_not_ascii_still_matches_itself() {
+    // ASCII case folding leaves multi-byte scalars untouched, so a non-ASCII
+    // query matches exactly — and never mid-char, since no UTF-8
+    // continuation byte can be confused for a foldable ASCII one.
+    let hits = search_text("le café du café", "café", usize::MAX);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits.iter().map(|h| h.col).collect::<Vec<_>>(), vec![3, 11]);
+}
+
+#[test]
+fn many_matches_on_one_very_long_line_all_report_correct_columns() {
+    // The regression this guards: converting each match's byte offset to a
+    // char column used to recount from the line's start every time, which is
+    // quadratic — and on a real minified line, slow enough to hang the app.
+    let line = "x".repeat(50_000) + &"needle ".repeat(100);
+    let hits = search_text(&line, "needle", usize::MAX);
+    assert_eq!(hits.len(), 100);
+    for (i, hit) in hits.iter().enumerate() {
+        assert_eq!(hit.col, 50_000 + i * 7, "hit {i}");
+    }
+}

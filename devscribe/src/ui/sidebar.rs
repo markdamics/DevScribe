@@ -509,7 +509,70 @@ pub fn projects_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
     Some(iced::widget::stack![backdrop, positioned].into())
 }
 
-fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static, Message> {
+/// The confirm/cancel step shown once the rollback icon's been clicked once
+/// (`State::pending_discard`) — same two-step shape as the file tree's
+/// `confirm_delete_rows`, condensed to fit the row's fixed height since the
+/// Changes panel has no menu-popup surface to expand into.
+fn discard_confirm_row(path: &Path, row_h: f32, p: Palette) -> Element<'static, Message> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    row![
+        text(format!("Discard changes to {name}?"))
+            .font(fonts::sans(Weight::Medium))
+            .size(crate::text_scale::px(13.0))
+            .color(color(p.text_strong))
+            .width(Length::Fill),
+        button(
+            text("Cancel")
+                .font(fonts::sans(Weight::Medium))
+                .size(crate::text_scale::px(13.0))
+                .color(color(p.text_muted)),
+        )
+        .padding([4.0, 8.0])
+        .on_press(Message::CancelDiscardChange)
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if hovered { Some(color(p.surface_hover).into()) } else { None },
+                ..button::Style::default()
+            }
+        }),
+        button(
+            text("Discard")
+                .font(fonts::sans(Weight::Medium))
+                .size(crate::text_scale::px(13.0))
+                .color(color(p.status_danger)),
+        )
+        .padding([4.0, 8.0])
+        .on_press(Message::ConfirmDiscardChange(path.to_path_buf()))
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if hovered { Some(tint(p.status_danger, 0.16).into()) } else { None },
+                ..button::Style::default()
+            }
+        }),
+    ]
+    .spacing(4.0)
+    .padding(Padding {
+        top: 0.0,
+        right: 8.0,
+        bottom: 0.0,
+        left: 22.0,
+    })
+    .height(Length::Fixed(row_h))
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn changes_row(entry: &ChangesEntry, row_h: f32, pending_discard: bool, p: Palette) -> Element<'static, Message> {
+    if pending_discard {
+        return discard_confirm_row(&entry.path, row_h, p);
+    }
+
     let (letter, kind_color) = kind_letter(entry.kind, p);
     let name = entry
         .path
@@ -548,11 +611,20 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
     .align_y(Alignment::Center);
 
     let path = entry.path.clone();
-    button(
+    let rollback_path = entry.path.clone();
+
+    // Two sibling buttons rather than one nested in the other — iced buttons
+    // can't nest (see `tab_bar.rs`'s `tab_shell`, same shape for its select/
+    // close pair). The rollback icon is always present (there's no
+    // widget-level hover-enter/exit tracking in this codebase to hide it
+    // until the row's hovered — see `tab_bar.rs`'s close button, muted the
+    // same way), but stays muted until directly hovered, so it doesn't
+    // compete with the filename at rest.
+    let select = button(
         container(contents)
             .padding(Padding {
                 top: 0.0,
-                right: 8.0,
+                right: 4.0,
                 bottom: 0.0,
                 left: 22.0,
             })
@@ -574,8 +646,25 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, p: Palette) -> Element<'static,
             text_color: color(p.text_strong),
             ..button::Style::default()
         }
-    })
-    .into()
+    });
+
+    let rollback = button(widgets::center_fill(
+        text("\u{21BA}").size(crate::text_scale::px(14.0)),
+    ))
+    .padding(0.0)
+    .width(Length::Fixed(24.0))
+    .height(Length::Fixed(row_h))
+    .on_press(Message::PromptDiscardChange(rollback_path))
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered { Some(tint(p.status_danger, 0.16).into()) } else { None },
+            text_color: if hovered { color(p.status_danger) } else { tint(p.text_muted, 0.55) },
+            ..button::Style::default()
+        }
+    });
+
+    row![select, rollback].align_y(Alignment::Center).into()
 }
 
 /// Shown in place of the (hidden-when-empty) CHANGES section for a git repo
@@ -664,12 +753,27 @@ fn changes_header(state: &State, p: Palette) -> Option<Element<'static, Message>
 /// letting a long changed-file list push the tree out of view.
 fn changes_rows(state: &State, p: Palette) -> Element<'static, Message> {
     let row_h = state.density.sidebar_row_h();
-    let rows: Vec<Element<'static, Message>> =
-        state.changed_files.iter().map(|entry| changes_row(entry, row_h, p)).collect();
-    scrollable(column(rows))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    let rows: Vec<Element<'static, Message>> = state
+        .changed_files
+        .iter()
+        .map(|entry| {
+            let pending_discard = state.pending_discard.as_deref() == Some(entry.path.as_path());
+            changes_row(entry, row_h, pending_discard, p)
+        })
+        .collect();
+    // Right-padded so the scrollbar (drawn over the content rather than
+    // reserving its own space — see the file tree's `[8.0, 4.0]` for the
+    // same fix) doesn't sit on top of the rollback icon at the row's right
+    // edge.
+    scrollable(column(rows).padding(Padding {
+        top: 0.0,
+        right: 8.0,
+        bottom: 0.0,
+        left: 0.0,
+    }))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// A small icon-glyph button (Collapse sidebar / Settings / Expand sidebar)

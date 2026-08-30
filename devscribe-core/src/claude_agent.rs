@@ -206,28 +206,32 @@ fn spawn_permission_listener(socket_path: PathBuf, pending: PendingMap, requests
 }
 
 /// How permission decisions are made for a session — mirrors VS Code's own
-/// Claude Code mode picker. `Bash` is deliberately left out of this
-/// entirely: it stays disallowed (`--disallowedTools Bash`) in every mode,
-/// a boundary this app draws regardless of how permissive the selected
-/// mode otherwise is (a deliberate choice, not an oversight — "Auto"
-/// bypasses everything *DevScribe itself* exposes, not literally
-/// everything the CLI could do).
+/// Claude Code mode picker. `Bash` stays disallowed (`--disallowedTools
+/// Bash`) unless the caller opts in via `SessionOptions::allow_bash` (see
+/// `run`'s own doc) — a session-level toggle DevScribe exposes separately
+/// from this mode picker (off by default every time), since running real
+/// shell commands is a materially different risk than editing files. Once
+/// opted in, `Bash` follows the exact same gating this enum already
+/// defines for `Edit`/`Write` (see `gates_edits`) rather than getting its
+/// own independent rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PermissionMode {
-    /// Ask a human for every `Edit`/`Write` via the permission-hook card —
-    /// nothing mutates without an explicit decision.
+    /// Ask a human for every `Edit`/`Write` (and `Bash`, once allowed) via
+    /// the permission-hook card — nothing mutates without an explicit
+    /// decision.
     Manual,
-    /// `Edit`/`Write` are silently auto-approved (`--permission-mode
-    /// acceptEdits`, no hook registered at all for them) — VS Code's
-    /// "auto-accept edits".
+    /// `Edit`/`Write` (and `Bash`, once allowed) are silently auto-approved
+    /// (`--permission-mode acceptEdits`, no hook registered at all for
+    /// them) — VS Code's "auto-accept edits".
     EditAuto,
     /// Read-only: `claude` can explore but not modify anything
     /// (`--permission-mode plan`) — no hook needed, since nothing
-    /// mutating can fire in the first place.
+    /// mutating (including `Bash`, even if otherwise allowed) can fire in
+    /// the first place.
     Plan,
     /// No prompts for anything DevScribe exposes (`--permission-mode
-    /// bypassPermissions`) — still short of *actual* full autonomy, since
-    /// Bash stays off regardless.
+    /// bypassPermissions`) — still short of *actual* full autonomy when
+    /// `Bash` isn't allowed, since it then stays off regardless.
     Auto,
 }
 
@@ -252,7 +256,8 @@ impl PermissionMode {
         }
     }
 
-    /// Whether `Edit`/`Write` should be routed through the permission-hook
+    /// Whether `Edit`/`Write` (and `Bash`, once allowed — see
+    /// `generate_settings`) should be routed through the permission-hook
     /// card for a human decision. `Manual` is the only mode that does —
     /// note this is independent of `cli_value`: `Manual` and `EditAuto`
     /// share the same underlying `--permission-mode acceptEdits`, and only
@@ -266,7 +271,13 @@ impl PermissionMode {
     }
 }
 
-fn generate_settings(devscribe_exe: &std::path::Path, socket_path: &std::path::Path, mode: PermissionMode) -> Value {
+/// `allow_bash` is `SessionOptions::allow_bash` — whether the session-level
+/// shell-access toggle is on at all, independent of `mode`. When it's off,
+/// `Bash` never appears in the matcher (it's excluded via
+/// `--disallowedTools` in `run` instead, same as before this toggle
+/// existed); when it's on, `Bash` joins `Edit`/`Write` and is gated by
+/// exactly the same `gates_edits` rule as they are.
+fn generate_settings(devscribe_exe: &std::path::Path, socket_path: &std::path::Path, mode: PermissionMode, allow_bash: bool) -> Value {
     if !mode.gates_edits() {
         return json!({});
     }
@@ -275,10 +286,11 @@ fn generate_settings(devscribe_exe: &std::path::Path, socket_path: &std::path::P
         devscribe_exe.display(),
         socket_path.display()
     );
+    let matcher = if allow_bash { "Edit|Write|Bash" } else { "Edit|Write" };
     json!({
         "hooks": {
             "PreToolUse": [{
-                "matcher": "Edit|Write",
+                "matcher": matcher,
                 "hooks": [{ "type": "command", "command": command }]
             }]
         }
@@ -558,6 +570,12 @@ pub struct SessionOptions {
     /// Governs both the base `--permission-mode` and whether `Edit`/`Write`
     /// route through the permission-hook card — see `PermissionMode`.
     pub mode: PermissionMode,
+    /// The session-level shell-access toggle — off unless the caller
+    /// explicitly opts in (see `devscribe`'s `chat_shell_access_enabled`).
+    /// When `false`, `Bash` is excluded via `--disallowedTools` exactly as
+    /// it always has been; when `true`, it's allowed and gated by `mode`
+    /// the same way `Edit`/`Write` already are (see `generate_settings`).
+    pub allow_bash: bool,
 }
 
 /// Spawns `claude` for `root` and drives it — reading its stream-json
@@ -568,7 +586,7 @@ pub struct SessionOptions {
 /// PATH first and emitting `Unavailable` if it isn't found, same
 /// convention as `lsp::run`. See `SessionOptions` for the rest.
 pub async fn run(root: PathBuf, binary: PathBuf, devscribe_exe: PathBuf, options: SessionOptions, mut output: mpsc::Sender<ClaudeEvent>) {
-    let SessionOptions { session_id, resume, mode } = options;
+    let SessionOptions { session_id, resume, mode, allow_bash } = options;
     let run_id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default());
     let socket_path = std::env::temp_dir().join(format!("devscribe-claude-{run_id}.sock"));
     let settings_path = std::env::temp_dir().join(format!("devscribe-claude-{run_id}-settings.json"));
@@ -584,7 +602,7 @@ pub async fn run(root: PathBuf, binary: PathBuf, devscribe_exe: PathBuf, options
         return;
     }
 
-    let settings = generate_settings(&devscribe_exe, &socket_path, mode);
+    let settings = generate_settings(&devscribe_exe, &socket_path, mode, allow_bash);
     let Ok(settings_json) = serde_json::to_string(&settings) else {
         let _ = output.send(ClaudeEvent::Unavailable("couldn't serialize the generated hook settings".into())).await;
         return;
@@ -605,10 +623,11 @@ pub async fn run(root: PathBuf, binary: PathBuf, devscribe_exe: PathBuf, options
         .arg("--include-partial-messages")
         .arg("--permission-mode")
         .arg(mode.cli_value())
-        .arg("--disallowedTools")
-        .arg("Bash")
         .arg("--settings")
         .arg(&settings_path);
+    if !allow_bash {
+        command.arg("--disallowedTools").arg("Bash");
+    }
     // No `--strict-mcp-config`: the session loads whatever MCP servers are
     // actually configured for this machine/account (Gmail, Calendar,
     // Drive, DesignSync once authorized, anything else), same as a normal

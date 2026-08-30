@@ -115,6 +115,63 @@ fn ahead_behind_is_none_without_an_upstream() {
 }
 
 #[test]
+fn discard_file_restores_a_modified_file_from_head() {
+    let dir = std::env::temp_dir().join(format!("devscribe-git-test-discard-modified-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    git(&dir, &["init", "-q"]);
+    let path = dir.join("edit.txt");
+    std::fs::write(&path, "original\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "initial"]);
+    std::fs::write(&path, "changed\n").unwrap();
+
+    let repo = Repo::open(&dir).unwrap();
+    repo.discard_file(&path, ChangeKind::Modified).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn discard_file_removes_an_untracked_file() {
+    let dir = std::env::temp_dir().join(format!("devscribe-git-test-discard-untracked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    git(&dir, &["init", "-q"]);
+    let path = dir.join("new.txt");
+    std::fs::write(&path, "brand new\n").unwrap();
+
+    let repo = Repo::open(&dir).unwrap();
+    repo.discard_file(&path, ChangeKind::Untracked).unwrap();
+    assert!(!path.exists());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn discard_file_recreates_a_deleted_file_from_head() {
+    let dir = std::env::temp_dir().join(format!("devscribe-git-test-discard-deleted-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    git(&dir, &["init", "-q"]);
+    let path = dir.join("gone.txt");
+    std::fs::write(&path, "will be deleted\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "initial"]);
+    std::fs::remove_file(&path).unwrap();
+
+    let repo = Repo::open(&dir).unwrap();
+    repo.discard_file(&path, ChangeKind::Deleted).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "will be deleted\n");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn init_makes_a_plain_folder_openable_as_a_repo() {
     let dir = std::env::temp_dir().join(format!("devscribe-git-test-init-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

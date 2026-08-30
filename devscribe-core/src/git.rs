@@ -1,7 +1,8 @@
 //! Minimal `gix`-backed read access to the repository: current branch name,
-//! a file's content at `HEAD` (for the diff panel), and a coarse working-tree
-//! status scan (for the sidebar's Changes panel). No staging or discarding —
-//! those are real features that deserve their own pass, not a bolt-on here.
+//! a file's content at `HEAD` (for the diff panel), a coarse working-tree
+//! status scan (for the sidebar's Changes panel), and discarding a single
+//! file's working-tree changes back to `HEAD`. Still no staging — nothing
+//! here reads or writes the index.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -172,6 +173,25 @@ impl Repo {
             .into_iter()
             .map(|(path, kind)| ChangedFile { path, kind })
             .collect()
+    }
+
+    /// Reverts `absolute_path`'s working-tree content back to how `HEAD`
+    /// (or "doesn't exist") sees it — the Changes panel's "discard changes"
+    /// action. Only touches the working tree, never the index: `Modified`/
+    /// `Deleted` are restored from `HEAD`'s blob (reusing `head_text`, so a
+    /// binary or non-UTF-8 file's discard fails with `NotFound` rather than
+    /// corrupting it); `Added`/`Untracked` have no `HEAD` version to restore
+    /// to, so discarding one just deletes the working file.
+    pub fn discard_file(&self, absolute_path: &Path, kind: ChangeKind) -> std::io::Result<()> {
+        match kind {
+            ChangeKind::Modified | ChangeKind::Deleted => {
+                let content = self.head_text(absolute_path).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no HEAD version to restore")
+                })?;
+                std::fs::write(absolute_path, content)
+            }
+            ChangeKind::Added | ChangeKind::Untracked => std::fs::remove_file(absolute_path),
+        }
     }
 
     /// `bytes` accepts a `BString`, `Cow<BStr>`, or `BStr` by reference —

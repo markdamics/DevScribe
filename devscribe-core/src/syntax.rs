@@ -358,7 +358,7 @@ impl Highlighter {
             return Vec::new();
         };
 
-        let mut spans = Vec::new();
+        let mut spans: Vec<Span> = Vec::new();
         let mut stack: Vec<HighlightKind> = Vec::new();
 
         for event in events {
@@ -366,7 +366,20 @@ impl Highlighter {
                 Ok(HighlightEvent::Source { start, end }) => {
                     if start < end {
                         let kind = stack.last().copied().unwrap_or(HighlightKind::Default);
-                        spans.push(Span { start, end, kind });
+                        // Coalesce with the previous span when it is the same
+                        // kind and directly abutting. tree-sitter emits a
+                        // `Source` event per token boundary, so an ordinary
+                        // run of unhighlighted code arrives as dozens of
+                        // separate `Default` spans. Rendering is identical
+                        // either way, but `editor_canvas` issues one
+                        // `fill_text` — one text-shaping run — per span, on
+                        // every frame.
+                        match spans.last_mut() {
+                            Some(last) if last.kind == kind && last.end == start => {
+                                last.end = end;
+                            }
+                            _ => spans.push(Span { start, end, kind }),
+                        }
                     }
                 }
                 Ok(HighlightEvent::HighlightStart(Highlight(i))) => {

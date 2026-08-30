@@ -931,6 +931,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "gix",
+ "memchr",
  "notify",
  "ropey",
  "serde_json",

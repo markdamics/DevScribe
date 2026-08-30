@@ -3,6 +3,7 @@ pub mod diff;
 pub mod document;
 pub mod git;
 pub mod lsp;
+pub mod outline;
 pub mod search;
 pub mod syntax;
 pub mod theme;

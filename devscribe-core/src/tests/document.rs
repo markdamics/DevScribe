@@ -23,6 +23,20 @@ fn save_without_path_errors() {
 }
 
 #[test]
+fn line_char_range_with_terminator_includes_the_newline() {
+    let doc = Document::from_str("a\nb\nc\n");
+    // "b\n" is chars 2..4.
+    assert_eq!(doc.line_char_range_with_terminator(1), 2..4);
+}
+
+#[test]
+fn line_char_range_with_terminator_stops_at_document_end_on_the_last_untermined_line() {
+    let doc = Document::from_str("a\nb");
+    // "b" has no trailing newline, so the range can't extend past it.
+    assert_eq!(doc.line_char_range_with_terminator(1), 2..3);
+}
+
+#[test]
 fn save_writes_buffer_and_clears_dirty() {
     let path = std::env::temp_dir().join(format!("devscribe-core-save-test-{}", std::process::id()));
     std::fs::write(&path, "original").unwrap();
@@ -67,4 +81,30 @@ fn char_index_and_line_col_round_trip() {
     assert_eq!(doc.line_col(6), (1, 2));
     // Column past end-of-line clamps to the line's length.
     assert_eq!(doc.char_index(0, 99), 3);
+}
+
+#[test]
+fn line_text_capped_truncates_to_max_chars() {
+    let doc = Document::from_str("abcdef\ngh");
+    assert_eq!(doc.line_text_capped(0, 3), "abc");
+    // A cap wider than the line is not padding — it just yields the line.
+    assert_eq!(doc.line_text_capped(0, 99), "abcdef");
+    assert_eq!(doc.line_text_capped(1, 99), "gh");
+}
+
+#[test]
+fn line_text_capped_cuts_on_char_boundaries_not_bytes() {
+    // The editor canvas caps by *column*, so a multi-byte line must yield
+    // whole chars — slicing this by bytes would panic or produce mojibake.
+    let doc = Document::from_str("héllo wörld");
+    assert_eq!(doc.line_text_capped(0, 4), "héll");
+    assert_eq!(doc.line_text_capped(0, 8), "héllo wö");
+}
+
+#[test]
+fn line_text_capped_never_includes_the_terminator() {
+    let doc = Document::from_str("abc\r\ndef\n");
+    // Cap wider than the line: the \r\n must still be excluded.
+    assert_eq!(doc.line_text_capped(0, 99), "abc");
+    assert_eq!(doc.line_text_capped(1, 99), "def");
 }

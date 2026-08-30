@@ -52,26 +52,70 @@ pub fn search_text(text: &str, query: &str, max_hits: usize) -> Vec<SearchHit> {
         return Vec::new();
     }
     let query_lower = query.to_ascii_lowercase();
+    let needle = query_lower.as_bytes();
 
     let mut hits = Vec::new();
     'lines: for (line_idx, line) in text.lines().enumerate() {
-        let line_lower = line.to_ascii_lowercase();
+        let haystack = line.as_bytes();
         let mut start = 0;
-        while start <= line_lower.len() {
-            let Some(pos) = line_lower[start..].find(&query_lower) else {
+        // Running `(byte, char)` cursor into `line`. Converting a match's
+        // byte offset to a char column used to recount from the line's start
+        // per match, which is quadratic on a line carrying many matches.
+        let mut walked_bytes = 0usize;
+        let mut walked_chars = 0usize;
+        while start + needle.len() <= haystack.len() {
+            let Some(pos) = find_ascii_ci(&haystack[start..], needle) else {
                 break;
             };
             let byte_col = start + pos;
-            let col = line[..byte_col].chars().count();
-            let (preview, preview_col) = windowed_preview(line, byte_col, query_lower.len());
-            hits.push(SearchHit { line: line_idx, col, preview, preview_col });
+            walked_chars += line[walked_bytes..byte_col].chars().count();
+            walked_bytes = byte_col;
+            let (preview, preview_col) = windowed_preview(line, byte_col, needle.len());
+            hits.push(SearchHit { line: line_idx, col: walked_chars, preview, preview_col });
             if hits.len() >= max_hits {
                 break 'lines;
             }
-            start = byte_col + query_lower.len().max(1);
+            start = byte_col + needle.len();
         }
     }
     hits
+}
+
+/// First offset in `haystack` where `needle` (already ASCII-lowercased)
+/// matches under ASCII case folding, or `None`.
+///
+/// Scans bytes rather than lowercasing a copy of the line first. That copy
+/// was the single biggest cost of find-as-you-type: every keystroke
+/// allocated and rewrote the entire document, line by line, before looking
+/// at any of it — on a multi-megabyte file, per keystroke. Skipping it is
+/// also *faster*, not merely leaner, because `memchr2` finds the candidate
+/// starts (either case of the needle's first byte) with SIMD.
+///
+/// Byte-wise matching stays UTF-8-safe: ASCII case folding only ever touches
+/// `0x41..=0x5A`, and no UTF-8 continuation byte falls in that range, so a
+/// byte-sequence match can only begin on a char boundary — the same property
+/// the `to_ascii_lowercase` version relied on to keep byte and char offsets
+/// in lockstep.
+fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let first = needle[0];
+    let first_upper = first.to_ascii_uppercase();
+    let last_start = haystack.len() - needle.len();
+    let mut i = 0;
+    while i <= last_start {
+        i += memchr::memchr2(first, first_upper, &haystack[i..=last_start])?;
+        if haystack[i + 1..i + needle.len()]
+            .iter()
+            .zip(&needle[1..])
+            .all(|(h, n)| h.to_ascii_lowercase() == *n)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Builds a bounded `(preview, preview_col)` around the match at byte

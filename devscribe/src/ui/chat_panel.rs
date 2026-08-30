@@ -282,8 +282,8 @@ fn status_line(state: &State, p: Palette) -> Element<'static, Message> {
         ChatStatus::Ready => {
             let model = state.chat.model.as_deref().unwrap_or("claude");
             format!(
-                "{model} \u{2014} ${:.2} \u{2014} {}+{} TOK",
-                state.chat.cost_usd, state.chat.input_tokens, state.chat.output_tokens
+                "{model} \u{2014} {}+{} TOK",
+                state.chat.input_tokens, state.chat.output_tokens
             )
         }
     };
@@ -471,6 +471,9 @@ pub fn actions_menu(state: &State, p: Palette) -> Option<Element<'static, Messag
             action_row("Switch model\u{2026}", Some(model), Message::ChatShowModel, p),
             action_toggle_row("Thinking", state.chat_thinking_enabled, Message::ChatToggleThinking, p),
             widgets::hline(color(p.border_hairline)),
+            actions_section_label("PERMISSIONS", p),
+            action_toggle_row("Shell Access", state.chat_shell_access_enabled, Message::ChatToggleShellAccess, p),
+            widgets::hline(color(p.border_hairline)),
             action_row("Account & usage\u{2026}", None, Message::ChatShowUsage, p),
         ]
         .spacing(2.0)
@@ -644,6 +647,7 @@ pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
         widgets::placeholder("Ask Claude Code about this project to get started", p)
     } else {
         scrollable(column(rows).spacing(16.0).padding(16.0).width(Length::Fill))
+            .id(crate::state::chat_scroll_id())
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

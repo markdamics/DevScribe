@@ -270,7 +270,7 @@ fn temp_files_are_cleaned_up_even_when_run_is_cancelled_mid_await() {
     let handle = std::thread::spawn(move || {
         futures::executor::block_on(async {
             futures::select! {
-                _ = run(root, fake_claude, devscribe_exe(), SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Manual }, tx).fuse() => {},
+                _ = run(root, fake_claude, devscribe_exe(), SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Manual, allow_bash: false }, tx).fuse() => {},
                 _ = cancel_rx.fuse() => {}, // drops `run`'s future here, mid-`.await`
             }
         });
@@ -318,7 +318,7 @@ fn approves_one_edit_and_denies_another_end_to_end() {
     let (tx, mut rx) = fmpsc::channel(64);
     let root = dir.clone();
     std::thread::spawn(move || {
-        futures::executor::block_on(run(root, binary, devscribe_exe, SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Manual }, tx));
+        futures::executor::block_on(run(root, binary, devscribe_exe, SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Manual, allow_bash: false }, tx));
     });
 
     let ready_events = recv_within(&mut rx, Duration::from_secs(20));
@@ -419,7 +419,7 @@ fn resumes_a_session_with_real_memory_and_replayed_history() {
     let handle = std::thread::spawn(move || {
         futures::executor::block_on(async {
             futures::select! {
-                _ = run(root1, binary, devscribe_exe1, SessionOptions { session_id: session_id1, resume: false, mode: PermissionMode::Manual }, tx1).fuse() => {},
+                _ = run(root1, binary, devscribe_exe1, SessionOptions { session_id: session_id1, resume: false, mode: PermissionMode::Manual, allow_bash: false }, tx1).fuse() => {},
                 _ = cancel_rx.fuse() => {},
             }
         });
@@ -460,7 +460,7 @@ fn resumes_a_session_with_real_memory_and_replayed_history() {
     let devscribe_exe2 = devscribe_exe();
     let session_id2 = session_id.clone();
     std::thread::spawn(move || {
-        futures::executor::block_on(run(root2, PathBuf::from("claude"), devscribe_exe2, SessionOptions { session_id: session_id2, resume: true, mode: PermissionMode::Manual }, tx2));
+        futures::executor::block_on(run(root2, PathBuf::from("claude"), devscribe_exe2, SessionOptions { session_id: session_id2, resume: true, mode: PermissionMode::Manual, allow_bash: false }, tx2));
     });
     let ready2 = recv_within(&mut rx2, Duration::from_secs(20));
     let mut sender2 = find_command_sender(&ready2).expect("expected ClaudeEvent::Ready on resume");
@@ -507,7 +507,7 @@ fn plan_and_auto_modes_behave_as_documented() {
             root,
             PathBuf::from("claude"),
             devscribe_exe(),
-            SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Plan },
+            SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Plan, allow_bash: false },
             tx,
         ));
     });
@@ -533,7 +533,7 @@ fn plan_and_auto_modes_behave_as_documented() {
             root2,
             PathBuf::from("claude"),
             devscribe_exe(),
-            SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Auto },
+            SessionOptions { session_id: new_session_id(), resume: false, mode: PermissionMode::Auto, allow_bash: false },
             tx2,
         ));
     });
@@ -552,4 +552,23 @@ fn plan_and_auto_modes_behave_as_documented() {
     assert!(contents2.contains("edited"), "auto mode should have actually edited the file: {contents2:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn generate_settings_gates_bash_with_the_same_rule_as_edit_write() {
+    let exe = PathBuf::from("/usr/bin/devscribe");
+    let socket = PathBuf::from("/tmp/devscribe-test.sock");
+
+    let manual_no_bash = generate_settings(&exe, &socket, PermissionMode::Manual, false);
+    assert_eq!(manual_no_bash["hooks"]["PreToolUse"][0]["matcher"], "Edit|Write");
+
+    let manual_with_bash = generate_settings(&exe, &socket, PermissionMode::Manual, true);
+    assert_eq!(manual_with_bash["hooks"]["PreToolUse"][0]["matcher"], "Edit|Write|Bash");
+
+    // Non-gating modes stay hook-free regardless of `allow_bash` — the same
+    // `json!({})` `generate_settings` has always returned for them.
+    for mode in [PermissionMode::EditAuto, PermissionMode::Plan, PermissionMode::Auto] {
+        assert_eq!(generate_settings(&exe, &socket, mode, false), json!({}));
+        assert_eq!(generate_settings(&exe, &socket, mode, true), json!({}));
+    }
 }

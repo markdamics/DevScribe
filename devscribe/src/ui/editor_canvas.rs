@@ -2,6 +2,7 @@
 //! drawn directly with `iced::widget::canvas` (gutter, selection, caret,
 //! tree-sitter-driven per-span coloring, LSP diagnostics) and driven by real
 //! mouse/keyboard input.
+use devscribe_core::diff::GutterMark;
 use devscribe_core::lsp::DiagnosticSeverity;
 use devscribe_core::syntax::{HighlightKind, Span};
 use devscribe_core::theme::{Palette, Rgba};
@@ -10,6 +11,7 @@ use iced::alignment::Vertical;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Style, Text};
 use iced::widget::text::{Alignment, LineHeight};
 use iced::{keyboard, mouse, Color, Pixels, Point, Rectangle, Renderer, Size, Theme};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::color::color;
@@ -34,8 +36,13 @@ pub struct EditorCanvas {
     /// Document-ordered, non-overlapping byte-range spans from
     /// `devscribe_core::syntax`. Empty for files with no wired grammar,
     /// in which case lines fall back to a single flat color.
-    pub highlights: Vec<Span>,
-    pub diagnostics: Vec<EditorDiagnostic>,
+    pub highlights: Rc<Vec<Span>>,
+    pub diagnostics: Rc<Vec<EditorDiagnostic>>,
+    /// Per-buffer-line added/modified/removed marker, from `EditorState`'s
+    /// diff against `HEAD` — drawn as a small colored gutter bar, and what a
+    /// gutter click's `Message::RevertLine` acts on. Empty for a file with
+    /// no diff (no repo, untracked, or unchanged).
+    pub gutter_marks: Rc<Vec<Option<GutterMark>>>,
     /// Toggled from the settings panel. Only hides the inline `// message`
     /// annotation — the wavy underline stays either way.
     pub problem_lens_enabled: bool,
@@ -195,8 +202,19 @@ impl canvas::Program<Message> for EditorCanvas {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let position = cursor.position_in(bounds)?;
                 state.focused = true;
-                state.dragging = true;
                 let (line, col) = self.hit_test(position);
+
+                // A click on a changed line's gutter marker reverts that
+                // line instead of placing the cursor or starting a drag-
+                // select — the marker itself is the affordance (unlike a
+                // Changes-panel row, a changed line's bar is always visible,
+                // so there's no separate hover-reveal step needed).
+                // Unmarked-line gutter clicks fall through unchanged, to
+                // today's cursor-to-column-0.
+                if position.x < GUTTER_WIDTH && self.gutter_marks.get(line).and_then(Option::as_ref).is_some() {
+                    return Some(canvas::Action::publish(Message::RevertLine { line }).and_capture());
+                }
+                state.dragging = true;
 
                 // Shift-click always just extends, same as shift+arrow —
                 // doesn't participate in double/triple-click detection.
@@ -299,6 +317,56 @@ impl canvas::Program<Message> for EditorCanvas {
                 .partition_point(|s| s.end <= first_line_byte)
         };
 
+        // Horizontal culling. There is no horizontal scrolling (the canvas
+        // is `Length::Fill` inside a vertical-only `scrollable`), so every
+        // column past the right edge is not merely off-screen, it is
+        // unreachable — and a project can hold lines with hundreds of
+        // thousands of chars (a minified bundle, a generated blob). Without
+        // this, one such line materialized its whole self as a `String` and
+        // handed it to the text shaper on *every* frame; the per-span
+        // column arithmetic below was quadratic in the line's length on top
+        // of that. Landing on one via Find navigation was enough to wedge
+        // the app.
+        let text_x0 = GUTTER_WIDTH + TEXT_INSET;
+        // +1 so a glyph straddling the right edge is still drawn, not clipped
+        // to nothing.
+        let max_cols = (((bounds.width - text_x0).max(0.0) / char_width).ceil() as usize) + 1;
+        // Clamps a column-derived x to the visible strip, so a rect or
+        // underline spanning a pathological line stays a screen wide rather
+        // than a million pixels wide.
+        let clamp_x = |x: f32| x.min(bounds.width);
+
+        // Only the find matches and diagnostics that touch the drawn line
+        // range matter. Both used to be re-scanned in full for every visible
+        // line — O(visible_lines × total), which the 200-match/200-diagnostic
+        // caps kept survivable but never cheap. Narrow each once instead.
+        let drawn_start_idx = self.document.char_index(first_line, 0);
+        let drawn_end_idx = self
+            .document
+            .char_index(last_line.saturating_sub(1), usize::MAX)
+            + 1;
+        // `find_matches` is document-ordered (built by scanning line by line),
+        // so the relevant window is a contiguous slice. `find_base` keeps the
+        // original index, which is what `find_current` is measured against.
+        let find_base = self
+            .find_matches
+            .partition_point(|(_, end)| *end <= drawn_start_idx);
+        // `.max(find_base)` only matters if the two partitions ever disagree
+        // (they shouldn't — both clamp to the same line); slicing backwards
+        // would panic, and this is the render path.
+        let find_end = self
+            .find_matches
+            .partition_point(|(start, _)| *start < drawn_end_idx)
+            .max(find_base);
+        let find_visible = &self.find_matches[find_base..find_end];
+        // Diagnostics arrive in whatever order the server sent them, so
+        // filter rather than slice.
+        let diags_visible: Vec<&EditorDiagnostic> = self
+            .diagnostics
+            .iter()
+            .filter(|d| d.start.line < last_line && d.end.line >= first_line)
+            .collect();
+
         for line in first_line..last_line {
             let y = TOP_PAD + line as f32 * line_height;
             let is_cursor_line = line == self.cursor.line;
@@ -326,8 +394,8 @@ impl canvas::Program<Message> for EditorCanvas {
             {
                 let sel_start_col = start.saturating_sub(line_start_idx);
                 let sel_end_col = (end.saturating_sub(line_start_idx)).min(line_len + 1);
-                let x0 = GUTTER_WIDTH + TEXT_INSET + sel_start_col as f32 * char_width;
-                let x1 = GUTTER_WIDTH + TEXT_INSET + sel_end_col as f32 * char_width;
+                let x0 = text_x0 + sel_start_col as f32 * char_width;
+                let x1 = clamp_x(text_x0 + sel_end_col as f32 * char_width);
                 frame.fill(
                     &Path::rectangle(
                         Point::new(x0, y),
@@ -337,15 +405,18 @@ impl canvas::Program<Message> for EditorCanvas {
                 );
             }
 
-            for (i, (start, end)) in self.find_matches.iter().enumerate() {
+            for (i, (start, end)) in find_visible.iter().enumerate() {
                 if *start >= line_end_idx || *end <= line_start_idx {
                     continue;
                 }
-                let is_current = i == self.find_current;
                 let match_start_col = start.saturating_sub(line_start_idx);
+                if text_x0 + match_start_col as f32 * char_width > bounds.width {
+                    continue;
+                }
+                let is_current = find_base + i == self.find_current;
                 let match_end_col = (end.saturating_sub(line_start_idx)).min(line_len);
-                let x0 = GUTTER_WIDTH + TEXT_INSET + match_start_col as f32 * char_width;
-                let x1 = GUTTER_WIDTH + TEXT_INSET + match_end_col as f32 * char_width;
+                let x0 = text_x0 + match_start_col as f32 * char_width;
+                let x1 = clamp_x(text_x0 + match_end_col as f32 * char_width);
                 let rect = Path::rectangle(
                     Point::new(x0, y + 1.0),
                     Size::new((x1 - x0).max(char_width * 0.4), line_height - 2.0),
@@ -365,6 +436,43 @@ impl canvas::Program<Message> for EditorCanvas {
                 }
             }
 
+            // The gutter's per-line git-diff marker: a tinted background
+            // across the whole gutter cell plus a solid accent bar at its
+            // left edge for a line that's added/modified (a lone 3px sliver
+            // at the frame's own edge, tried first, was too easy to miss —
+            // this reads unmistakably as "this line has a pending action"
+            // the way the cursor-line highlight already reads as "this is
+            // the active line"), or a solid bar at the line's top edge for
+            // `RemovedAbove` (deleted `HEAD` lines don't occupy a line of
+            // their own in the new buffer, so they can't get a full-height
+            // mark). Clicking anywhere in the gutter on a marked line
+            // (`update()`, above) reverts it to `HEAD`.
+            if let Some(mark) = self.gutter_marks.get(line).and_then(Option::as_ref) {
+                let accent = match mark {
+                    GutterMark::Added => p.status_success,
+                    GutterMark::Modified { .. } => p.status_warning,
+                    GutterMark::RemovedAbove { .. } => p.status_danger,
+                };
+                frame.fill(
+                    &Path::rectangle(Point::new(0.0, y), Size::new(GUTTER_WIDTH, line_height)),
+                    tint(accent, 0.16),
+                );
+                match mark {
+                    GutterMark::Added | GutterMark::Modified { .. } => {
+                        frame.fill(
+                            &Path::rectangle(Point::new(0.0, y), Size::new(4.0, line_height)),
+                            color(accent),
+                        );
+                    }
+                    GutterMark::RemovedAbove { .. } => {
+                        frame.fill(
+                            &Path::rectangle(Point::new(0.0, y), Size::new(GUTTER_WIDTH, 3.0)),
+                            color(accent),
+                        );
+                    }
+                }
+            }
+
             frame.fill_text(Text {
                 content: (line + 1).to_string(),
                 position: Point::new(GUTTER_WIDTH - 14.0, y),
@@ -381,10 +489,13 @@ impl canvas::Program<Message> for EditorCanvas {
                 ..Text::default()
             });
 
-            let text = self.document.line_text(line);
+            // Only the columns that fit on screen — see `max_cols`.
+            let text = self.document.line_text_capped(line, max_cols);
             if !text.is_empty() {
                 let line_start_byte = self.document.text().line_to_byte(line);
-                let line_end_byte = line_start_byte + text.len();
+                // End of the *drawn* slice, not of the line: spans past the
+                // right edge are skipped entirely rather than shaped.
+                let drawn_end_byte = line_start_byte + text.len();
 
                 while span_cursor < self.highlights.len()
                     && self.highlights[span_cursor].end <= line_start_byte
@@ -395,7 +506,7 @@ impl canvas::Program<Message> for EditorCanvas {
                 if self.highlights.is_empty() {
                     frame.fill_text(Text {
                         content: text,
-                        position: Point::new(GUTTER_WIDTH + TEXT_INSET, y),
+                        position: Point::new(text_x0, y),
                         color: color(p.text_body),
                         size: Pixels(font_size),
                         line_height: LineHeight::Absolute(Pixels(line_height)),
@@ -404,18 +515,33 @@ impl canvas::Program<Message> for EditorCanvas {
                         ..Text::default()
                     });
                 } else {
+                    // Spans are document-ordered and non-overlapping, so a
+                    // running (byte, char) cursor converts each span's byte
+                    // offset to a column in one forward pass over the line.
+                    // Counting `text[..seg_start].chars()` afresh per span
+                    // instead made this quadratic in the line's length.
+                    let mut walked_bytes = 0usize;
+                    let mut walked_chars = 0usize;
                     let mut idx = span_cursor;
-                    while idx < self.highlights.len() && self.highlights[idx].start < line_end_byte {
+                    while idx < self.highlights.len() && self.highlights[idx].start < drawn_end_byte
+                    {
                         let span = self.highlights[idx];
                         let seg_start = span.start.max(line_start_byte) - line_start_byte;
-                        let seg_end = span.end.min(line_end_byte) - line_start_byte;
+                        let seg_end = span.end.min(drawn_end_byte) - line_start_byte;
                         if seg_start < seg_end {
-                            let start_col = text[..seg_start].chars().count();
+                            if seg_start < walked_bytes {
+                                // Defensive: an out-of-order span would make
+                                // the forward walk wrong, so restart it.
+                                walked_bytes = 0;
+                                walked_chars = 0;
+                            }
+                            walked_chars += text[walked_bytes..seg_start].chars().count();
+                            walked_bytes = seg_start;
                             let content = text[seg_start..seg_end].to_string();
                             frame.fill_text(Text {
                                 content,
                                 position: Point::new(
-                                    GUTTER_WIDTH + TEXT_INSET + start_col as f32 * char_width,
+                                    text_x0 + walked_chars as f32 * char_width,
                                     y,
                                 ),
                                 color: highlight_color(span.kind, p),
@@ -432,34 +558,39 @@ impl canvas::Program<Message> for EditorCanvas {
             }
 
             let mut lens: Option<(&str, Rgba)> = None;
-            for diag in &self.diagnostics {
+            for diag in &diags_visible {
                 if diag.start.line > line || diag.end.line < line {
                     continue;
                 }
                 let seg_start_col = if diag.start.line == line { diag.start.col } else { 0 };
-                let line_len = self.document.line_len_chars(line);
                 let seg_end_col = if diag.end.line == line {
                     diag.end.col.max(seg_start_col + 1)
                 } else {
                     line_len.max(seg_start_col + 1)
                 };
                 let sev_color = severity_color(diag.severity, p);
-                let x0 = GUTTER_WIDTH + TEXT_INSET + seg_start_col as f32 * char_width;
-                let x1 = GUTTER_WIDTH + TEXT_INSET + seg_end_col as f32 * char_width;
-                draw_wavy_underline(&mut frame, x0, x1, y + line_height - 5.0, color(sev_color));
+                let x0 = text_x0 + seg_start_col as f32 * char_width;
+                // A diagnostic covering a whole pathological line would
+                // otherwise squiggle its way across a million pixels, one
+                // `PERIOD`-wide segment at a time.
+                let x1 = clamp_x(text_x0 + seg_end_col as f32 * char_width);
+                if x0 <= bounds.width {
+                    draw_wavy_underline(&mut frame, x0, x1, y + line_height - 5.0, color(sev_color));
+                }
 
                 if self.problem_lens_enabled && lens.is_none() {
                     lens = Some((diag.message.as_str(), sev_color));
                 }
             }
             if let Some((message, sev_color)) = lens {
-                let lens_col = self.document.line_len_chars(line) + 3;
+                let lens_col = line_len + 3;
+                let lens_x = text_x0 + lens_col as f32 * char_width;
+                // Past the right edge the annotation is unreachable (no
+                // horizontal scrolling), so shaping it is pure waste.
+                if lens_x <= bounds.width {
                 frame.fill_text(Text {
                     content: format!("// {message}"),
-                    position: Point::new(
-                        GUTTER_WIDTH + TEXT_INSET + lens_col as f32 * char_width,
-                        y,
-                    ),
+                    position: Point::new(lens_x, y),
                     color: tint(sev_color, 0.65),
                     size: Pixels(font_size - 1.0),
                     line_height: LineHeight::Absolute(Pixels(line_height)),
@@ -467,14 +598,17 @@ impl canvas::Program<Message> for EditorCanvas {
                     align_y: Vertical::Top,
                     ..Text::default()
                 });
+                }
             }
 
             if is_cursor_line && self.caret_visible {
-                let x = GUTTER_WIDTH + TEXT_INSET + self.cursor.col as f32 * char_width;
-                frame.fill(
-                    &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
-                    color(p.accent_solid),
-                );
+                let x = text_x0 + self.cursor.col as f32 * char_width;
+                if x <= bounds.width {
+                    frame.fill(
+                        &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
+                        color(p.accent_solid),
+                    );
+                }
             }
         }
 
@@ -516,6 +650,12 @@ fn severity_color(severity: DiagnosticSeverity, p: Palette) -> Rgba {
 fn draw_wavy_underline(frame: &mut Frame, x0: f32, x1: f32, y: f32, color: Color) {
     const AMPLITUDE: f32 = 1.6;
     const PERIOD: f32 = 4.0;
+
+    // Belt-and-braces against a caller handing in a span thousands of
+    // screens wide: the loop below advances `PERIOD` px at a time, so an
+    // unbounded `x1` is an unbounded number of path segments.
+    const MAX_SEGMENTS: usize = 4096;
+    let x1 = x1.min(x0 + MAX_SEGMENTS as f32 * PERIOD);
 
     let path = Path::new(|p| {
         p.move_to(Point::new(x0, y));
@@ -562,6 +702,19 @@ pub(crate) fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
 /// the `Canvas` so it can sit inside a `scrollable` for vertical scrolling.
 pub fn content_height(line_count: usize, font_size: f32) -> f32 {
     TOP_PAD * 2.0 + line_count as f32 * font_size * LINE_HEIGHT_RATIO
+}
+
+/// Absolute y-position (canvas/document coordinates, i.e. what
+/// `scroll_offset` is measured against) of the top of `line` at `font_size`.
+/// Used by Find navigation to decide whether a match is already within the
+/// visible scroll range before scrolling to it.
+pub fn line_top(line: usize, font_size: f32) -> f32 {
+    TOP_PAD + line as f32 * font_size * LINE_HEIGHT_RATIO
+}
+
+/// Line height in px at `font_size` — see `line_top`.
+pub fn line_height_px(font_size: f32) -> f32 {
+    font_size * LINE_HEIGHT_RATIO
 }
 
 /// Approximate window-relative pixel position of the bottom-left corner of

@@ -1,12 +1,19 @@
 //! The settings overlay: a left-nav modal (`Explorer`/`Editor`/`Toolchains`/
-//! `Shortcuts`/`About`) matching the mockup's 760x520 shell. Every category
-//! has real content as of Phase 7 — see `docs/differences-and-roadmap.md`'s
-//! Phase 7 writeup for what "real" means for Toolchains (DevScribe only
-//! ever speaks to one language server, so that's all it claims) and
-//! Shortcuts (only currently-wired keybindings are listed, not the
-//! mockup's `New window`/`Open folder`/`Save as` rows — none of those
-//! actions exist in DevScribe). Rendered as a `stack!` layer over the
-//! shell, same backdrop-modal mechanism as `command_palette`.
+//! `Shortcuts`/`About`) matching the mockup's 760x520 shell and its nav
+//! order. Rendered as a `stack!` layer over the shell, same backdrop-modal
+//! mechanism as `command_palette`.
+//!
+//! Two deliberate departures from `DevScribe.dc.html`:
+//!
+//! - **Toolchains** shows live state — the active language's real
+//!   `LspStatus`, and binary-present/absent for the rest — where the mockup
+//!   shows four fixed `READY`/`FETCHING` sample rows. The mockup's states
+//!   aren't a model DevScribe has; these are.
+//! - **Shortcuts** lists every wired keybinding, which is a superset of the
+//!   mockup's ten rows (it also has the tab, find and reveal bindings).
+//!
+//! Switch rows otherwise carry the mockup's own title + description copy
+//! verbatim — see `toggle_row`.
 use devscribe_core::theme::{Accent, Palette, ThemeMode};
 use iced::font::Weight;
 use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
@@ -248,14 +255,33 @@ fn density_row(state: &State, p: Palette) -> Element<'static, Message> {
     row(options).spacing(8.0).into()
 }
 
-fn toggle_row(label: &'static str, enabled: bool, message: Message, p: Palette) -> Element<'static, Message> {
+/// One settings switch, as the mockup lays it out: a `--text-body-md`
+/// title over a `--text-body-sm`/`--text-muted` line saying what the switch
+/// actually does, with the control on the right. The app used to show a
+/// single label carrying the *description's* wording ("Show inline problem
+/// hints"), which lost the mockup's title ("Inline problem lens") and with
+/// it the name the rest of the UI uses for the same feature.
+fn toggle_row(
+    title: &'static str,
+    description: &'static str,
+    enabled: bool,
+    message: Message,
+    p: Palette,
+) -> Element<'static, Message> {
     button(
         row![
             widgets::dot(if enabled { color(p.accent_solid) } else { color(p.text_muted) }, 6.0),
-            text(label)
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(15.0))
-                .color(color(p.text_strong)),
+            column![
+                text(title)
+                    .font(fonts::mono(Weight::Medium))
+                    .size(crate::text_scale::px(15.0))
+                    .color(color(p.text_strong)),
+                text(description)
+                    .font(fonts::mono(Weight::Normal))
+                    .size(crate::text_scale::px(13.0))
+                    .color(color(p.text_muted)),
+            ]
+            .spacing(2.0),
             iced::widget::Space::new().width(Length::Fill),
             text(if enabled { "ON" } else { "OFF" })
                 .font(fonts::mono(Weight::Bold))
@@ -349,17 +375,35 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
         column![section_label("UI TEXT SIZE", p), ui_scale_row(state, p)].spacing(8.0),
         column![
             section_label("FILES", p),
-            toggle_row("Show hidden files", state.show_hidden_files, Message::ToggleShowHiddenFiles, p),
+            toggle_row(
+                "Show hidden files",
+                "Dotfiles and ignored paths in the tree",
+                state.show_hidden_files,
+                Message::ToggleShowHiddenFiles,
+                p,
+            ),
         ]
         .spacing(8.0),
         column![
             section_label("GIT", p),
-            toggle_row("Show git status in tree", state.git_status_in_tree, Message::ToggleGitStatusInTree, p),
+            toggle_row(
+                "Git status in tree",
+                "Dirty dots, staged marks, ahead/behind counts",
+                state.git_status_in_tree,
+                Message::ToggleGitStatusInTree,
+                p,
+            ),
         ]
         .spacing(8.0),
         column![
             section_label("DIAGNOSTICS", p),
-            toggle_row("Show inline problem hints", state.problem_lens_enabled, Message::ToggleProblemLens, p),
+            toggle_row(
+                "Inline problem lens",
+                "Show diagnostics at the end of the offending line",
+                state.problem_lens_enabled,
+                Message::ToggleProblemLens,
+                p,
+            ),
         ]
         .spacing(8.0),
     ]
@@ -380,13 +424,20 @@ fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
         column![section_label("FONT SIZE", p), font_size_row(state, p)].spacing(8.0),
         column![
             section_label("DIAGNOSTICS", p),
-            toggle_row("Show inline problem hints", state.problem_lens_enabled, Message::ToggleProblemLens, p),
+            toggle_row(
+                "Inline problem lens",
+                "Show diagnostics at the end of the offending line",
+                state.problem_lens_enabled,
+                Message::ToggleProblemLens,
+                p,
+            ),
         ]
         .spacing(8.0),
         column![
             section_label("SAVING", p),
             toggle_row(
                 "Save on focus loss",
+                "Write buffers when the window is backgrounded",
                 state.save_on_focus_loss,
                 Message::ToggleSaveOnFocusLoss,
                 p
@@ -471,7 +522,13 @@ fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
     for row in rows {
         col = col.push(row);
     }
-    col.push(toggle_row("Enable language servers", state.lsp_enabled, Message::ToggleLspEnabled, p))
+    col.push(toggle_row(
+        "Install toolchains automatically",
+        "Fetch syntax and language servers on first open",
+        state.lsp_enabled,
+        Message::ToggleLspEnabled,
+        p,
+    ))
         .into()
 }
 
