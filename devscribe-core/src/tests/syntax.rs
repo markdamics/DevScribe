@@ -20,7 +20,8 @@ fn language_from_extension() {
     assert_eq!(Language::from_extension("ini"), Some(Language::Ini));
     assert_eq!(Language::from_extension("cfg"), Some(Language::Ini));
     assert_eq!(Language::from_extension("properties"), Some(Language::Ini));
-    assert_eq!(Language::from_extension("md"), None);
+    assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
+    assert_eq!(Language::from_extension("markdown"), Some(Language::Markdown));
 }
 
 #[test]
@@ -127,4 +128,23 @@ fn highlights_ini_sections_and_comments() {
     assert!(spans
         .iter()
         .any(|s| &source[s.start..s.end] == "section" && s.kind == HighlightKind::Type));
+}
+
+#[test]
+fn highlights_markdown_heading_and_inline_code() {
+    let mut highlighter = Highlighter::new();
+    let source = "# Title\n\nSome `code` and **bold** text.\n";
+    let spans = highlighter.highlight(Language::Markdown, source);
+
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].contains("Title") && s.kind == HighlightKind::Keyword));
+    // These two only appear if the block grammar's "markdown_inline"
+    // injection actually resolved to the inline grammar's config.
+    assert!(spans
+        .iter()
+        .any(|s| &source[s.start..s.end] == "code" && s.kind == HighlightKind::String));
+    assert!(spans
+        .iter()
+        .any(|s| &source[s.start..s.end] == "bold" && s.kind == HighlightKind::Function));
 }

@@ -1950,6 +1950,10 @@ pub enum Message {
     OpenTreeContext(Option<PathBuf>),
     CloseTreeContext,
     CopyPath(PathBuf),
+    /// Context menu's escape hatch for files `SelectFile` would otherwise
+    /// redirect elsewhere (currently just Markdown, opened externally by
+    /// default) — opens `path` as a DevScribe tab regardless.
+    OpenInEditor(PathBuf),
     /// First click on the context menu's "Delete" row — shows the
     /// confirm/cancel step (`ContextMenu::confirm_delete`) rather than
     /// deleting immediately.
@@ -2179,7 +2183,17 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
         Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
-        Message::SelectFile(path) => open_or_focus_file(state, path),
+        Message::SelectFile(path) => {
+            if fs_tree::Lang::from_path(&path) == fs_tree::Lang::Md {
+                open_externally(&path);
+            } else {
+                open_or_focus_file(state, path);
+            }
+        }
+        Message::OpenInEditor(path) => {
+            state.ctx_menu = None;
+            open_or_focus_file(state, path);
+        }
         Message::EditorInsertText(text) => {
             if let Some(path) = active_file_path(state) {
                 // Intercept Enter ("\n") and Tab ("    ") when the completion
@@ -3692,8 +3706,9 @@ fn open_file_paths(state: &State) -> Vec<PathBuf> {
 }
 
 /// Opens `path` as a `File` tab, or focuses it if already open. Shared by
-/// `SelectFile`, `SearchResultSelected`, and the palette's file-open entries
-/// — this is what makes opening a second file additive instead of a replace.
+/// `SelectFile`, `SearchResultSelected`, `OpenInEditor`, and the palette's
+/// file-open entries — this is what makes opening a second file additive
+/// instead of a replace.
 fn open_or_focus_file(state: &mut State, path: PathBuf) {
     let key = TabKey::File(path.clone());
     if state.open_tabs.iter().any(|t| t.key() == key) {
@@ -3705,6 +3720,17 @@ fn open_or_focus_file(state: &mut State, path: PathBuf) {
         state.active_tab = Some(key);
         send_did_open_for(state, &path);
         recompute_diff_for(state, &path);
+    }
+}
+
+/// Hands `path` to the OS's default application for it instead of opening a
+/// DevScribe tab — used for Markdown files clicked in the sidebar, since
+/// they're more often read/reviewed than edited in-place. `OpenInEditor`
+/// (the context menu's escape hatch) still goes through `open_or_focus_file`
+/// directly.
+fn open_externally(path: &Path) {
+    if let Err(err) = opener::open(path) {
+        crate::logging::error(format!("failed to open {} externally: {err}", path.display()));
     }
 }
 

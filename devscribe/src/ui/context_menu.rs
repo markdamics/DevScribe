@@ -122,6 +122,9 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         ];
         if let Some(target) = ctx.target.clone() {
             rows.push(widgets::hline(color(p.border_hairline)));
+            if crate::fs_tree::Lang::from_path(&target) == crate::fs_tree::Lang::Md {
+                rows.push(menu_row("Open in editor", "", Message::OpenInEditor(target.clone()), p));
+            }
             rows.push(menu_row("Rename", "\u{21b5}", Message::BeginRename(target.clone()), p));
             rows.push(menu_row("Copy path", "\u{2325}\u{2318}C", Message::CopyPath(target), p));
             rows.push(widgets::hline(color(p.border_hairline)));

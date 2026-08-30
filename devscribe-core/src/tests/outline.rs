@@ -131,7 +131,14 @@ fn languages_without_a_landmark_table_produce_no_crumbs() {
     // no landmarks to ever find — `parse` returning `None` (rather than a
     // `Tree` that just never matches anything) confirms outline.rs doesn't
     // bother parsing files it can never produce a breadcrumb for.
-    for lang in [Language::Json, Language::Toml, Language::Yaml, Language::Xml, Language::Ini] {
+    for lang in [
+        Language::Json,
+        Language::Toml,
+        Language::Yaml,
+        Language::Xml,
+        Language::Ini,
+        Language::Markdown,
+    ] {
         assert!(parse(lang, "irrelevant").is_none(), "{lang:?} must not parse for breadcrumbs");
     }
 }

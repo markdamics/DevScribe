@@ -42,6 +42,7 @@ pub enum Language {
     Yaml,
     Xml,
     Ini,
+    Markdown,
 }
 
 impl Language {
@@ -58,6 +59,7 @@ impl Language {
             "yml" | "yaml" => Some(Language::Yaml),
             "xml" | "svg" | "xsd" | "xsl" | "xslt" | "plist" => Some(Language::Xml),
             "ini" | "cfg" | "properties" => Some(Language::Ini),
+            "md" | "markdown" => Some(Language::Markdown),
             _ => None,
         }
     }
@@ -76,6 +78,7 @@ impl Language {
             Language::Yaml => "YAML",
             Language::Xml => "XML",
             Language::Ini => "INI",
+            Language::Markdown => "Markdown",
         }
     }
 }
@@ -113,6 +116,12 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "tag",
     "type",
     "variable",
+    "text.title",
+    "text.literal",
+    "text.uri",
+    "text.reference",
+    "text.strong",
+    "text.emphasis",
 ];
 
 const HIGHLIGHT_KINDS: &[HighlightKind] = &[
@@ -133,6 +142,15 @@ const HIGHLIGHT_KINDS: &[HighlightKind] = &[
     HighlightKind::Keyword,
     HighlightKind::Type,
     HighlightKind::Default,
+    // Markdown-specific (nvim-treesitter-style capture names used by
+    // tree-sitter-md's shipped queries — a different taxonomy than every
+    // other language here, which is why these live at the end).
+    HighlightKind::Keyword,   // text.title (headings)
+    HighlightKind::String,    // text.literal (code spans / fenced code)
+    HighlightKind::Constant,  // text.uri (link/image destinations)
+    HighlightKind::Attribute, // text.reference (link labels/text)
+    HighlightKind::Function,  // text.strong (bold)
+    HighlightKind::Attribute, // text.emphasis (italic)
 ];
 
 fn rust_config() -> &'static HighlightConfiguration {
@@ -317,6 +335,58 @@ fn ini_config() -> &'static HighlightConfiguration {
     })
 }
 
+/// Markdown's grammar is split into a block grammar (headings, lists, code
+/// fences, blockquotes) and a separate inline grammar (bold, italic, inline
+/// code, links) that the block grammar's own query pulls in via a language
+/// injection named `"markdown_inline"` — see the injection callback in
+/// `Highlighter::highlight` below, which is what actually resolves it.
+fn markdown_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        // The block grammar's own tokenizer still emits each inline
+        // delimiter (`` ` ``, `*`, etc.) as an anonymous child of the
+        // `(inline)` node it hands off for injection. Without
+        // `injection.include-children`, tree-sitter-highlight's default
+        // "exclude the content node's children" behavior excises exactly
+        // those delimiter bytes from the range it re-parses with the inline
+        // grammar — which then can't see its own delimiters and silently
+        // produces no structure at all (no bold/italic/code-span captures,
+        // just inert plain text). Patching in the directive here fixes it;
+        // see `ini_config` for the same "shipped query needs a tweak"
+        // pattern applied to a different crate's quirk.
+        let injections_query = tree_sitter_md::INJECTION_QUERY_BLOCK.replace(
+            "(#set! injection.language \"markdown_inline\"))",
+            "(#set! injection.language \"markdown_inline\")\n  (#set! injection.include-children))",
+        );
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_md::LANGUAGE.into(),
+            "markdown",
+            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+            &injections_query,
+            "",
+        )
+        .expect("tree-sitter-md ships a valid block highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn markdown_inline_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_md::INLINE_LANGUAGE.into(),
+            "markdown_inline",
+            tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            tree_sitter_md::INJECTION_QUERY_INLINE,
+            "",
+        )
+        .expect("tree-sitter-md ships a valid inline highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
 fn config_for(language: Language) -> &'static HighlightConfiguration {
     match language {
         Language::Rust => rust_config(),
@@ -330,6 +400,7 @@ fn config_for(language: Language) -> &'static HighlightConfiguration {
         Language::Yaml => yaml_config(),
         Language::Xml => xml_config(),
         Language::Ini => ini_config(),
+        Language::Markdown => markdown_config(),
     }
 }
 
@@ -351,10 +422,9 @@ impl Highlighter {
     /// parse/query error tree-sitter can't recover from.
     pub fn highlight(&mut self, language: Language, source: &str) -> Vec<Span> {
         let config = config_for(language);
-        let Ok(events) = self
-            .inner
-            .highlight(config, source.as_bytes(), None, |_| None)
-        else {
+        let Ok(events) = self.inner.highlight(config, source.as_bytes(), None, |name| {
+            (name == "markdown_inline").then(markdown_inline_config)
+        }) else {
             return Vec::new();
         };
 
