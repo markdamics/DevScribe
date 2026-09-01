@@ -33,6 +33,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     let problem_lens_enabled = state.problem_lens_enabled;
     let font_size = state.editor_font_size;
     let scroll_offset = editor.scroll_offset;
+    let max_line_chars = editor.max_line_chars();
 
     // `responsive` hands us the pane's actual available height up front
     // (rather than waiting for a scroll event to learn it), so the canvas
@@ -56,17 +57,33 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             viewport_height: size.height,
         };
 
+        // At least the pane's own width (`size.width`, from `responsive`) so
+        // a short-lined file still fills the pane exactly like before; wider
+        // when the document's longest line needs more than that, which is
+        // what makes it something to scroll sideways *into*.
+        let canvas_width = editor_canvas::content_width(max_line_chars, font_size).max(size.width);
+
         let canvas_widget = canvas(program)
-            .width(Length::Fill)
+            .width(Length::Fixed(canvas_width))
             .height(Length::Fixed(editor_canvas::content_height(
                 line_count, font_size,
             )));
 
         scrollable(canvas_widget)
             .id(state::editor_scroll_id())
-            .on_scroll(|viewport| Message::EditorScrolled {
-                offset: viewport.absolute_offset().y,
-                viewport_height: viewport.bounds().height,
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .on_scroll(|viewport| {
+                let offset = viewport.absolute_offset();
+                let bounds = viewport.bounds();
+                Message::EditorScrolled {
+                    offset: offset.y,
+                    viewport_height: bounds.height,
+                    offset_x: offset.x,
+                    viewport_width: bounds.width,
+                }
             })
             .width(Length::Fill)
             .height(Length::Fill)

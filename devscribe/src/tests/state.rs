@@ -2343,3 +2343,219 @@ fn palette_colon_query_is_empty_with_no_file_open() {
         "nothing to jump to without an active file tab"
     );
 }
+
+#[test]
+fn typing_an_opening_bracket_with_no_selection_pairs_it() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+
+    editor.type_char('(');
+
+    assert_eq!(editor.document.text().to_string(), "()");
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 1 }, "the caret must land between the two halves");
+}
+
+#[test]
+fn typing_a_quote_with_no_selection_pairs_it_too() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+
+    editor.type_char('"');
+
+    assert_eq!(editor.document.text().to_string(), "\"\"");
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 1 });
+}
+
+#[test]
+fn typing_the_closer_right_before_its_auto_inserted_partner_skips_over_it() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+    editor.type_char('(');
+    assert_eq!(editor.document.text().to_string(), "()");
+
+    editor.type_char(')');
+
+    assert_eq!(
+        editor.document.text().to_string(),
+        "()",
+        "typing the closer must not insert a second one"
+    );
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 2 }, "the caret steps past the existing closer instead");
+}
+
+#[test]
+fn typing_a_quote_right_before_its_own_auto_inserted_partner_skips_over_it() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+    editor.type_char('"');
+
+    editor.type_char('"');
+
+    assert_eq!(editor.document.text().to_string(), "\"\"");
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 2 });
+}
+
+#[test]
+fn typing_a_closer_with_no_matching_partner_nearby_inserts_it_literally() {
+    let mut editor = EditorState::new(Document::from_str("abc"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 3 };
+
+    editor.type_char(')');
+
+    assert_eq!(editor.document.text().to_string(), "abc)");
+}
+
+#[test]
+fn typing_an_opener_with_an_active_selection_wraps_it_instead_of_pairing() {
+    let mut editor = EditorState::new(Document::from_str("hello"), PathBuf::from("t.rs"));
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 0, col: 5 };
+
+    editor.type_char('(');
+
+    assert_eq!(editor.document.text().to_string(), "(hello)");
+    assert_eq!(
+        editor.selection(),
+        Some((1, 6)),
+        "the original text stays selected — wrapped, not replaced or deselected"
+    );
+}
+
+#[test]
+fn wrapping_a_multi_line_selection_still_lands_the_closer_at_the_right_end() {
+    let mut editor = EditorState::new(Document::from_str("a\nbc\n"), PathBuf::from("t.rs"));
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 1, col: 2 };
+
+    editor.type_char('{');
+
+    assert_eq!(editor.document.text().to_string(), "{a\nbc}\n");
+}
+
+#[test]
+fn typing_an_ordinary_character_is_unaffected_by_auto_pairing() {
+    let mut editor = EditorState::new(Document::from_str("ab"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 1 };
+
+    editor.type_char('x');
+
+    assert_eq!(editor.document.text().to_string(), "axb");
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 2 });
+}
+
+#[test]
+fn max_line_chars_grows_as_a_line_grows() {
+    let mut editor = EditorState::new(Document::from_str("ab\nc\n"), PathBuf::from("t.txt"));
+    assert_eq!(editor.max_line_chars(), 2, "sanity: starts at the longest existing line");
+
+    editor.cursor = CursorPos { line: 1, col: 1 };
+    editor.insert_text("hello");
+
+    assert_eq!(editor.max_line_chars(), 6, "typing a longer line must grow the tracked max immediately, not wait for settle");
+}
+
+#[test]
+fn max_line_chars_is_capped_even_for_a_pathologically_long_line() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.txt"));
+    editor.insert_text(&"x".repeat(5000));
+
+    assert_eq!(
+        editor.max_line_chars(),
+        MAX_RENDERED_LINE_CHARS,
+        "the canvas must never be sized to fit a whole minified-bundle-style line verbatim"
+    );
+}
+
+#[test]
+fn max_line_chars_shrinks_back_once_the_longest_line_is_deleted_and_reparsed() {
+    let mut editor = EditorState::new(Document::from_str("short\nreally long line here\n"), PathBuf::from("t.txt"));
+    assert_eq!(editor.max_line_chars(), 21);
+
+    // Delete the whole second (longest) line.
+    editor.cursor = CursorPos { line: 1, col: 0 };
+    let range = editor.document.line_char_range_with_terminator(1);
+    editor.document.remove(range);
+    editor.resync_after_edit();
+    assert_eq!(
+        editor.max_line_chars(),
+        21,
+        "grow-only tracking must not shrink immediately — it's stale until the next reparse, by design"
+    );
+
+    editor.reparse_now();
+    assert_eq!(editor.max_line_chars(), 5, "a full reparse must correct the stale, now-too-large cached max");
+}
+
+#[test]
+fn undo_immediately_corrects_max_line_chars_without_waiting_for_settle() {
+    let mut editor = EditorState::new(Document::from_str("ab"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 2 };
+    editor.insert_text(&"x".repeat(20));
+    assert_eq!(editor.max_line_chars(), 22);
+
+    assert!(editor.undo());
+
+    assert_eq!(
+        editor.max_line_chars(),
+        2,
+        "undo/redo are discrete, infrequent actions — they recompute immediately rather than waiting for the settle debounce"
+    );
+}
+
+#[test]
+fn typing_past_the_right_edge_of_a_narrow_viewport_scrolls_right() {
+    let files = TempFiles::new("hscroll-right");
+    std::fs::write(&files.a, "").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    find_editor_mut(&mut state, &files.a).unwrap().viewport_width = 100.0;
+
+    for _ in 0..20 {
+        let _ = update(&mut state, Message::EditorTypeChar('x'));
+    }
+
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert!(editor.scroll_offset_x > 0.0, "typing past a 100px-wide viewport must scroll right to keep the caret visible");
+}
+
+#[test]
+fn moving_back_to_column_zero_resets_horizontal_scroll_to_show_the_gutter_again() {
+    let files = TempFiles::new("hscroll-home");
+    std::fs::write(&files.a, "x".repeat(60)).unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.viewport_width = 100.0;
+        editor.cursor = CursorPos { line: 0, col: 60 };
+    }
+    let _ = update(&mut state, Message::EditorMove { dir: Direction::LineEnd, extend: false });
+    assert!(
+        find_editor(&state, &files.a).unwrap().scroll_offset_x > 0.0,
+        "sanity: starting scrolled right"
+    );
+
+    let _ = update(&mut state, Message::EditorMove { dir: Direction::LineStart, extend: false });
+
+    assert_eq!(
+        find_editor(&state, &files.a).unwrap().scroll_offset_x,
+        0.0,
+        "column 0 must fully reset the scroll, not stop just short of it and leave the gutter hidden"
+    );
+}
+
+#[test]
+fn scroll_cursor_into_view_is_a_no_op_when_already_visible() {
+    let files = TempFiles::new("hscroll-noop");
+    std::fs::write(&files.a, "hello").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.viewport_width = 800.0;
+        editor.viewport_height = 800.0;
+    }
+
+    let task = scroll_cursor_into_view(&mut state);
+
+    assert_eq!(task.units(), 0, "a fully-visible caret must not produce a scroll task");
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert_eq!(editor.scroll_offset_x, 0.0);
+    assert_eq!(editor.scroll_offset, 0.0);
+}

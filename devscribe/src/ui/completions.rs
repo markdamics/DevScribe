@@ -86,6 +86,7 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         editor.completion_anchor.col,
         font_size,
         editor.scroll_offset,
+        editor.scroll_offset_x,
         HEADER_HEIGHT,
     );
 

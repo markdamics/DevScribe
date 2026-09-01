@@ -206,11 +206,20 @@ impl EditorCanvas {
         }
 
         let text = text?;
-        if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
-            return publish(Message::EditorInsertText(text.to_string()));
+        if text.is_empty() || text.chars().any(|c| c.is_control()) {
+            return None;
         }
-
-        None
+        // A lone char is a genuine physical keystroke — route it through
+        // `EditorTypeChar` so auto-pairing (`EditorState::type_char`) gets a
+        // chance at it. Anything longer (rare — some IME composition
+        // sequences) is left as a literal `EditorInsertText`, same as
+        // before; auto-pairing only ever makes sense for one character
+        // typed at a time.
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch), None) => publish(Message::EditorTypeChar(ch)),
+            _ => publish(Message::EditorInsertText(text.to_string())),
+        }
     }
 }
 
@@ -383,16 +392,17 @@ impl canvas::Program<Message> for EditorCanvas {
                 .partition_point(|s| s.end <= first_line_byte)
         };
 
-        // Horizontal culling. There is no horizontal scrolling (the canvas
-        // is `Length::Fill` inside a vertical-only `scrollable`), so every
-        // column past the right edge is not merely off-screen, it is
-        // unreachable — and a project can hold lines with hundreds of
-        // thousands of chars (a minified bundle, a generated blob). Without
-        // this, one such line materialized its whole self as a `String` and
-        // handed it to the text shaper on *every* frame; the per-span
-        // column arithmetic below was quadratic in the line's length on top
-        // of that. Landing on one via Find navigation was enough to wedge
-        // the app.
+        // Horizontal culling. The canvas is now sized to the document's
+        // widest line (`shell.rs`'s `content_width`, from
+        // `EditorState::max_line_chars`) so it can scroll sideways — but
+        // that width is itself capped at `MAX_RENDERED_LINE_CHARS`, so
+        // `bounds.width` here is bounded too. Without a cap somewhere, a
+        // project can hold lines with hundreds of thousands of chars (a
+        // minified bundle, a generated blob), and materializing one whole
+        // such line as a `String` and handing it to the text shaper on
+        // *every* frame — with the per-span column arithmetic below
+        // quadratic in the line's length on top of that — was enough to
+        // wedge the app just by landing on one via Find navigation.
         let text_x0 = GUTTER_WIDTH + TEXT_INSET;
         // +1 so a glyph straddling the right edge is still drawn, not clipped
         // to nothing.
@@ -663,8 +673,10 @@ impl canvas::Program<Message> for EditorCanvas {
             if let Some((message, sev_color)) = lens {
                 let lens_col = line_len + 3;
                 let lens_x = text_x0 + lens_col as f32 * char_width;
-                // Past the right edge the annotation is unreachable (no
-                // horizontal scrolling), so shaping it is pure waste.
+                // Past the canvas's own (capped) width the annotation is
+                // unreachable even via horizontal scroll, so shaping it
+                // would be pure waste — only bites on the rare line long
+                // enough to hit `MAX_RENDERED_LINE_CHARS`.
                 if lens_x <= bounds.width {
                 frame.fill_text(Text {
                     content: format!("// {message}"),
@@ -783,6 +795,20 @@ pub fn content_height(line_count: usize, font_size: f32) -> f32 {
     TOP_PAD * 2.0 + line_count as f32 * font_size * LINE_HEIGHT_RATIO
 }
 
+/// Total content width for a document whose longest line is
+/// `max_line_chars` (already capped — see `EditorState::max_line_chars`) at
+/// `font_size` — the horizontal sibling of `content_height`, sizing the
+/// canvas so it can scroll sideways within a `scrollable` instead of
+/// clipping anything past the pane's own width.
+pub fn content_width(max_line_chars: usize, font_size: f32) -> f32 {
+    let char_width = font_size * CHAR_WIDTH_RATIO;
+    // A little slack past the last char so the caret sitting right at
+    // end-of-line, and a diagnostic's inline `// message` lens past it,
+    // both stay fully reachable rather than landing exactly on the
+    // scrollable's own right edge.
+    GUTTER_WIDTH + TEXT_INSET + max_line_chars as f32 * char_width + char_width * 24.0
+}
+
 /// Absolute y-position (canvas/document coordinates, i.e. what
 /// `scroll_offset` is measured against) of the top of `line` at `font_size`.
 /// Used by Find navigation to decide whether a match is already within the
@@ -794,6 +820,19 @@ pub fn line_top(line: usize, font_size: f32) -> f32 {
 /// Line height in px at `font_size` — see `line_top`.
 pub fn line_height_px(font_size: f32) -> f32 {
     font_size * LINE_HEIGHT_RATIO
+}
+
+/// Absolute x-position (canvas coordinates, what `scroll_offset_x` is
+/// measured against) of the left edge of the glyph at `col`, at `font_size`
+/// — the horizontal sibling of `line_top`, used by
+/// `scroll_cursor_into_view`'s horizontal half.
+pub fn col_left(col: usize, font_size: f32) -> f32 {
+    GUTTER_WIDTH + TEXT_INSET + col as f32 * (font_size * CHAR_WIDTH_RATIO)
+}
+
+/// Char width in px at `font_size` — see `col_left`.
+pub fn char_width_px(font_size: f32) -> f32 {
+    font_size * CHAR_WIDTH_RATIO
 }
 
 /// Approximate window-relative pixel position of the bottom-left corner of
@@ -808,11 +847,12 @@ pub fn cursor_pixel_pos(
     col: usize,
     font_size: f32,
     scroll_offset: f32,
+    scroll_offset_x: f32,
     header_height: f32,
 ) -> (f32, f32) {
     let line_height = font_size * LINE_HEIGHT_RATIO;
     let char_width = font_size * CHAR_WIDTH_RATIO;
-    let x = GUTTER_WIDTH + TEXT_INSET + col as f32 * char_width;
+    let x = GUTTER_WIDTH + TEXT_INSET + col as f32 * char_width - scroll_offset_x;
     // +1 so the popup appears *below* the cursor line, not overlapping it.
     let y = header_height + TOP_PAD + (line as f32 + 1.0) * line_height - scroll_offset;
     (x, y)

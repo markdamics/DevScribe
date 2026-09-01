@@ -452,6 +452,25 @@ pub struct EditorState {
     /// `find_step` falls back to an assumed height in that case rather
     /// than refusing to scroll.
     pub viewport_height: f32,
+    /// Horizontal scroll offset (px from the left) — the same idea as
+    /// `scroll_offset`, one axis over, now that the canvas is sized to the
+    /// document's widest line (`max_line_chars`) rather than always filling
+    /// the pane, so long lines scroll into view instead of being clipped.
+    pub scroll_offset_x: f32,
+    /// Width (px) of the horizontal scroll viewport — the `viewport_height`
+    /// of this axis.
+    pub viewport_width: f32,
+    /// The char length of the document's longest line, capped at
+    /// `MAX_RENDERED_LINE_CHARS` — sizes the canvas horizontally (see
+    /// `editor_canvas::content_width`). Kept only *grow*-accurate between
+    /// settles: `resync_after_edit` bumps it the moment a line gets longer
+    /// (so typing past the current edge doesn't visibly clip before the
+    /// canvas catches up), but never shrinks it — a shrink (e.g. deleting
+    /// the longest line) only self-corrects at the next `reparse_now`, same
+    /// EDIT_SETTLE lag `highlights`/`tree` already accept. A full rescan on
+    /// every keystroke would put an O(line count) pass back on the hot path
+    /// this file has otherwise gone to some lengths to keep O(1).
+    max_line_chars: usize,
     /// Active completion popup: `None` = closed, `Some(items)` = showing.
     pub completions: Option<Vec<CompletionItem>>,
     /// Keyboard-navigation index into `completions`.
@@ -524,6 +543,31 @@ enum EditKind {
 /// bound.
 const MAX_UNDO_ENTRIES: usize = 500;
 
+/// Cap on `EditorState::max_line_chars` — the widest column the canvas will
+/// ever actually size itself to and let horizontal scroll reach. A
+/// minified bundle or generated blob can hold a single line hundreds of
+/// thousands of chars long; sizing the canvas to fit one verbatim would
+/// make it (and every hit-test/frame built against its width) as
+/// pathological as the "no-cap" line-rendering trap `line_text_capped`
+/// exists to avoid on the vertical axis. 2000 columns is already far wider
+/// than any realistic terminal or monitor — ordinary code, even quite long
+/// lines, stays completely unaffected by this; only the truly pathological
+/// case is what the cap actually bites.
+const MAX_RENDERED_LINE_CHARS: usize = 2000;
+
+/// A one-time full scan for `EditorState::new` — every other call site
+/// updates `max_line_chars` incrementally (grow-only in the hot path,
+/// reconciled at settle) rather than rescanning, per its own doc comment.
+/// `line_len_chars` is O(log n) (no text materialized), so this whole pass
+/// is O(line count), the same class as `Document::line_count()` itself.
+fn scan_max_line_chars(document: &Document) -> usize {
+    (0..document.line_count())
+        .map(|line| document.line_len_chars(line))
+        .max()
+        .unwrap_or(0)
+        .min(MAX_RENDERED_LINE_CHARS)
+}
+
 impl EditorState {
     pub fn new(document: Document, path: PathBuf) -> Self {
         let language = path
@@ -543,6 +587,11 @@ impl EditorState {
             (Some(lang), Some(text)) => outline::parse(lang, text),
             _ => None,
         };
+        // A one-time full scan, same cost class as the initial highlight
+        // parse above — cheap relative to that (just `len_chars()` per line,
+        // no text materialized), and there's no settle-debounced moment
+        // before the very first `draw()` to defer it to.
+        let max_line_chars = scan_max_line_chars(&document);
         let mut this = Self {
             document,
             path,
@@ -566,6 +615,9 @@ impl EditorState {
             find: None,
             scroll_offset: 0.0,
             viewport_height: 0.0,
+            scroll_offset_x: 0.0,
+            viewport_width: 0.0,
+            max_line_chars,
             completions: None,
             completion_selected: 0,
             completion_anchor: CursorPos::default(),
@@ -597,7 +649,34 @@ impl EditorState {
         // break an Up/Down run's sticky column — editing is not vertical
         // motion, so the next Up/Down should re-seed from the new cursor.
         self.goal_col = None;
+        // Covers the common single-position edits (typing, backspace,
+        // paste, ...) generically via wherever the cursor landed. Multi-line
+        // block edits (`indent`/`dedent`/`toggle_comment`) additionally call
+        // `note_line_length` per touched line directly, since most of those
+        // lines aren't the cursor's own.
+        self.note_line_length(self.cursor.line);
         self.refind();
+    }
+
+    /// Grows `max_line_chars` if `line`'s current length now exceeds it —
+    /// see the field's own doc comment for why this is grow-only.
+    fn note_line_length(&mut self, line: usize) {
+        let len = self.document.line_len_chars(line).min(MAX_RENDERED_LINE_CHARS);
+        if len > self.max_line_chars {
+            self.max_line_chars = len;
+        }
+    }
+
+    /// A full, accurate rescan — corrects any staleness `note_line_length`'s
+    /// grow-only tracking left behind (most commonly: the document's longest
+    /// line just got shorter or was deleted outright). Called from
+    /// `reparse_now` (so ordinary typing self-corrects within one
+    /// `EDIT_SETTLE`) and from the handful of discrete, infrequent actions —
+    /// undo/redo, line revert — where doing this immediately rather than
+    /// waiting for settle is cheap enough (they're not per-keystroke) and
+    /// removes any lag between the action and the canvas's width.
+    fn recompute_max_line_chars(&mut self) {
+        self.max_line_chars = scan_max_line_chars(&self.document);
     }
 
     /// Recomputes the expensive derived views — syntax spans and the JSON
@@ -616,6 +695,7 @@ impl EditorState {
         self.rehighlight_with(text);
         self.reparse_json_with(text);
         self.tree = self.language.and_then(|lang| outline::parse(lang, text));
+        self.recompute_max_line_chars();
     }
 
     /// The stack of enclosing scopes at the cursor, for the breadcrumb
@@ -784,6 +864,12 @@ impl EditorState {
         self.selection_range().filter(|(start, end)| start != end)
     }
 
+    /// The document's longest line, capped — see the field's own doc
+    /// comment. `shell.rs` sizes the canvas horizontally from this.
+    pub fn max_line_chars(&self) -> usize {
+        self.max_line_chars
+    }
+
     /// Deletes the current selection, if any. Returns whether it deleted anything.
     fn delete_selection(&mut self) -> bool {
         let range = self.selection();
@@ -811,6 +897,7 @@ impl EditorState {
         self.apply_revert_mark(line);
         self.cursor = self.document.line_col(self.document.char_index(line, 0)).into();
         self.resync_after_edit();
+        self.recompute_max_line_chars();
         true
     }
 
@@ -842,6 +929,7 @@ impl EditorState {
         }
         self.cursor = self.document.line_col(self.document.char_index(first, 0)).into();
         self.resync_after_edit();
+        self.recompute_max_line_chars();
         true
     }
 
@@ -924,6 +1012,65 @@ impl EditorState {
         self.resync_after_edit();
     }
 
+    /// A single live keystroke's character — auto-pairing-aware, unlike
+    /// `insert_text` (which stays a literal insert for paste and generated
+    /// text like Enter/Tab). Three cases, checked in order:
+    ///
+    /// 1. No selection, and `ch` is a closing bracket or quote sitting right
+    ///    where the cursor already is (i.e. one this same auto-pairing just
+    ///    inserted): step over it instead of typing a second one, so closing
+    ///    a pair never needs deleting the auto-inserted half first.
+    /// 2. `ch` opens a pair (`(`, `[`, `{`, or a quote): pair it — wrapping
+    ///    the selection if there is one, else inserting both halves with the
+    ///    cursor left in between.
+    /// 3. Anything else: ordinary typing.
+    pub fn type_char(&mut self, ch: char) {
+        if self.selection().is_none() {
+            let next = self.document.line_char(self.cursor.line, self.cursor.col);
+            if next == Some(ch) && is_closer(ch) {
+                self.move_cursor(Direction::Right, false);
+                return;
+            }
+        }
+        if let Some(closer) = closer_for(ch) {
+            self.insert_pair(ch, closer);
+            return;
+        }
+        self.insert_text(&ch.to_string());
+    }
+
+    /// The actual insert behind `type_char`'s pairing case: wraps the
+    /// selection in `open`/`close` if there is one (keeping it selected,
+    /// around the same original text, not the new brackets), otherwise
+    /// inserts both chars at the cursor and leaves the cursor between them.
+    fn insert_pair(&mut self, open: char, close: char) {
+        let Some((start, end)) = self.selection() else {
+            // A lone paired insert coalesces with adjacent typing, same as
+            // any other single character — see `insert_text`.
+            self.record_undo_boundary(EditKind::Insert);
+            let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+            self.edit_insert(idx, &format!("{open}{close}"));
+            self.cursor = self.document.line_col(idx + 1).into();
+            self.resync_after_edit();
+            return;
+        };
+        self.record_undo_boundary(EditKind::Other);
+        // Insert the closer first: `start < end`, so inserting there first
+        // doesn't shift `start` out from under the second insert. Inserting
+        // the opener second then pushes both the closer and the wrapped text
+        // right by one, landing the closer at `end + 1` — exactly past the
+        // (now-shifted) originally-selected text.
+        self.edit_insert(end, &close.to_string());
+        self.edit_insert(start, &open.to_string());
+        let open_line = self.document.line_col(start).0;
+        self.selection_anchor = Some(self.document.line_col(start + 1).into());
+        self.cursor = self.document.line_col(end + 1).into();
+        self.resync_after_edit();
+        // `resync_after_edit`'s own check only sees `cursor.line` (the
+        // closer's line); a multi-line wrap grows the opener's line too.
+        self.note_line_length(open_line);
+    }
+
     /// The run of leading spaces/tabs on `self.cursor.line`, capped at
     /// `self.cursor.col` — see `insert_text`'s Enter handling.
     fn current_line_indent(&self) -> String {
@@ -1004,6 +1151,7 @@ impl EditorState {
             let at = self.document.char_index(line, 0);
             self.edit_insert(at, "    ");
             self.shift_cols_after_edit(line, 0, 4);
+            self.note_line_length(line);
         }
         self.resync_after_edit();
     }
@@ -1101,6 +1249,7 @@ impl EditorState {
                 let inserted_len = inserted.chars().count() as i32;
                 self.edit_insert(at, &inserted);
                 self.shift_cols_after_edit(line, indent, inserted_len);
+                self.note_line_length(line);
             }
         }
         self.resync_after_edit();
@@ -1200,6 +1349,11 @@ impl EditorState {
         self.document.set_dirty(self.revision != self.saved_revision);
         self.last_edit_kind = None;
         self.resync_after_edit();
+        // The whole buffer just changed out from under the grow-only
+        // tracking `resync_after_edit` did above (via whatever line the
+        // cursor happens to land on) — an infrequent, discrete action, so a
+        // full accurate rescan here costs nothing worth avoiding.
+        self.recompute_max_line_chars();
     }
 
     /// Writes the buffer to disk, and on success records the revision that
@@ -1373,6 +1527,28 @@ fn char_class(c: char) -> CharClass {
     } else {
         CharClass::Other
     }
+}
+
+/// The closing half of an auto-paired opener — `None` for anything that
+/// isn't one, in particular the closers themselves (`)` doesn't open a pair
+/// of its own). See `EditorState::type_char`.
+fn closer_for(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+/// Whether `c` is a closing bracket or a quote — quotes count because they
+/// close *themselves*, which is what makes typing a second `"` right before
+/// an auto-inserted one a skip-over rather than a double-insert.
+fn is_closer(c: char) -> bool {
+    matches!(c, ')' | ']' | '}' | '"' | '\'' | '`')
 }
 
 /// Sidebar width bounds for the drag handle — narrow enough to still show
@@ -2145,6 +2321,12 @@ pub enum Message {
     ViewWorkingTreeDiff,
     SelectFile(PathBuf),
     EditorInsertText(String),
+    /// A single physical keystroke's character, routed separately from
+    /// `EditorInsertText` so auto-pairing (`EditorState::type_char`) only
+    /// ever sees live typing — paste (`EditorPasteWithText`) and generated
+    /// text (Enter's `"\n"`, Tab-as-indent's four spaces) go through
+    /// `EditorInsertText` instead and are never candidates for pairing.
+    EditorTypeChar(char),
     EditorBackspace,
     EditorDelete,
     /// `Tab` — block-indents a multi-line selection, else inserts four
@@ -2180,11 +2362,17 @@ pub enum Message {
     /// happens in `EditorPasteWithText` once it resolves.
     EditorPaste,
     EditorPasteWithText(Option<String>),
-    /// The editor's `scrollable` reported a new vertical offset (and its
-    /// current viewport height) — stored so `EditorCanvas::draw` can skip
-    /// lines outside the visible range, and so Find navigation knows
-    /// whether a match is already on-screen.
-    EditorScrolled { offset: f32, viewport_height: f32 },
+    /// The editor's `scrollable` reported a new offset (and viewport size),
+    /// in both axes now that the canvas scrolls horizontally too — stored so
+    /// `EditorCanvas::draw` can skip lines outside the visible range, and so
+    /// Find/Go to Line/`scroll_cursor_into_view` know whether the target is
+    /// already on-screen.
+    EditorScrolled {
+        offset: f32,
+        viewport_height: f32,
+        offset_x: f32,
+        viewport_width: f32,
+    },
     CaretTick,
     /// Fires only while an edit is pending; runs the deferred per-edit work
     /// once the buffer has been still for `EDIT_SETTLE`.
@@ -2577,48 +2765,21 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.insert_text(&text);
                 }
                 mark_edited(state, &path);
-
-                // Trigger completion on '.' or second ':' of '::'
-                if matches!(state.lsp_status, LspStatus::Ready) && (text == "." || text == ":") {
-                    let trigger_info = find_editor(state, &path).and_then(|editor| {
-                        let cursor = editor.cursor;
-                        let line_text = editor.document.line_text(cursor.line);
-                        let should_trigger = if text == ":" {
-                            line_text.ends_with("::")
-                        } else {
-                            true
-                        };
-                        if should_trigger {
-                            let utf16_char = char_col_to_utf16_col(&line_text, cursor.col);
-                            Some((cursor, utf16_char))
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some((cursor, utf16_char)) = trigger_info {
-                        // The `didChange` for the character that triggered
-                        // this is still sitting in the settle queue; send it
-                        // before asking, or the server completes against a
-                        // buffer it has not seen. Only the notification —
-                        // running the whole settle here would put the 30 ms
-                        // reparse back on the keystroke path, and on exactly
-                        // the keystrokes (`.`, `::`) that need to feel fast.
-                        // The reparse and diff stay queued.
-                        send_did_change_for(state, &path);
-                        if let Some(uri) = lsp_uri(&path) {
-                            if let Some(sender) = state.lsp_sender.as_mut() {
-                                let _ = sender.try_send(LspCommand::Completion {
-                                    uri,
-                                    line: cursor.line as u32,
-                                    character: utf16_char,
-                                });
-                            }
-                            if let Some(editor) = find_editor_mut(state, &path) {
-                                editor.completion_anchor = cursor;
-                            }
-                        }
+                maybe_trigger_completion(state, &path, &text);
+                return scroll_cursor_into_view(state);
+            }
+        }
+        Message::EditorTypeChar(ch) => {
+            if let Some(path) = active_file_path(state) {
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    // Same stale-popup-closing rule as `EditorInsertText`.
+                    if editor.completions.is_some() && ch != '.' && ch != ':' {
+                        editor.completions = None;
                     }
+                    editor.type_char(ch);
                 }
+                mark_edited(state, &path);
+                maybe_trigger_completion(state, &path, &ch.to_string());
                 return scroll_cursor_into_view(state);
             }
         }
@@ -2793,12 +2954,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 return scroll_cursor_into_view(state);
             }
         }
-        Message::EditorScrolled { offset, viewport_height } => {
+        Message::EditorScrolled { offset, viewport_height, offset_x, viewport_width } => {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.scroll_offset = offset;
                 editor.viewport_height = viewport_height;
+                editor.scroll_offset_x = offset_x;
+                editor.viewport_width = viewport_width;
             }
         }
         Message::CaretTick => state.caret_visible = !state.caret_visible,
@@ -4076,26 +4239,37 @@ fn center_line_in_viewport(editor: &mut EditorState, font_size: f32, line: usize
     // caller in the same tick (e.g. a held Find-next) must see this scroll
     // as already applied, not recompute against the pre-scroll viewport.
     editor.scroll_offset = target_offset;
+    // Also resets horizontal scroll back to the line's start, rather than
+    // trying to horizontally center on whatever column the jump landed on —
+    // simpler, and right often enough (most lines worth jumping to fit
+    // on-screen once scrolled to their start); a match deep inside an
+    // unusually long line may still need a manual scroll right afterward.
+    editor.scroll_offset_x = 0.0;
     iced::widget::operation::scroll_to(
         editor_scroll_id(),
         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target_offset },
     )
 }
 
-/// Scrolls the active file tab's editor just far enough to put the caret's
-/// line on screen, if it isn't already.
+/// Assumed editor viewport width (px) when `EditorState::viewport_width`
+/// hasn't been reported yet — the horizontal sibling of
+/// `ASSUMED_VIEWPORT_HEIGHT`, same reasoning.
+const ASSUMED_VIEWPORT_WIDTH: f32 = 700.0;
+
+/// Scrolls the active file tab's editor just far enough to put the caret on
+/// screen, in whichever axis (or both) it isn't already.
 ///
 /// Without this the view never followed the cursor at all — `scroll_to` was
 /// reachable only from `find_step` (now `center_line_in_viewport`) — so
-/// holding Down, or typing past the bottom edge, walked the caret off-screen
-/// and left you editing blind.
+/// holding Down, or typing past the bottom or right edge, walked the caret
+/// off-screen and left you editing blind.
 ///
 /// Scrolls *minimally*, unlike `center_line_in_viewport`'s deliberate
 /// centering: arrowing one line past the edge should nudge the view one
-/// line, not fling the caret into the middle of the screen. A no-op while
-/// the caret is already visible, which matters because this runs on every
-/// cursor move and every keystroke — it must never fight the user's own
-/// scrolling.
+/// line, not fling the caret into the middle of the screen. A no-op in both
+/// axes while the caret is already fully visible, which matters because
+/// this runs on every cursor move and every keystroke — it must never fight
+/// the user's own scrolling.
 fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
     let Some(path) = active_file_path(state) else {
         return iced::Task::none();
@@ -4104,6 +4278,7 @@ fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
     let Some(editor) = find_editor_mut(state, &path) else {
         return iced::Task::none();
     };
+
     let line_top = editor_canvas::line_top(editor.cursor.line, font_size);
     let line_bottom = line_top + editor_canvas::line_height_px(font_size);
     let viewport_height = if editor.viewport_height > 0.0 {
@@ -4113,24 +4288,59 @@ fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
     };
     let visible_top = editor.scroll_offset;
     let visible_bottom = visible_top + viewport_height;
-
-    let target_offset = if line_top < visible_top {
-        line_top
+    let target_y = if line_top < visible_top {
+        Some(line_top)
     } else if line_bottom > visible_bottom {
-        line_bottom - viewport_height
+        Some(line_bottom - viewport_height)
     } else {
+        None
+    };
+
+    // Treats the caret as one char wide rather than a zero-width point, so
+    // the char just typed at the far edge is fully in view, not just the
+    // caret's own leading pixel.
+    let char_width = editor_canvas::char_width_px(font_size);
+    let col_left = editor_canvas::col_left(editor.cursor.col, font_size);
+    let col_right = col_left + char_width;
+    let viewport_width = if editor.viewport_width > 0.0 {
+        editor.viewport_width
+    } else {
+        ASSUMED_VIEWPORT_WIDTH
+    };
+    let visible_left = editor.scroll_offset_x;
+    let visible_right = visible_left + viewport_width;
+    let target_x = if col_left < visible_left {
+        Some(col_left)
+    } else if col_right > visible_right {
+        Some(col_right - viewport_width)
+    } else {
+        None
+    };
+
+    if target_y.is_none() && target_x.is_none() {
         return iced::Task::none();
     }
-    .max(0.0);
+    let target_y = target_y.unwrap_or(visible_top).max(0.0);
+    let target_x = target_x.unwrap_or(visible_left).max(0.0);
+    // The gutter lives in the same scrollable canvas as the text (columns
+    // `0..text_x0`), so scrolling to exactly `col_left` of an early column
+    // would leave a sliver of it (or all of it, for column 0 itself)
+    // permanently hidden to the left of the viewport for no benefit — there
+    // is nothing useful *between* 0 and `text_x0` to reveal by stopping
+    // short of it. Snap to 0 instead whenever the target would do that.
+    let text_x0 = editor_canvas::col_left(0, font_size);
+    let target_x = if target_x <= text_x0 { 0.0 } else { target_x };
 
     // Updated by hand rather than waiting for the scrollable's `on_scroll` to
     // report back: the next keystroke of a held arrow key redoes this same
-    // arithmetic, and a `scroll_offset` still describing the pre-scroll
-    // viewport would make it scroll a second time for a line already visible.
-    editor.scroll_offset = target_offset;
+    // arithmetic, and a `scroll_offset`/`scroll_offset_x` still describing
+    // the pre-scroll viewport would make it scroll a second time for
+    // something already visible.
+    editor.scroll_offset = target_y;
+    editor.scroll_offset_x = target_x;
     iced::widget::operation::scroll_to(
         editor_scroll_id(),
-        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target_offset },
+        iced::widget::scrollable::AbsoluteOffset { x: target_x, y: target_y },
     )
 }
 
@@ -5106,6 +5316,55 @@ fn send_did_open_for(state: &mut State, path: &Path) {
     };
     if let Some(sender) = state.lsp_sender.as_mut() {
         let _ = sender.try_send(LspCommand::DidOpen { uri, text });
+    }
+}
+
+/// Fires the LSP completion request that typing `.` or the second `:` of
+/// `::` triggers. Shared by `EditorInsertText` and `EditorTypeChar` — a lone
+/// `.`/`:` can arrive through either (auto-pairing never touches either
+/// char, so `EditorTypeChar` still passes them straight through to a plain
+/// insert), and the trigger condition needs to stay identical on both paths.
+fn maybe_trigger_completion(state: &mut State, path: &Path, text: &str) {
+    if !matches!(state.lsp_status, LspStatus::Ready) || (text != "." && text != ":") {
+        return;
+    }
+    let trigger_info = find_editor(state, path).and_then(|editor| {
+        let cursor = editor.cursor;
+        let line_text = editor.document.line_text(cursor.line);
+        let should_trigger = if text == ":" {
+            line_text.ends_with("::")
+        } else {
+            true
+        };
+        if should_trigger {
+            let utf16_char = char_col_to_utf16_col(&line_text, cursor.col);
+            Some((cursor, utf16_char))
+        } else {
+            None
+        }
+    });
+    let Some((cursor, utf16_char)) = trigger_info else {
+        return;
+    };
+    // The `didChange` for the character that triggered this is still sitting
+    // in the settle queue; send it before asking, or the server completes
+    // against a buffer it has not seen. Only the notification — running the
+    // whole settle here would put the 30 ms reparse back on the keystroke
+    // path, and on exactly the keystrokes (`.`, `::`) that need to feel
+    // fast. The reparse and diff stay queued.
+    send_did_change_for(state, path);
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    if let Some(sender) = state.lsp_sender.as_mut() {
+        let _ = sender.try_send(LspCommand::Completion {
+            uri,
+            line: cursor.line as u32,
+            character: utf16_char,
+        });
+    }
+    if let Some(editor) = find_editor_mut(state, path) {
+        editor.completion_anchor = cursor;
     }
 }
 
