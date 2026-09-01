@@ -9,6 +9,7 @@ pub mod find_bar;
 pub mod flash;
 pub mod json_view;
 pub mod logo_mark;
+pub mod markdown_view;
 pub mod search_icon;
 pub mod search_view;
 pub mod settings_panel;

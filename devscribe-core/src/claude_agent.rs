@@ -82,11 +82,12 @@ pub enum ClaudeEvent {
     /// sent, via `ClaudeCommand::SendPrompt`'s own caller).
     OperatorText(String),
     ToolUseStarted { id: String, name: String, input: Value },
-    /// `result` is whatever the wire protocol gave back for this tool call
-    /// — the top-level `tool_use_result` field when present (richer,
-    /// tool-specific: file contents for `Read`, stdout/stderr for `Bash`,
-    /// ...), else the tool_result content block itself.
-    ToolResult { id: String, is_error: bool, result: Value },
+    /// No result payload — the wire protocol's `tool_use_result`/
+    /// `tool_result` content (file contents for `Read`, stdout/stderr for
+    /// `Bash`, ...) can run to megabytes and nothing downstream ever
+    /// displays it, so it's dropped right here rather than cloned into
+    /// `ChatThread.messages` for the life of the session.
+    ToolResult { id: String, is_error: bool },
     /// `claude` wants to run `tool_name` with `tool_input` and is waiting
     /// (via the hook bridge) for `ClaudeCommand::RespondPermission{id, ..}`.
     PermissionRequest {
@@ -103,6 +104,11 @@ pub enum ClaudeEvent {
     },
     /// The subprocess couldn't be spawned, or the connection died.
     Unavailable(String),
+    /// Sent once, before any replayed history, when a resumed session's
+    /// saved transcript had more lines than `load_session_history` replayed
+    /// — see that function's own doc. The chat panel's "Load earlier
+    /// messages" affordance shows only after seeing this.
+    HistoryTruncated,
 }
 
 /// Removes the generated socket and settings files on drop — critically,
@@ -297,14 +303,6 @@ fn generate_settings(devscribe_exe: &std::path::Path, socket_path: &std::path::P
     })
 }
 
-/// Extracts the richest available description of a tool's result: the
-/// top-level `tool_use_result` (tool-specific — e.g. `Read` gives back
-/// `{file: {content, ...}}`, `Bash` gives `{stdout, stderr, ...}`) when
-/// present, else the plain `tool_result` content block.
-fn tool_result_value(message: &Value, block: &Value) -> Value {
-    message.get("tool_use_result").cloned().unwrap_or_else(|| block.get("content").cloned().unwrap_or(Value::Null))
-}
-
 async fn emit_session_init_if_ready(
     output: &mut mpsc::Sender<ClaudeEvent>,
     session_id: &str,
@@ -374,8 +372,7 @@ fn parse_event_line(v: &Value, model: &mut Option<String>) -> Vec<ClaudeEvent> {
                             if block.get("type").and_then(Value::as_str) == Some("tool_result") {
                                 let id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default().to_string();
                                 let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                                let result = tool_result_value(v, block);
-                                events.push(ClaudeEvent::ToolResult { id, is_error, result });
+                                events.push(ClaudeEvent::ToolResult { id, is_error });
                             }
                         }
                     }
@@ -517,29 +514,64 @@ pub fn list_sessions(root: &Path) -> Vec<SessionSummary> {
     sessions
 }
 
+/// How many of a resumed session's saved transcript lines `load_session_history`
+/// replays by default. An old, long-running session's full history can run
+/// to thousands of lines; replaying — and then, forever after, re-rendering
+/// every frame — all of it turns "reopen a project" into a multi-second
+/// stall and a permanently bloated chat panel for a conversation nobody's
+/// about to scroll back through anyway. `load_full_session_history` is the
+/// escape hatch for when they are.
+const DEFAULT_HISTORY_LINES: usize = 200;
+
+/// A resumed session's replayed prior transcript, plus whether there was
+/// more of it than got replayed — see `load_session_history`.
+pub struct SessionHistory {
+    pub events: Vec<ClaudeEvent>,
+    pub truncated: bool,
+}
+
 /// Reconstructs a resumed session's prior transcript as the same
 /// `ClaudeEvent`s live streaming would have produced (run each back
-/// through the exact same reducer the live path uses). This exists
-/// because `--resume` only streams *new* turns going forward — confirmed
-/// against the real CLI, it does not replay history on its own — so
-/// without this, resuming a session would silently show an empty
-/// transcript despite `claude` itself remembering everything. Blocking,
-/// same convention as `list_sessions`; an unreadable/missing transcript
-/// degrades to an empty history rather than an error (the session may
-/// simply be brand new).
-pub fn load_session_history(root: &Path, session_id: &str) -> Vec<ClaudeEvent> {
-    let Some(dir) = project_session_dir(root) else { return Vec::new() };
-    let Ok(content) = std::fs::read_to_string(dir.join(format!("{session_id}.jsonl"))) else {
-        return Vec::new();
+/// through the exact same reducer the live path uses), capped to the most
+/// recent `DEFAULT_HISTORY_LINES` lines. This exists because `--resume`
+/// only streams *new* turns going forward — confirmed against the real
+/// CLI, it does not replay history on its own — so without this, resuming
+/// a session would silently show an empty transcript despite `claude`
+/// itself remembering everything. Blocking, same convention as
+/// `list_sessions`; an unreadable/missing transcript degrades to an empty,
+/// non-truncated history rather than an error (the session may simply be
+/// brand new).
+pub fn load_session_history(root: &Path, session_id: &str) -> SessionHistory {
+    load_session_history_tail(root, session_id, DEFAULT_HISTORY_LINES)
+}
+
+/// Like `load_session_history`, replaying the transcript's every line
+/// rather than just the most recent `DEFAULT_HISTORY_LINES` — the chat
+/// panel's "Load earlier messages" action, once `SessionHistory::truncated`
+/// says there's more.
+pub fn load_full_session_history(root: &Path, session_id: &str) -> Vec<ClaudeEvent> {
+    load_session_history_tail(root, session_id, usize::MAX).events
+}
+
+fn load_session_history_tail(root: &Path, session_id: &str, max_lines: usize) -> SessionHistory {
+    let Some(dir) = project_session_dir(root) else {
+        return SessionHistory { events: Vec::new(), truncated: false };
     };
+    let Ok(content) = std::fs::read_to_string(dir.join(format!("{session_id}.jsonl"))) else {
+        return SessionHistory { events: Vec::new(), truncated: false };
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let truncated = lines.len() > max_lines;
+    let start = lines.len().saturating_sub(max_lines);
 
     let mut model = None;
     let mut events = Vec::new();
-    for line in content.lines() {
+    for line in &lines[start..] {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         events.extend(parse_event_line(&v, &mut model));
     }
-    events
+    SessionHistory { events, truncated }
 }
 
 /// Whether `session_id` already has a saved transcript for `root` — the

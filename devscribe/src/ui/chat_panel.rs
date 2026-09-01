@@ -558,6 +558,31 @@ fn input_bar(state: &State, p: Palette) -> Element<'_, Message> {
     column![mode_selector(state, p), input_row, hint_row(p), status_line(state, p)].spacing(6.0).into()
 }
 
+/// The message list's top row while `state.chat.history_truncated` — a
+/// resumed session's saved transcript has more history than got replayed
+/// (see `claude_agent::load_session_history`'s cap), and this is the escape
+/// hatch back to the complete conversation.
+fn load_earlier_row(p: Palette) -> Element<'static, Message> {
+    button(widgets::center_fill(
+        text("Load earlier messages")
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_muted)),
+    ))
+    .width(Length::Fill)
+    .padding([8.0, 10.0])
+    .on_press(Message::LoadEarlierChatHistory)
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered { Some(color(p.surface_raised).into()) } else { None },
+            border: Border { color: color(p.border_hairline), width: 1.0, radius: 4.0.into() },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
 fn session_row(session: &SessionSummary, p: Palette) -> Element<'static, Message> {
     let ms = session.last_active.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     let when = recent_projects::relative_label(ms);
@@ -640,8 +665,11 @@ pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
         return session_list_view(state, p);
     }
 
-    let rows: Vec<Element<'static, Message>> =
+    let mut rows: Vec<Element<'static, Message>> =
         state.chat.messages.iter().map(|m| message_row(m, state.caret_visible, p)).collect();
+    if state.chat.history_truncated {
+        rows.insert(0, load_earlier_row(p));
+    }
 
     let list: Element<'static, Message> = if rows.is_empty() {
         widgets::placeholder("Ask Claude Code about this project to get started", p)

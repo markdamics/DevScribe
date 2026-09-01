@@ -1,7 +1,7 @@
 use devscribe_core::theme::Palette;
 use iced::alignment::Vertical;
 use iced::font::Weight;
-use iced::widget::{button, canvas, column, container, mouse_area, row, text, Space};
+use iced::widget::{button, canvas, column, container, mouse_area, row, scrollable, text, Space};
 use iced::{Alignment, Border, Color, Element, Length, Padding};
 
 use crate::color::color;
@@ -218,6 +218,14 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     let search_active = state.active_tab.as_ref() == Some(&TabKey::Search);
     let mut tab_elements: Vec<Element<'static, Message>> =
         vec![search_icon_tab(search_active, p, state.density)];
+    // Chat, when opened in tab view, is pinned immediately after the search
+    // icon rather than appended after every file tab — keeping it visible
+    // near the fixed search entry point instead of drifting off past
+    // however many file tabs happen to be scrolled open.
+    if state.chat_tab_open {
+        let active = state.active_tab.as_ref() == Some(&TabKey::Chat);
+        tab_elements.push(tab_shell(Message::ChatOpenTab, Message::ChatCloseTab, active, p, state.density, chat_tab_label(p)));
+    }
     tab_elements.extend(state.open_tabs.iter().map(|tab| {
         let key = tab.key();
         let active = state.active_tab.as_ref() == Some(&key);
@@ -227,12 +235,9 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         };
         tab_shell(Message::SelectOpenTab(key.clone()), Message::CloseTab(key), active, p, state.density, label)
     }));
-    if state.chat_tab_open {
-        let active = state.active_tab.as_ref() == Some(&TabKey::Chat);
-        tab_elements.push(tab_shell(Message::ChatOpenTab, Message::ChatCloseTab, active, p, state.density, chat_tab_label(p)));
-    }
 
-    let tabs = row(tab_elements)
+    let tabs = scrollable(row(tab_elements).height(Length::Fixed(bar_h)))
+        .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default().width(0.0).scroller_width(0.0)))
         .width(Length::Fill)
         .height(Length::Fixed(bar_h));
 

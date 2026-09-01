@@ -2,22 +2,18 @@
 //! top-right of the editor pane, layered over `editor_canvas` via a local
 //! `stack!` in `shell.rs`. Distinct from `search_view`, which searches every
 //! file rather than the current buffer.
+use devscribe_core::theme::Palette;
 use iced::font::Weight;
-use iced::widget::{button, canvas, container, row, text, text_input, Space};
+use iced::widget::{button, canvas, column, container, row, text, text_input, Space};
 use iced::{Alignment, Border, Color, Element, Length, Padding};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{self, EditorState, Message};
+use crate::state::{self, EditorState, FindState, Message};
 use crate::ui::search_icon::SearchIcon;
 use crate::widgets;
 
-fn nav_button(
-    label: &'static str,
-    on_press: Message,
-    enabled: bool,
-    p: devscribe_core::theme::Palette,
-) -> Element<'static, Message> {
+fn nav_button(label: &'static str, on_press: Message, enabled: bool, p: Palette) -> Element<'static, Message> {
     let mut b = button(widgets::center_fill(
         text(label)
             .font(fonts::mono(Weight::Medium))
@@ -48,9 +44,118 @@ fn nav_button(
     b.into()
 }
 
+/// Toggles the replace row below the find row — an expand/collapse chevron,
+/// same glyph pair `json_view.rs::toggle` uses for its tree nodes.
+fn expand_toggle(p: Palette, open: bool) -> Element<'static, Message> {
+    button(widgets::center_fill(
+        text(if open { "\u{25be}" } else { "\u{25b8}" })
+            .size(crate::text_scale::px(11.0))
+            .color(color(p.text_muted)),
+    ))
+    .width(Length::Fixed(16.0))
+    .height(Length::Fixed(22.0))
+    .padding(0.0)
+    .on_press(Message::ToggleReplace)
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered {
+                Some(color(p.surface_hover).into())
+            } else {
+                None
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
+fn replace_action_button(
+    label: &'static str,
+    on_press: Message,
+    enabled: bool,
+    p: Palette,
+) -> Element<'static, Message> {
+    let mut b = button(
+        text(label)
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(if enabled { color(p.text_strong) } else { color(p.text_muted) }),
+    )
+    .padding([3.0, 8.0])
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered {
+                Some(color(p.surface_hover).into())
+            } else {
+                None
+            },
+            border: Border {
+                color: color(p.border_hairline),
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..button::Style::default()
+        }
+    });
+    if enabled {
+        b = b.on_press(on_press);
+    }
+    b.into()
+}
+
+/// The replace row, shown below the find row while `find.replace_open` —
+/// its own text input plus "Replace"/"All" buttons, both disabled while
+/// there's nothing to replace.
+fn replace_row(find: &FindState, p: Palette) -> Element<'static, Message> {
+    let can_replace = !find.matches.is_empty();
+
+    let input = text_input("Replace\u{2026}", &find.replace_query)
+        .font(fonts::mono(Weight::Medium))
+        .size(crate::text_scale::px(15.0))
+        .padding([4.0, 6.0])
+        .on_input(Message::ReplaceQueryChanged)
+        .on_submit(Message::ReplaceOne)
+        .style(move |_theme, _status| text_input::Style {
+            background: Color::TRANSPARENT.into(),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            icon: color(p.text_muted),
+            placeholder: color(p.text_muted),
+            value: color(p.text_strong),
+            selection: {
+                let mut c = p.accent_solid;
+                c.a = 0.35;
+                color(c)
+            },
+        });
+
+    row![
+        // Aligns the replace input under the find input, past the chevron
+        // and search-icon columns above it.
+        Space::new().width(Length::Fixed(16.0 + 13.0)),
+        input,
+        replace_action_button("Replace", Message::ReplaceOne, can_replace, p),
+        replace_action_button("All", Message::ReplaceAll, can_replace, p),
+    ]
+    .spacing(8.0)
+    .align_y(Alignment::Center)
+    .padding(Padding {
+        top: 2.0,
+        right: 6.0,
+        bottom: 6.0,
+        left: 10.0,
+    })
+    .into()
+}
+
 /// `editor` must have `editor.find.is_some()` — callers check this before
 /// including the bar as a stack layer.
-pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<'static, Message> {
+pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
     let find = editor.find.as_ref().expect("caller checks find.is_some()");
 
     let count_label = if find.query.is_empty() {
@@ -106,6 +211,7 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
         });
 
     let pill = row![
+        expand_toggle(p, find.replace_open),
         canvas(SearchIcon { color: color(p.text_muted) })
             .width(Length::Fixed(13.0))
             .height(Length::Fixed(13.0)),
@@ -124,10 +230,15 @@ pub fn view(editor: &EditorState, p: devscribe_core::theme::Palette) -> Element<
         top: 4.0,
         right: 6.0,
         bottom: 4.0,
-        left: 10.0,
+        left: 6.0,
     });
 
-    let panel = container(pill)
+    let mut panel_column = column![pill];
+    if find.replace_open {
+        panel_column = panel_column.push(replace_row(find, p));
+    }
+
+    let panel = container(panel_column)
         .width(Length::Fixed(320.0))
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_base).into()),

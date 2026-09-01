@@ -66,6 +66,37 @@ fn crumb_view(crumb: &Crumb, emphasized: bool, p: Palette) -> Element<'static, M
     .into()
 }
 
+/// The strip's "switch back to the other view" button — JSON's "Tree View"
+/// and Markdown's "Preview", both shown only while that file's `_text_mode`
+/// flag has flipped it over to the plain `code_area` (see `shell.rs`).
+fn toggle_view_button(label: &'static str, on_press: Message, p: Palette) -> Element<'static, Message> {
+    button(
+        text(label)
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(11.0))
+            .color(color(p.text_muted)),
+    )
+    .padding([3.0, 8.0])
+    .on_press(on_press)
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered {
+                Some(color(p.surface_raised).into())
+            } else {
+                None
+            },
+            border: Border {
+                color: color(p.border_hairline),
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
 fn chevron(p: Palette) -> Element<'static, Message> {
     text("\u{203a}")
         .font(fonts::mono(Weight::Medium))
@@ -98,32 +129,10 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
 
     let mut right = row![].spacing(12.0).align_y(Alignment::Center);
     if editor.json.is_some() && editor.json_text_mode {
-        right = right.push(
-            button(
-                text("Tree View")
-                    .font(fonts::mono(Weight::Medium))
-                    .size(crate::text_scale::px(11.0))
-                    .color(color(p.text_muted)),
-            )
-            .padding([3.0, 8.0])
-            .on_press(Message::JsonToggleTextMode)
-            .style(move |_theme, status| {
-                let hovered = status == button::Status::Hovered;
-                button::Style {
-                    background: if hovered {
-                        Some(color(p.surface_raised).into())
-                    } else {
-                        None
-                    },
-                    border: Border {
-                        color: color(p.border_hairline),
-                        width: 1.0,
-                        radius: 3.0.into(),
-                    },
-                    ..button::Style::default()
-                }
-            }),
-        );
+        right = right.push(toggle_view_button("Tree View", Message::JsonToggleTextMode, p));
+    }
+    if editor.markdown.is_some() && editor.markdown_text_mode {
+        right = right.push(toggle_view_button("Preview", Message::MarkdownToggleTextMode, p));
     }
     if let Some((inserted, deleted)) = diff_counts {
         if inserted > 0 || deleted > 0 {

@@ -9,7 +9,8 @@ use crate::state::{self, ChatMode, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
     breadcrumb_bar, chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash,
-    json_view, search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
+    json_view, markdown_view, search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast,
+    welcome,
 };
 use crate::widgets;
 
@@ -177,6 +178,8 @@ fn content_area(state: &State, p: Palette) -> Element<'_, Message> {
             };
             if editor.json.is_some() && !editor.json_text_mode {
                 json_view::view(editor, p)
+            } else if editor.markdown.is_some() && !editor.markdown_text_mode {
+                markdown_view::view(editor, p)
             } else {
                 code_area(editor, state, p)
             }

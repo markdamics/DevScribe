@@ -179,8 +179,10 @@ fn load_session_history_reconstructs_operator_assistant_and_tool_events() {
         ],
     );
 
-    let events = load_session_history(&project.root, "s1");
+    let history = load_session_history(&project.root, "s1");
+    let events = history.events;
 
+    assert!(!history.truncated, "well under DEFAULT_HISTORY_LINES, nothing should be capped");
     assert!(matches!(&events[0], ClaudeEvent::OperatorText(t) if t == "read main.rs"));
     assert!(matches!(&events[1], ClaudeEvent::ToolUseStarted { name, .. } if name == "Read"));
     assert!(matches!(&events[2], ClaudeEvent::ToolResult { id, is_error: false, .. } if id == "toolu_1"));
@@ -190,7 +192,38 @@ fn load_session_history_reconstructs_operator_assistant_and_tool_events() {
 #[test]
 fn load_session_history_is_empty_for_a_missing_transcript() {
     let project = FakeProject::new("history-missing");
-    assert!(load_session_history(&project.root, "does-not-exist").is_empty());
+    let history = load_session_history(&project.root, "does-not-exist");
+    assert!(history.events.is_empty());
+    assert!(!history.truncated);
+}
+
+#[test]
+fn load_session_history_caps_to_the_most_recent_lines_and_flags_truncation() {
+    // A long-running session's saved transcript can run to thousands of
+    // lines; replaying (and forever after re-rendering) all of it on every
+    // resume is exactly the unbounded-memory-growth the cap exists to
+    // avoid. `DEFAULT_HISTORY_LINES + 50` operator lines, each uniquely
+    // numbered, lets this both prove the cap fires and pin *which* lines
+    // survive (the most recent ones, not an arbitrary subset).
+    let project = FakeProject::new("history-long");
+    let total = DEFAULT_HISTORY_LINES + 50;
+    let lines: Vec<Value> = (0..total)
+        .map(|i| json!({"type": "user", "message": {"role": "user", "content": format!("line {i}")}}))
+        .collect();
+    project.write_transcript("s1", &lines);
+
+    let capped = load_session_history(&project.root, "s1");
+    assert!(capped.truncated, "a transcript longer than the cap must report truncated");
+    assert_eq!(capped.events.len(), DEFAULT_HISTORY_LINES);
+    assert!(
+        matches!(&capped.events[0], ClaudeEvent::OperatorText(t) if t == &format!("line {}", total - DEFAULT_HISTORY_LINES)),
+        "capped replay must keep the *most recent* lines, not the earliest: {:#?}",
+        capped.events[0]
+    );
+
+    let full = load_full_session_history(&project.root, "s1");
+    assert_eq!(full.len(), total, "the escape hatch must replay every line, uncapped");
+    assert!(matches!(&full[0], ClaudeEvent::OperatorText(t) if t == "line 0"));
 }
 
 /// `--include-partial-messages`'s live-typing chunks — captured against the
@@ -446,8 +479,9 @@ fn resumes_a_session_with_real_memory_and_replayed_history() {
     assert!(sessions.iter().any(|s| s.id == session_id), "list_sessions should find it: {sessions:#?}");
     let history = load_session_history(&dir, &session_id);
     assert!(
-        history.iter().any(|e| matches!(e, ClaudeEvent::OperatorText(t) if t.contains("pineapple-forty-two"))),
-        "expected the first turn's prompt to be in the replayed history: {history:#?}"
+        history.events.iter().any(|e| matches!(e, ClaudeEvent::OperatorText(t) if t.contains("pineapple-forty-two"))),
+        "expected the first turn's prompt to be in the replayed history: {:#?}",
+        history.events
     );
 
     // --- Second run: resume it, and confirm both real memory and that

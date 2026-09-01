@@ -1105,10 +1105,7 @@ fn chat_tool_use_and_result_correlate_by_id_into_one_entry() {
             input: serde_json::json!({"file_path": "/tmp/x.rs"}),
         }),
     );
-    let _ = update(
-        &mut state,
-        Message::Chat(ClaudeEvent::ToolResult { id: "toolu_1".to_string(), is_error: false, result: serde_json::json!("contents") }),
-    );
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::ToolResult { id: "toolu_1".to_string(), is_error: false }));
 
     assert_eq!(state.chat.messages.len(), 1, "the result should update the existing entry, not add a second one");
     let ChatMessage::Tool(tool) = &state.chat.messages[0] else { panic!("expected a Tool entry") };
@@ -1116,7 +1113,32 @@ fn chat_tool_use_and_result_correlate_by_id_into_one_entry() {
     assert!(tool.permission.is_none(), "Read never needed a permission decision");
     let result = tool.result.as_ref().expect("result should be attached");
     assert!(!result.is_error);
-    assert_eq!(result.result, serde_json::json!("contents"));
+}
+
+#[test]
+fn chat_history_truncated_flag_is_set_then_cleared_once_full_history_loads() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::HistoryTruncated));
+    assert!(state.chat.history_truncated, "the resumed session's capped replay must flag more history exists");
+
+    // Only the two capped lines happened to be replayed live; the "full"
+    // load below stands in for what a bigger, uncapped re-read would
+    // return — an earlier operator line the capped replay never saw.
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::OperatorText("recent".to_string())));
+    assert_eq!(state.chat.messages.len(), 1);
+
+    let _ = update(
+        &mut state,
+        Message::ChatFullHistoryLoaded(vec![
+            ClaudeEvent::OperatorText("earlier".to_string()),
+            ClaudeEvent::OperatorText("recent".to_string()),
+        ]),
+    );
+
+    assert!(!state.chat.history_truncated, "loading the full history must clear the flag");
+    assert_eq!(state.chat.messages.len(), 2, "the full replay must replace, not append to, the capped one");
+    assert!(matches!(&state.chat.messages[0], ChatMessage::Operator(t) if t == "earlier"));
+    assert!(matches!(&state.chat.messages[1], ChatMessage::Operator(t) if t == "recent"));
 }
 
 #[test]
@@ -1542,7 +1564,7 @@ fn an_edit_updates_find_immediately_and_the_rest_once_the_buffer_settles() {
     std::fs::write(&path, "{\"a\": 1}").unwrap();
 
     let mut editor = EditorState::new(Document::open(&path).unwrap(), path.clone());
-    editor.find = Some(FindState { query: "a".into(), matches: Vec::new(), current: 0 });
+    editor.find = Some(FindState { query: "a".into(), matches: Vec::new(), current: 0, ..FindState::default() });
     editor.refind();
     assert_eq!(editor.find.as_ref().unwrap().matches.len(), 1);
     assert!(editor.json.as_ref().unwrap().is_ok(), "sanity: valid JSON parses");
@@ -1583,7 +1605,7 @@ fn find_matches_stay_document_ordered_so_the_canvas_can_binary_search_them() {
         Document::from_str("token a\nb token\ntoken token\n"),
         PathBuf::from("t.txt"),
     );
-    editor.find = Some(FindState { query: "token".into(), matches: Vec::new(), current: 0 });
+    editor.find = Some(FindState { query: "token".into(), matches: Vec::new(), current: 0, ..FindState::default() });
     editor.refind();
 
     let matches = &editor.find.as_ref().unwrap().matches;
@@ -1594,6 +1616,94 @@ fn find_matches_stay_document_ordered_so_the_canvas_can_binary_search_them() {
     );
 }
 
+#[test]
+fn replace_current_drops_the_replaced_match_so_current_lands_on_the_next_one() {
+    // Replacing the active match removes it from `find.matches` on the very
+    // next `refind_with`, which shifts every later match's index down by
+    // one — that's what should make `find.current` land on "the next match"
+    // for free, with no separate advance step in `replace_current` itself.
+    let mut editor = EditorState::new(Document::from_str("cat cat cat\n"), PathBuf::from("t.txt"));
+    editor.find = Some(FindState {
+        query: "cat".into(),
+        replace_query: "dog".into(),
+        matches: Vec::new(),
+        current: 0,
+        ..FindState::default()
+    });
+    editor.refind();
+    assert_eq!(editor.find.as_ref().unwrap().matches.len(), 3);
+
+    editor.replace_current();
+
+    assert_eq!(editor.document.text().to_string(), "dog cat cat\n");
+    let find = editor.find.as_ref().unwrap();
+    assert_eq!(find.matches.len(), 2, "the replaced occurrence must drop out of the results");
+    assert_eq!(find.current, 0, "index 0 now points at what used to be the second match");
+}
+
+#[test]
+fn replace_current_is_a_noop_with_no_active_match() {
+    let mut editor = EditorState::new(Document::from_str("cat\n"), PathBuf::from("t.txt"));
+    editor.find = Some(FindState {
+        query: "dog".into(),
+        replace_query: "cat".into(),
+        ..FindState::default()
+    });
+    editor.refind();
+    assert!(editor.find.as_ref().unwrap().matches.is_empty());
+
+    editor.replace_current();
+
+    assert_eq!(editor.document.text().to_string(), "cat\n", "nothing to replace, buffer untouched");
+}
+
+#[test]
+fn replace_all_replaces_every_match_as_a_single_undo_step() {
+    let mut editor = EditorState::new(Document::from_str("cat cat cat\n"), PathBuf::from("t.txt"));
+    editor.find = Some(FindState {
+        query: "cat".into(),
+        replace_query: "dog".into(),
+        matches: Vec::new(),
+        current: 0,
+        ..FindState::default()
+    });
+    editor.refind();
+
+    editor.replace_all();
+
+    assert_eq!(editor.document.text().to_string(), "dog dog dog\n");
+    assert!(editor.find.as_ref().unwrap().matches.is_empty(), "no more \"cat\" left to match");
+
+    assert!(editor.undo(), "replace-all must undo in one step");
+    assert_eq!(editor.document.text().to_string(), "cat cat cat\n");
+}
+
+#[test]
+fn markdown_files_get_a_parsed_preview_and_other_files_do_not() {
+    let md = EditorState::new(Document::from_str("# Title\n"), PathBuf::from("t.md"));
+    assert!(md.markdown.is_some(), ".md files must get a parsed markdown::Content");
+
+    let txt = EditorState::new(Document::from_str("# Title\n"), PathBuf::from("t.txt"));
+    assert!(txt.markdown.is_none(), "a non-Markdown file must not get one, even with the same text");
+}
+
+#[test]
+fn editing_a_markdown_buffer_reparses_the_preview_only_once_settled() {
+    let mut editor = EditorState::new(Document::from_str("# Title\n"), PathBuf::from("t.md"));
+    let before = editor.markdown.as_ref().unwrap().items().len();
+
+    editor.cursor = editor.document.line_col(editor.document.text().len_chars()).into();
+    editor.insert_text("\n\nAnother paragraph.\n");
+
+    assert_eq!(
+        editor.markdown.as_ref().unwrap().items().len(),
+        before,
+        "the preview is deliberately still the pre-edit one until the buffer settles"
+    );
+
+    editor.reparse_now();
+    assert!(editor.markdown.as_ref().unwrap().items().len() > before, "settling must reparse the edited buffer");
+}
 
 #[test]
 fn typing_defers_the_expensive_work_and_one_settle_covers_the_whole_burst() {
