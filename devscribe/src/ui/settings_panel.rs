@@ -591,6 +591,16 @@ fn shortcuts_content(p: Palette) -> Element<'static, Message> {
                 shortcut_row("Find in file", "\u{2318}F", p),
                 shortcut_row("Find in project", "\u{21e7}\u{2318}F", p),
                 shortcut_row("Working tree diff", "\u{21e7}\u{2318}D", p),
+                shortcut_row("Go to line", "\u{2318}G", p),
+            ]
+        ]
+        .spacing(8.0),
+        column![
+            section_label("EDITING", p),
+            column![
+                shortcut_row("Indent / block indent", "Tab", p),
+                shortcut_row("Dedent / block dedent", "\u{21e7}Tab", p),
+                shortcut_row("Toggle line comment", "\u{2318}/", p),
             ]
         ]
         .spacing(8.0),

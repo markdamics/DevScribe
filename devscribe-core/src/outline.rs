@@ -177,7 +177,7 @@ fn landmarks_for(language: Language) -> Option<&'static [Landmark]> {
     match language {
         Language::Rust => Some(RUST_LANDMARKS),
         Language::Python => Some(PYTHON_LANDMARKS),
-        Language::JavaScript | Language::TypeScript => Some(JS_TS_LANDMARKS),
+        Language::JavaScript | Language::TypeScript | Language::Tsx => Some(JS_TS_LANDMARKS),
         Language::Java => Some(JAVA_LANDMARKS),
         Language::Cpp => Some(CPP_LANDMARKS),
         Language::Json | Language::Toml | Language::Yaml | Language::Xml | Language::Ini | Language::Markdown => {
@@ -192,6 +192,7 @@ fn ts_language(language: Language) -> Option<tree_sitter::Language> {
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Language::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
         Language::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
         Language::Json | Language::Toml | Language::Yaml | Language::Xml | Language::Ini | Language::Markdown => {

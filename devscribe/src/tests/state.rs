@@ -2065,3 +2065,281 @@ fn open_and_close_a_tab_round_trips_through_the_real_session_file() {
     assert_eq!(reopened.open_tabs.len(), 2, "both real message-driven opens must have persisted, not just the direct capture_session call");
     assert_eq!(reopened.active_tab, Some(TabKey::File(files.b.clone())));
 }
+
+#[test]
+fn the_caret_can_cross_a_crlf_line_ending_in_both_directions() {
+    // `Document::open` reads files verbatim, so CRLF buffers are ordinary.
+    // `line_len_chars` excludes both terminator chars, which means
+    // `char_index` clamps the position between `\r` and `\n` straight back
+    // onto the `\r` — so a naive `idx + 1` landed there and then bounced off
+    // it forever, leaving the caret unable to leave the line at all.
+    let mut editor = EditorState::new(Document::from_str("ab\r\ncd"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 2 };
+
+    editor.move_cursor(Direction::Right, false);
+    assert_eq!(editor.cursor, CursorPos { line: 1, col: 0 }, "Right at end-of-line must reach the next line, not stall inside the \\r\\n");
+
+    editor.move_cursor(Direction::Left, false);
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 2 }, "and Left must come straight back, not stall either");
+}
+
+#[test]
+fn backspace_at_a_crlf_line_start_takes_the_whole_terminator() {
+    // Deleting only the `\n` would leave an orphaned `\r` behind as a stray
+    // char on the joined line.
+    let mut editor = EditorState::new(Document::from_str("ab\r\ncd"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 1, col: 0 };
+
+    assert!(editor.backspace());
+    assert_eq!(editor.document.text().to_string(), "abcd");
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 2 });
+}
+
+#[test]
+fn up_and_down_keep_a_goal_column_across_a_short_line() {
+    let mut editor = EditorState::new(
+        Document::from_str("aaaaaaaa\nbb\ncccccccc\n"),
+        PathBuf::from("t.txt"),
+    );
+    editor.cursor = CursorPos { line: 0, col: 6 };
+
+    editor.move_cursor(Direction::Down, false);
+    assert_eq!(editor.cursor, CursorPos { line: 1, col: 2 }, "the short line clamps the column, as it must");
+
+    editor.move_cursor(Direction::Down, false);
+    assert_eq!(
+        editor.cursor,
+        CursorPos { line: 2, col: 6 },
+        "passing through a short line must not truncate the column for good — the caret walked diagonally down the file without this"
+    );
+
+    // A horizontal move is the user picking a new column, so the next
+    // vertical run re-seeds from there rather than resurrecting the old goal.
+    editor.move_cursor(Direction::Left, false);
+    editor.move_cursor(Direction::Up, false);
+    editor.move_cursor(Direction::Up, false);
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 5 }, "Left reset the goal column to 5, not the stale 6");
+}
+
+#[test]
+fn a_backspace_with_nothing_to_delete_leaves_the_undo_history_alone() {
+    // `record_undo_boundary` unconditionally clears the redo stack, so
+    // running it before the "is there anything to delete?" check meant an
+    // inert keystroke silently threw away a pending redo.
+    let mut editor = EditorState::new(Document::from_str("abc"), PathBuf::from("t.txt"));
+    editor.insert_text("x");
+    assert!(editor.undo());
+    assert_eq!(editor.document.text().to_string(), "abc");
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 0 }, "sanity: undo put the caret back at the buffer start");
+
+    assert!(!editor.backspace(), "there is nothing before the first char to delete");
+    assert_eq!(editor.redo_stack.len(), 1, "the inert Backspace must not have discarded the redo");
+    assert!(editor.redo());
+    assert_eq!(editor.document.text().to_string(), "xabc");
+}
+
+#[test]
+fn undoing_past_a_save_marks_the_buffer_dirty_again() {
+    // An `UndoSnapshot` carries the `dirty` flag its `Document` clone had
+    // when it was taken. For any snapshot predating a save that flag is
+    // `false`, so restoring it verbatim claimed a buffer matching nothing on
+    // disk was unmodified — no modified dot, and nothing to warn on close.
+    let files = TempFiles::new("undo-dirty");
+    let mut editor = EditorState::new(Document::open(&files.a).unwrap(), files.a.clone());
+
+    // Two-char inserts so each is its own undo step (a single char coalesces).
+    editor.insert_text("hi");
+    editor.save().unwrap();
+    assert!(!editor.document.is_dirty(), "sanity: a fresh save is clean");
+
+    editor.insert_text("yo");
+    assert!(editor.document.is_dirty());
+
+    assert!(editor.undo());
+    assert_eq!(editor.document.text().to_string(), "hia");
+    assert!(!editor.document.is_dirty(), "undone back to exactly the saved revision — genuinely clean again");
+
+    assert!(editor.undo());
+    assert_eq!(editor.document.text().to_string(), "a");
+    assert!(
+        editor.document.is_dirty(),
+        "undone *past* the save point: the buffer no longer matches the file on disk and must say so"
+    );
+}
+
+#[test]
+fn enter_carries_over_the_current_lines_indentation() {
+    let mut editor = EditorState::new(Document::from_str("    let a = 1;"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 14 }; // end of the line
+
+    editor.insert_text("\n");
+
+    assert_eq!(editor.document.text().to_string(), "    let a = 1;\n    ");
+    assert_eq!(editor.cursor, CursorPos { line: 1, col: 4 }, "the caret must land after the copied indent, not at column 0");
+}
+
+#[test]
+fn enter_inside_the_indent_only_copies_up_to_the_cursor() {
+    // Pressing Enter with the caret still inside the leading whitespace (not
+    // yet at the first real char) must not grab whitespace the split is
+    // about to move onto the new line on its own.
+    let mut editor = EditorState::new(Document::from_str("    let a = 1;"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 2 };
+
+    editor.insert_text("\n");
+
+    // 2 copied spaces before the break, then the original line's own
+    // untouched 2 remaining leading spaces after it — 4 total, not merged.
+    assert_eq!(editor.document.text().to_string(), "  \n    let a = 1;");
+}
+
+#[test]
+fn tab_block_indents_a_multi_line_selection_instead_of_replacing_it() {
+    let mut editor = EditorState::new(Document::from_str("a\nb\nc\n"), PathBuf::from("t.txt"));
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 2, col: 0 };
+
+    editor.indent();
+
+    assert_eq!(
+        editor.document.text().to_string(),
+        "    a\n    b\nc\n",
+        "every line the selection touches gets indented; the selected text itself must survive, not get replaced by four spaces"
+    );
+}
+
+#[test]
+fn tab_indents_rather_than_replaces_even_a_single_line_selection() {
+    // Any active selection indents, even one that never crosses a line
+    // break — losing selected text to a Tab press would be surprising
+    // regardless of how many lines it spans.
+    let mut editor = EditorState::new(Document::from_str("abc"), PathBuf::from("t.txt"));
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 0, col: 3 };
+
+    editor.indent();
+
+    assert_eq!(editor.document.text().to_string(), "    abc");
+}
+
+#[test]
+fn tab_with_no_selection_inserts_four_spaces_at_the_cursor() {
+    let mut editor = EditorState::new(Document::from_str("ab"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 1 };
+
+    editor.indent();
+
+    assert_eq!(editor.document.text().to_string(), "a    b");
+}
+
+#[test]
+fn shift_tab_dedents_every_selected_line_by_one_level() {
+    let mut editor = EditorState::new(Document::from_str("    a\n  b\nc\n"), PathBuf::from("t.txt"));
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 2, col: 0 };
+
+    assert!(editor.dedent());
+    assert_eq!(
+        editor.document.text().to_string(),
+        "a\nb\nc\n",
+        "each line loses up to one indent level (4 spaces or a tab), never more"
+    );
+}
+
+#[test]
+fn shift_tab_on_lines_with_no_leading_whitespace_is_a_no_op() {
+    let mut editor = EditorState::new(Document::from_str("abc"), PathBuf::from("t.txt"));
+    editor.insert_text("x");
+    assert!(editor.undo());
+
+    assert!(!editor.dedent(), "nothing to remove");
+    assert_eq!(editor.redo_stack.len(), 1, "an inert Shift+Tab must not have discarded the pending redo");
+}
+
+#[test]
+fn ctrl_slash_comments_then_uncomments_a_block() {
+    // `col: 999` on each end just means "end of that line" — `char_index`
+    // clamps it, so the exact line length doesn't need recomputing after the
+    // first toggle changes it.
+    let mut editor = EditorState::new(Document::from_str("let a = 1;\nlet b = 2;\n"), PathBuf::from("t.rs"));
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 1, col: 999 };
+
+    assert!(editor.toggle_comment());
+    assert_eq!(editor.document.text().to_string(), "// let a = 1;\n// let b = 2;\n");
+
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 1, col: 999 };
+    assert!(editor.toggle_comment());
+    assert_eq!(
+        editor.document.text().to_string(),
+        "let a = 1;\nlet b = 2;\n",
+        "toggling an already-commented block must remove exactly what was added"
+    );
+}
+
+#[test]
+fn ctrl_slash_on_a_mixed_block_comments_only_the_uncommented_lines() {
+    let mut editor = EditorState::new(
+        Document::from_str("// already\nnot yet\n"),
+        PathBuf::from("t.rs"),
+    );
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+    editor.cursor = CursorPos { line: 1, col: 999 };
+
+    assert!(editor.toggle_comment());
+    assert_eq!(
+        editor.document.text().to_string(),
+        "// already\n// not yet\n",
+        "a mixed block converges to fully commented, without doubling up the line that already had a marker"
+    );
+}
+
+#[test]
+fn ctrl_slash_does_nothing_for_a_language_with_no_comment_syntax() {
+    let mut editor = EditorState::new(Document::from_str("{}"), PathBuf::from("t.json"));
+    assert!(!editor.toggle_comment());
+    assert_eq!(editor.document.text().to_string(), "{}");
+}
+
+#[test]
+fn palette_colon_query_offers_a_go_to_line_entry_and_running_it_moves_the_cursor() {
+    let files = TempFiles::new("goto-line");
+    std::fs::write(&files.a, "one\ntwo\nthree\nfour\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+
+    state.palette_query = ":3".to_string();
+    let entries = filtered_palette_entries(&state);
+    assert_eq!(entries.len(), 1, "a `:N` query must offer exactly the one synthetic entry, not fall through to substring filtering");
+    assert_eq!(entries[0].label, "Go to line 3");
+
+    let _ = run_palette_action(&mut state, entries[0].action.clone());
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert_eq!(editor.cursor, CursorPos { line: 2, col: 0 }, "line 3 is index 2");
+}
+
+#[test]
+fn palette_colon_query_clamps_past_the_last_line() {
+    let files = TempFiles::new("goto-line-clamp");
+    std::fs::write(&files.a, "one\ntwo\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+
+    let _ = run_palette_action(&mut state, PaletteAction::GoToLine(999));
+    let editor = find_editor(&state, &files.a).unwrap();
+    // `document.line_count()` counts the trailing empty line a file ending in
+    // `\n` has, same as `move_cursor`'s own Down-arrow bound does — line
+    // index 2 (not 1) is genuinely the last line this document has.
+    assert_eq!(editor.cursor, CursorPos { line: 2, col: 0 }, "clamped to the document's actual last line, not left past its end");
+}
+
+#[test]
+fn palette_colon_query_is_empty_with_no_file_open() {
+    let mut state = State::default();
+    state.palette_query = ":1".to_string();
+    assert!(
+        filtered_palette_entries(&state).is_empty(),
+        "nothing to jump to without an active file tab"
+    );
+}

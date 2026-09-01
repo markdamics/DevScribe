@@ -13,8 +13,8 @@ use devscribe_core::lsp::DiagnosticSeverity;
 use devscribe_core::outline::{Crumb, CrumbKind};
 use devscribe_core::theme::Palette;
 use iced::font::Weight;
-use iced::widget::{column, container, row, text};
-use iced::{Alignment, Element, Length};
+use iced::widget::{button, column, container, row, text};
+use iced::{Alignment, Border, Element, Length};
 
 use crate::color::color;
 use crate::fonts;
@@ -97,6 +97,34 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
     let diff_counts = editor.diff_counts();
 
     let mut right = row![].spacing(12.0).align_y(Alignment::Center);
+    if editor.json.is_some() && editor.json_text_mode {
+        right = right.push(
+            button(
+                text("Tree View")
+                    .font(fonts::mono(Weight::Medium))
+                    .size(crate::text_scale::px(11.0))
+                    .color(color(p.text_muted)),
+            )
+            .padding([3.0, 8.0])
+            .on_press(Message::JsonToggleTextMode)
+            .style(move |_theme, status| {
+                let hovered = status == button::Status::Hovered;
+                button::Style {
+                    background: if hovered {
+                        Some(color(p.surface_raised).into())
+                    } else {
+                        None
+                    },
+                    border: Border {
+                        color: color(p.border_hairline),
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            }),
+        );
+    }
     if let Some((inserted, deleted)) = diff_counts {
         if inserted > 0 || deleted > 0 {
             right = right.push(

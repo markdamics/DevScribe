@@ -84,6 +84,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
 
     let entries = state::filtered_palette_entries(state);
     let selected = state.palette_selected.min(entries.len().saturating_sub(1));
+    let is_goto_line = state.palette_query.trim_start().starts_with(':');
 
     // Contextual "Diff:" grouping: whenever the query contains "diff", split
     // results into commands (everything else) and a "FILES" section for the
@@ -107,8 +108,9 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     };
 
     let results: Element<'static, Message> = if rows.is_empty() {
+        let message = if is_goto_line { "Type a line number\u{2026}" } else { "No matches" };
         container(
-            text("No matches")
+            text(message)
                 .font(fonts::mono(Weight::Medium))
                 .size(crate::text_scale::px(15.0))
                 .color(color(p.text_muted)),
@@ -144,7 +146,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         });
 
     let mode_badge = container(
-        text("Commands")
+        text(if is_goto_line { "Go to Line" } else { "Commands" })
             .font(fonts::mono(Weight::Medium))
             .size(crate::text_scale::px(13.0))
             .color(color(p.text_muted)),

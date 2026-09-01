@@ -29,6 +29,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     let highlights = editor.highlights.clone();
     let diagnostics = editor.diagnostics.clone();
     let gutter_marks = editor.gutter_marks.clone();
+    let pending_revert_line = editor.pending_revert_line;
     let problem_lens_enabled = state.problem_lens_enabled;
     let font_size = state.editor_font_size;
     let scroll_offset = editor.scroll_offset;
@@ -46,6 +47,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             highlights: highlights.clone(),
             diagnostics: diagnostics.clone(),
             gutter_marks: gutter_marks.clone(),
+            pending_revert_line,
             problem_lens_enabled,
             font_size,
             find_matches: find_matches.clone(),
@@ -156,7 +158,7 @@ fn content_area(state: &State, p: Palette) -> Element<'_, Message> {
             let Some(editor) = state::find_editor(state, path) else {
                 return widgets::placeholder("No file open \u{2014} pick one from the sidebar", p);
             };
-            if editor.json.is_some() {
+            if editor.json.is_some() && !editor.json_text_mode {
                 json_view::view(editor, p)
             } else {
                 code_area(editor, state, p)

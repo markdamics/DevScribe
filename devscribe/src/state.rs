@@ -327,6 +327,9 @@ pub enum PaletteAction {
     /// a deliberately different thing (Phase 5's "New file" writes straight
     /// to disk; this doesn't, until Save As gives it a real location).
     NewUntitledFile,
+    /// The palette's `:N` syntax — see `filtered_palette_entries`. `N` is
+    /// 1-based, matching the gutter's own line numbers.
+    GoToLine(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +401,11 @@ pub struct EditorState {
     pub json: Option<Result<serde_json::Value, String>>,
     /// Collapsed node paths in the JSON tree view (e.g. `"root.foo[2]"`).
     pub json_collapsed: HashSet<String>,
+    /// `.json` files default to the read-only tree view (`json_view.rs`);
+    /// this flips a single tab over to the normal editable `code_area` so
+    /// the tree view doesn't have to grow its own editing UI. Ignored for
+    /// non-JSON files, which never look at it.
+    pub json_text_mode: bool,
     /// This file's content at `HEAD` diffed against the live buffer.
     pub diff: DiffStatus,
     /// One entry per buffer line, derived from `diff` — the editor gutter's
@@ -420,6 +428,12 @@ pub struct EditorState {
     /// is waiting on its confirm/cancel step — same two-step shape as the
     /// sidebar's `State::pending_discard`.
     pub pending_hunk_revert: bool,
+    /// The buffer line whose gutter marker was clicked once and is now
+    /// armed, waiting for a confirming second click (`Message::RevertLine`)
+    /// — same two-step shape as `pending_hunk_revert`, but for the canvas
+    /// gutter's single-line revert rather than the diff view's multi-hunk
+    /// one. A click anywhere else, or Escape, disarms it without reverting.
+    pub pending_revert_line: Option<usize>,
     /// Set by every edit, cleared by `reparse_now`. The expensive derived
     /// views (tree-sitter spans, the JSON tree) are recomputed once the
     /// buffer settles rather than on every keystroke — see `EDIT_SETTLE`.
@@ -460,6 +474,24 @@ pub struct EditorState {
     /// mouse-driven selection change that isn't itself an edit, so typing
     /// never coalesces across an unrelated click or arrow-key jump.
     last_edit_kind: Option<EditKind>,
+    /// The column an unbroken run of Up/Down presses is *trying* to stay in.
+    /// Without it, passing through one short line clamps `cursor.col` for
+    /// good and the caret walks diagonally down the file instead of straight
+    /// — every other editor keeps this "sticky" desired column. `None`
+    /// outside such a run: any horizontal move, click, selection or edit
+    /// clears it, so the next Up/Down re-seeds from wherever the cursor
+    /// actually is.
+    goal_col: Option<usize>,
+    /// Bumped by every buffer mutation (`edit_insert`/`edit_remove`) and
+    /// snapshotted into `UndoSnapshot`, so undo/redo restore *which* revision
+    /// the buffer is at rather than only its text. Compared against
+    /// `saved_revision` to decide whether the buffer still matches disk.
+    revision: u64,
+    /// `revision` as of the last successful `save()` (or of the freshly
+    /// opened buffer). `revision != saved_revision` is the true dirty test,
+    /// and the only thing that can tell "undone back to exactly what's on
+    /// disk" apart from "undone past the save point" — see `undo`.
+    saved_revision: u64,
 }
 
 /// A point in `EditorState::undo_stack`/`redo_stack` — the whole buffer plus
@@ -471,6 +503,10 @@ struct UndoSnapshot {
     document: Document,
     cursor: CursorPos,
     selection_anchor: Option<CursorPos>,
+    /// `EditorState::revision` when this snapshot was taken — restored
+    /// alongside the buffer so the dirty flag can be recomputed against
+    /// `saved_revision` instead of being carried back inside `document`.
+    revision: u64,
 }
 
 /// What kind of edit just happened, for `record_undo_boundary`'s
@@ -519,11 +555,13 @@ impl EditorState {
             diagnostics: Rc::new(Vec::new()),
             json: None,
             json_collapsed: HashSet::new(),
+            json_text_mode: false,
             diff: DiffStatus::default(),
             gutter_marks: Rc::new(Vec::new()),
             hunks: Rc::new(Vec::new()),
             diff_selected_hunks: HashSet::new(),
             pending_hunk_revert: false,
+            pending_revert_line: None,
             needs_reparse: false,
             find: None,
             scroll_offset: 0.0,
@@ -534,6 +572,9 @@ impl EditorState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_kind: None,
+            goal_col: None,
+            revision: 0,
+            saved_revision: 0,
         };
         this.reparse_json_with(text.as_deref().unwrap_or(""));
         this
@@ -552,6 +593,10 @@ impl EditorState {
     /// highlight would visibly drift from the text otherwise.
     fn resync_after_edit(&mut self) {
         self.needs_reparse = true;
+        // Every mutation ends here, which makes it the one place that has to
+        // break an Up/Down run's sticky column — editing is not vertical
+        // motion, so the next Up/Down should re-seed from the new cursor.
+        self.goal_col = None;
         self.refind();
     }
 
@@ -616,6 +661,7 @@ impl EditorState {
     fn edit_insert(&mut self, char_idx: usize, text: &str) {
         let at = self.document.text().char_to_byte(char_idx);
         self.document.insert(char_idx, text);
+        self.revision += 1;
         self.shift_highlights(at, 0, text.len());
     }
 
@@ -626,6 +672,7 @@ impl EditorState {
         let at = rope.char_to_byte(range.start);
         let removed = rope.char_to_byte(range.end) - at;
         self.document.remove(range);
+        self.revision += 1;
         self.shift_highlights(at, removed, 0);
     }
 
@@ -837,11 +884,8 @@ impl EditorState {
     fn record_undo_boundary(&mut self, kind: EditKind) {
         let coalesce = kind != EditKind::Other && self.last_edit_kind == Some(kind);
         if !coalesce {
-            self.undo_stack.push(UndoSnapshot {
-                document: self.document.clone(),
-                cursor: self.cursor,
-                selection_anchor: self.selection_anchor,
-            });
+            let entry = self.snapshot();
+            self.undo_stack.push(entry);
             if self.undo_stack.len() > MAX_UNDO_ENTRIES {
                 self.undo_stack.remove(0);
             }
@@ -861,6 +905,18 @@ impl EditorState {
         };
         self.record_undo_boundary(kind);
         self.delete_selection();
+        // Auto-indent: Enter carries over the current line's leading
+        // whitespace, up to wherever the cursor actually sits (so pressing
+        // Enter *inside* the indent itself — cursor.col less than the
+        // indent's own width — doesn't grab whitespace that the split is
+        // about to move onto the new line anyway).
+        let owned;
+        let text = if text == "\n" {
+            owned = format!("\n{}", self.current_line_indent());
+            owned.as_str()
+        } else {
+            text
+        };
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
         self.edit_insert(idx, text);
         let new_idx = idx + text.chars().count();
@@ -868,34 +924,231 @@ impl EditorState {
         self.resync_after_edit();
     }
 
-    pub fn backspace(&mut self) {
-        self.record_undo_boundary(EditKind::Delete);
-        if self.delete_selection() {
-            self.resync_after_edit();
+    /// The run of leading spaces/tabs on `self.cursor.line`, capped at
+    /// `self.cursor.col` — see `insert_text`'s Enter handling.
+    fn current_line_indent(&self) -> String {
+        let indent_col = self.line_indent_col(self.cursor.line).min(self.cursor.col);
+        (0..indent_col)
+            .filter_map(|col| self.document.line_char(self.cursor.line, col))
+            .collect()
+    }
+
+    /// How many leading space/tab chars `line` starts with.
+    fn line_indent_col(&self, line: usize) -> usize {
+        let len = self.document.line_len_chars(line);
+        let mut col = 0;
+        while col < len && matches!(self.document.line_char(line, col), Some(' ') | Some('\t')) {
+            col += 1;
+        }
+        col
+    }
+
+    /// Whether `line` has `token` starting exactly at `col`.
+    fn line_starts_with_at(&self, line: usize, col: usize, token: &str) -> bool {
+        token.chars().enumerate().all(|(i, c)| self.document.line_char(line, col + i) == Some(c))
+    }
+
+    /// The (inclusive) line range a block operation — indent, dedent,
+    /// toggle-comment — should act on: every line the selection touches, or
+    /// just the cursor's own line with no selection.
+    fn selection_line_range(&self) -> (usize, usize) {
+        match self.selection() {
+            Some((start, end)) => (
+                self.document.line_col(start).0,
+                self.document.line_col(end.saturating_sub(1).max(start)).0,
+            ),
+            None => (self.cursor.line, self.cursor.line),
+        }
+    }
+
+    /// Slides `cursor` and `selection_anchor` when they sit on `line` at or
+    /// after `at_col`, following an edit that inserted (`delta > 0`) or
+    /// removed (`delta < 0`) `delta.abs()` chars starting at that column.
+    ///
+    /// Both are stored as `(line, col)`, not absolute char indices, so —
+    /// unlike `shift_highlights` — nothing keeps them in step with an edit
+    /// automatically. Every block-editing method that mutates a line out
+    /// from under a possibly-stored column has to do this by hand.
+    fn shift_cols_after_edit(&mut self, line: usize, at_col: usize, delta: i32) {
+        let shift = |col: usize| -> usize {
+            if col >= at_col {
+                (col as i32 + delta).max(at_col as i32) as usize
+            } else {
+                col
+            }
+        };
+        if self.cursor.line == line {
+            self.cursor.col = shift(self.cursor.col);
+        }
+        if let Some(anchor) = self.selection_anchor.as_mut()
+            && anchor.line == line
+        {
+            anchor.col = shift(anchor.col);
+        }
+    }
+
+    /// `Tab`. Block-indents every line touched by an active selection
+    /// (inserting four spaces at each line's start), even a single-line one;
+    /// with no selection at all, behaves like plain typing and inserts four
+    /// spaces at the cursor. Without the selection branch, Tab used to
+    /// *replace* whatever was selected with four spaces — a quietly
+    /// destructive shortcut for something that should only ever indent.
+    pub fn indent(&mut self) {
+        if self.selection().is_none() {
+            self.insert_text("    ");
             return;
         }
-        let idx = self.document.char_index(self.cursor.line, self.cursor.col);
-        if idx == 0 {
-            return;
+        let (start_line, end_line) = self.selection_line_range();
+        self.record_undo_boundary(EditKind::Other);
+        for line in start_line..=end_line {
+            let at = self.document.char_index(line, 0);
+            self.edit_insert(at, "    ");
+            self.shift_cols_after_edit(line, 0, 4);
         }
-        self.edit_remove(idx - 1..idx);
-        self.cursor = self.document.line_col(idx - 1).into();
         self.resync_after_edit();
     }
 
-    pub fn delete_forward(&mut self) {
+    /// `Shift+Tab`. Removes up to one indent level (a leading tab, or up to
+    /// four leading spaces) from the start of every line the selection
+    /// spans, or just the cursor's line with no selection. `false` if no
+    /// targeted line had any leading whitespace to remove, in which case
+    /// nothing happened — same no-op-must-not-touch-undo shape as
+    /// `backspace`/`delete_forward`.
+    pub fn dedent(&mut self) -> bool {
+        let (start_line, end_line) = self.selection_line_range();
+        let removals: Vec<(usize, usize)> = (start_line..=end_line)
+            .filter_map(|line| {
+                let len = self.document.line_len_chars(line);
+                if len > 0 && self.document.line_char(line, 0) == Some('\t') {
+                    return Some((line, 1));
+                }
+                let mut n = 0;
+                while n < 4 && n < len && self.document.line_char(line, n) == Some(' ') {
+                    n += 1;
+                }
+                (n > 0).then_some((line, n))
+            })
+            .collect();
+        if removals.is_empty() {
+            return false;
+        }
+        self.record_undo_boundary(EditKind::Other);
+        for (line, n) in removals {
+            let start = self.document.char_index(line, 0);
+            self.edit_remove(start..start + n);
+            self.shift_cols_after_edit(line, 0, -(n as i32));
+        }
+        self.resync_after_edit();
+        true
+    }
+
+    /// `Ctrl+/`. Toggles a line comment on every line the selection spans (or
+    /// just the cursor's line with no selection): uncomments every targeted
+    /// line if all of them (ignoring blanks) are already commented; otherwise
+    /// comments whichever targeted lines aren't already, leaving any that
+    /// are alone (so a block with mixed comment state converges to fully
+    /// commented in one step, rather than double-commenting a line that
+    /// already had a marker). `false` if the language has no line-comment
+    /// syntax, or every targeted line is blank, in which case nothing
+    /// happened.
+    ///
+    /// Comments are inserted at each line's own indent column rather than a
+    /// single column shared by the whole block, so a block with mixed
+    /// indentation ends up with mixed comment columns too — simpler than
+    /// hunting for the block's minimum indent, at the cost of the comments
+    /// not lining up visually the way some editors' does.
+    pub fn toggle_comment(&mut self) -> bool {
+        let Some(token) = self.language.and_then(syntax::Language::line_comment) else {
+            return false;
+        };
+        let (start_line, end_line) = self.selection_line_range();
+        let mut any_content = false;
+        let all_commented = (start_line..=end_line).all(|line| {
+            let indent = self.line_indent_col(line);
+            if indent >= self.document.line_len_chars(line) {
+                true
+            } else {
+                any_content = true;
+                self.line_starts_with_at(line, indent, token)
+            }
+        });
+        if !any_content {
+            return false;
+        }
+        self.record_undo_boundary(EditKind::Other);
+        for line in start_line..=end_line {
+            let len = self.document.line_len_chars(line);
+            let indent = self.line_indent_col(line);
+            if indent >= len {
+                continue;
+            }
+            if all_commented {
+                let mut remove_len = token.chars().count();
+                if self.document.line_char(line, indent + remove_len) == Some(' ') {
+                    remove_len += 1;
+                }
+                let start = self.document.char_index(line, indent);
+                self.edit_remove(start..start + remove_len);
+                self.shift_cols_after_edit(line, indent, -(remove_len as i32));
+            } else if !self.line_starts_with_at(line, indent, token) {
+                // A block with mixed comment state (some lines already
+                // commented, some not) only comments the lines that need it
+                // — otherwise an already-commented line in the selection
+                // would double up (`// // like this`) instead of being left
+                // alone.
+                let at = self.document.char_index(line, indent);
+                let inserted = format!("{token} ");
+                let inserted_len = inserted.chars().count() as i32;
+                self.edit_insert(at, &inserted);
+                self.shift_cols_after_edit(line, indent, inserted_len);
+            }
+        }
+        self.resync_after_edit();
+        true
+    }
+
+    /// `Backspace`. `false` if there was nothing to delete, in which case
+    /// nothing at all happened — see the guard below.
+    pub fn backspace(&mut self) -> bool {
+        let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+        // An inert keystroke must not touch the undo history.
+        // `record_undo_boundary` unconditionally clears the redo stack and
+        // can push a snapshot, so backspacing at the very start of the buffer
+        // used to throw away a pending redo *and* leave a phantom entry that
+        // made the next Ctrl+Z appear to do nothing.
+        if idx == 0 && self.selection().is_none() {
+            return false;
+        }
         self.record_undo_boundary(EditKind::Delete);
         if self.delete_selection() {
             self.resync_after_edit();
-            return;
+            return true;
         }
+        // CRLF-atomic, so backspacing at the start of a line takes the whole
+        // terminator rather than leaving an orphaned `\r` behind.
+        let prev = self.document.prev_char_index(idx);
+        self.edit_remove(prev..idx);
+        self.cursor = self.document.line_col(prev).into();
+        self.resync_after_edit();
+        true
+    }
+
+    /// `Delete`. `false` if there was nothing to delete — see `backspace`.
+    pub fn delete_forward(&mut self) -> bool {
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
-        if idx >= self.document.text().len_chars() {
-            return;
+        if idx >= self.document.text().len_chars() && self.selection().is_none() {
+            return false;
         }
-        self.edit_remove(idx..idx + 1);
+        self.record_undo_boundary(EditKind::Delete);
+        if self.delete_selection() {
+            self.resync_after_edit();
+            return true;
+        }
+        let next = self.document.next_char_index(idx);
+        self.edit_remove(idx..next);
         self.cursor = self.document.line_col(idx).into();
         self.resync_after_edit();
+        true
     }
 
     /// `Ctrl+Z`. `false` if there was nothing left to undo.
@@ -903,16 +1156,9 @@ impl EditorState {
         let Some(prev) = self.undo_stack.pop() else {
             return false;
         };
-        self.redo_stack.push(UndoSnapshot {
-            document: self.document.clone(),
-            cursor: self.cursor,
-            selection_anchor: self.selection_anchor,
-        });
-        self.document = prev.document;
-        self.cursor = prev.cursor;
-        self.selection_anchor = prev.selection_anchor;
-        self.last_edit_kind = None;
-        self.resync_after_edit();
+        let entry = self.snapshot();
+        self.redo_stack.push(entry);
+        self.restore(prev);
         true
     }
 
@@ -921,17 +1167,48 @@ impl EditorState {
         let Some(next) = self.redo_stack.pop() else {
             return false;
         };
-        self.undo_stack.push(UndoSnapshot {
+        let entry = self.snapshot();
+        self.undo_stack.push(entry);
+        self.restore(next);
+        true
+    }
+
+    /// The current buffer + cursor as an undo/redo entry.
+    fn snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
             document: self.document.clone(),
             cursor: self.cursor,
             selection_anchor: self.selection_anchor,
-        });
-        self.document = next.document;
-        self.cursor = next.cursor;
-        self.selection_anchor = next.selection_anchor;
+            revision: self.revision,
+        }
+    }
+
+    /// Puts `snapshot` back, shared by `undo` and `redo`.
+    ///
+    /// The dirty flag is recomputed rather than restored: `snapshot.document`
+    /// carries whatever `dirty` was set when it was taken, and for any
+    /// snapshot predating a save that is `false` — so undoing across a save
+    /// point used to leave the tab claiming "no unsaved changes" while the
+    /// buffer and the file on disk disagreed, with no modified dot to warn
+    /// anyone. Comparing revisions gets it exactly right in both directions:
+    /// undoing back to precisely the saved revision really is clean.
+    fn restore(&mut self, snapshot: UndoSnapshot) {
+        self.document = snapshot.document;
+        self.cursor = snapshot.cursor;
+        self.selection_anchor = snapshot.selection_anchor;
+        self.revision = snapshot.revision;
+        self.document.set_dirty(self.revision != self.saved_revision);
         self.last_edit_kind = None;
         self.resync_after_edit();
-        true
+    }
+
+    /// Writes the buffer to disk, and on success records the revision that
+    /// went out so `undo`/`redo` can tell whether a later state matches it.
+    /// Errors propagate untouched, same as `Document::save`.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        self.document.save()?;
+        self.saved_revision = self.revision;
+        Ok(())
     }
 
     pub fn move_cursor(&mut self, dir: Direction, extend: bool) {
@@ -944,35 +1221,41 @@ impl EditorState {
             self.selection_anchor = None;
         }
 
+        // Only Up/Down carry a sticky column forward; every other direction
+        // is the user deliberately choosing a new one.
+        if !matches!(dir, Direction::Up | Direction::Down) {
+            self.goal_col = None;
+        }
+
         match dir {
             Direction::Left => {
                 let idx = self.document.char_index(self.cursor.line, self.cursor.col);
                 if idx > 0 {
-                    self.cursor = self.document.line_col(idx - 1).into();
+                    // `prev_char_index`, not `idx - 1`: on a CRLF buffer the
+                    // position between `\r` and `\n` is one `char_index`
+                    // clamps straight back onto, so stepping one char at a
+                    // time leaves the caret stuck at the line boundary.
+                    self.cursor = self.document.line_col(self.document.prev_char_index(idx)).into();
                 }
             }
             Direction::Right => {
                 let idx = self.document.char_index(self.cursor.line, self.cursor.col);
                 if idx < self.document.text().len_chars() {
-                    self.cursor = self.document.line_col(idx + 1).into();
+                    self.cursor = self.document.line_col(self.document.next_char_index(idx)).into();
                 }
             }
             Direction::Up => {
                 if self.cursor.line > 0 {
+                    let goal = *self.goal_col.get_or_insert(self.cursor.col);
                     self.cursor.line -= 1;
-                    self.cursor.col = self
-                        .cursor
-                        .col
-                        .min(self.document.line_len_chars(self.cursor.line));
+                    self.cursor.col = goal.min(self.document.line_len_chars(self.cursor.line));
                 }
             }
             Direction::Down => {
                 if self.cursor.line + 1 < self.document.line_count() {
+                    let goal = *self.goal_col.get_or_insert(self.cursor.col);
                     self.cursor.line += 1;
-                    self.cursor.col = self
-                        .cursor
-                        .col
-                        .min(self.document.line_len_chars(self.cursor.line));
+                    self.cursor.col = goal.min(self.document.line_len_chars(self.cursor.line));
                 }
             }
             Direction::LineStart => self.cursor.col = 0,
@@ -984,6 +1267,7 @@ impl EditorState {
 
     pub fn click(&mut self, line: usize, col: usize, extend: bool) {
         self.last_edit_kind = None;
+        self.goal_col = None;
         if extend {
             if self.selection_anchor.is_none() {
                 self.selection_anchor = Some(self.cursor);
@@ -1001,21 +1285,31 @@ impl EditorState {
     /// what kind of thing that is.
     pub fn select_word_at(&mut self, line: usize, col: usize) {
         self.last_edit_kind = None;
-        let text = self.document.line_text(line);
-        let chars: Vec<char> = text.chars().collect();
-        if chars.is_empty() {
+        self.goal_col = None;
+        // Scanned straight out of the rope via `line_char` (O(log n), no
+        // allocation) rather than materializing the line into a `String` and
+        // then a `Vec<char>` — on a minified bundle or a generated blob that
+        // was megabytes of copying for every double-click, the same trap
+        // `line_text_capped` exists to keep the renderer out of.
+        let len = self.document.line_len_chars(line);
+        if len == 0 {
             self.selection_anchor = None;
             self.cursor = CursorPos { line, col: 0 };
             return;
         }
-        let idx = col.min(chars.len() - 1);
-        let class = char_class(chars[idx]);
+        let idx = col.min(len - 1);
+        let class_at = |i: usize| self.document.line_char(line, i).map(char_class);
+        let Some(class) = class_at(idx) else {
+            self.selection_anchor = None;
+            self.cursor = CursorPos { line, col: idx };
+            return;
+        };
         let mut start = idx;
-        while start > 0 && char_class(chars[start - 1]) == class {
+        while start > 0 && class_at(start - 1) == Some(class) {
             start -= 1;
         }
         let mut end = idx + 1;
-        while end < chars.len() && char_class(chars[end]) == class {
+        while end < len && class_at(end) == Some(class) {
             end += 1;
         }
         self.selection_anchor = Some(CursorPos { line, col: start });
@@ -1027,6 +1321,7 @@ impl EditorState {
     /// word), except on the file's last line, which has no newline to take.
     pub fn select_line_at(&mut self, line: usize) {
         self.last_edit_kind = None;
+        self.goal_col = None;
         self.selection_anchor = Some(CursorPos { line, col: 0 });
         self.cursor = if line + 1 < self.document.line_count() {
             CursorPos { line: line + 1, col: 0 }
@@ -1037,6 +1332,7 @@ impl EditorState {
 
     pub fn select_all(&mut self) {
         self.last_edit_kind = None;
+        self.goal_col = None;
         let total_chars = self.document.text().len_chars();
         self.selection_anchor = Some(CursorPos { line: 0, col: 0 });
         self.cursor = self.document.line_col(total_chars).into();
@@ -1062,7 +1358,7 @@ impl EditorState {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum CharClass {
     Word,
     Space,
@@ -1851,6 +2147,13 @@ pub enum Message {
     EditorInsertText(String),
     EditorBackspace,
     EditorDelete,
+    /// `Tab` — block-indents a multi-line selection, else inserts four
+    /// spaces at the cursor. See `EditorState::indent`.
+    EditorIndent,
+    /// `Shift+Tab` — see `EditorState::dedent`.
+    EditorDedent,
+    /// `Ctrl+/` — see `EditorState::toggle_comment`.
+    EditorToggleComment,
     EditorMove { dir: Direction, extend: bool },
     /// A left-button press or drag-move over the canvas — also the plain
     /// (non-double/triple) click path. `extend: true` both for shift-click
@@ -1892,6 +2195,7 @@ pub enum Message {
     /// the AI Chat Assist panel's own file edits).
     FilesChanged(Vec<WatchEvent>),
     JsonToggle(String),
+    JsonToggleTextMode,
     ToggleDirCollapsed(PathBuf),
     SearchQueryChanged(String),
     /// Enter in the search box — starts a search immediately, bypassing
@@ -1906,6 +2210,11 @@ pub enum Message {
     SearchCompleted(SearchOutcome),
     SearchResultSelected { path: PathBuf, line: usize, col: usize },
     TogglePalette,
+    /// `Ctrl+G` — opens the command palette pre-filled with `:`, ready for a
+    /// line number; see `filtered_palette_entries`'s `:N` handling. A no-op
+    /// with no active file tab, same guard `PaletteAction::GoToLine` itself
+    /// applies.
+    OpenGoToLine,
     ClosePalette,
     PaletteQueryChanged(String),
     PaletteMove(i32),
@@ -1998,9 +2307,17 @@ pub enum Message {
     /// this is a `git checkout -- path`, not covered by the editor's own
     /// undo stack.
     ConfirmDiscardChange(PathBuf),
-    /// A click on a changed line's gutter marker — reverts just that line
-    /// (or, for `GutterMark::RemovedAbove`, re-inserts the deleted lines
-    /// above it) back to its `HEAD` content. One undo step.
+    /// The first click on a changed line's gutter marker — arms the
+    /// confirm/cancel step (`EditorState::pending_revert_line`) rather than
+    /// reverting immediately.
+    PromptRevertLine { line: usize },
+    /// Dismisses `EditorState::pending_revert_line` without reverting —
+    /// fired by a click away from the armed line, or by Escape.
+    CancelRevertLine,
+    /// The confirm step: a second click on the already-armed line's gutter
+    /// marker. Reverts just that line (or, for `GutterMark::RemovedAbove`,
+    /// re-inserts the deleted lines above it) back to its `HEAD` content.
+    /// One undo step.
     RevertLine { line: usize },
     /// A click on a hunk in the diff view — toggles whether it's checked,
     /// keyed by that hunk's `Hunk::range.start` in `EditorState::hunks`.
@@ -2241,12 +2558,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::EditorInsertText(text) => {
             if let Some(path) = active_file_path(state) {
-                // Intercept Enter ("\n") and Tab ("    ") when the completion
-                // popup is open — select the highlighted item instead of
-                // inserting the literal text.
+                // Intercept Enter when the completion popup is open — select
+                // the highlighted item instead of inserting a literal
+                // newline. Tab has the equivalent intercept in
+                // `Message::EditorIndent`, since it no longer routes through
+                // here (see `EditorState::indent`).
                 let completions_open = find_editor(state, &path)
                     .is_some_and(|e| e.completions.is_some());
-                if completions_open && (text == "\n" || text == "    ") {
+                if completions_open && text == "\n" {
                     return update(state, Message::CompletionSelect);
                 }
 
@@ -2300,22 +2619,62 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                         }
                     }
                 }
+                return scroll_cursor_into_view(state);
             }
         }
         Message::EditorBackspace => {
             if let Some(path) = active_file_path(state) {
-                if let Some(editor) = find_editor_mut(state, &path) {
-                    editor.backspace();
+                // A Backspace with nothing to delete changed nothing, so it
+                // must not arm the settle timer (and the reparse, git diff and
+                // LSP `didChange` behind it) either.
+                if !find_editor_mut(state, &path).is_some_and(|e| e.backspace()) {
+                    return iced::Task::none();
                 }
                 mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
             }
         }
         Message::EditorDelete => {
             if let Some(path) = active_file_path(state) {
-                if let Some(editor) = find_editor_mut(state, &path) {
-                    editor.delete_forward();
+                if !find_editor_mut(state, &path).is_some_and(|e| e.delete_forward()) {
+                    return iced::Task::none();
                 }
                 mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
+            }
+        }
+        Message::EditorIndent => {
+            if let Some(path) = active_file_path(state) {
+                // Same completion-popup intercept `EditorInsertText` gives
+                // Enter — Tab with the popup open selects the highlighted
+                // item rather than indenting.
+                let completions_open = find_editor(state, &path).is_some_and(|e| e.completions.is_some());
+                if completions_open {
+                    return update(state, Message::CompletionSelect);
+                }
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.indent();
+                }
+                mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
+            }
+        }
+        Message::EditorDedent => {
+            if let Some(path) = active_file_path(state) {
+                if !find_editor_mut(state, &path).is_some_and(|e| e.dedent()) {
+                    return iced::Task::none();
+                }
+                mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
+            }
+        }
+        Message::EditorToggleComment => {
+            if let Some(path) = active_file_path(state) {
+                if !find_editor_mut(state, &path).is_some_and(|e| e.toggle_comment()) {
+                    return iced::Task::none();
+                }
+                mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
             }
         }
         Message::EditorMove { dir, extend } => {
@@ -2348,6 +2707,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
                 editor.move_cursor(dir, extend);
             }
+            return scroll_cursor_into_view(state);
         }
         Message::EditorClick { line, col, extend } => {
             if let Some(path) = active_file_path(state)
@@ -2395,7 +2755,10 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(text) = editor.cut_selection()
             {
                 mark_edited(state, &path);
-                return iced::clipboard::write(text);
+                return iced::Task::batch([
+                    iced::clipboard::write(text),
+                    scroll_cursor_into_view(state),
+                ]);
             }
         }
         Message::EditorUndo => {
@@ -2404,6 +2767,9 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && editor.undo()
             {
                 mark_edited(state, &path);
+                // Undo can land the caret anywhere — including a screenful
+                // away from wherever the view currently sits.
+                return scroll_cursor_into_view(state);
             }
         }
         Message::EditorRedo => {
@@ -2412,6 +2778,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && editor.redo()
             {
                 mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
             }
         }
         Message::EditorPaste => return iced::clipboard::read().map(Message::EditorPasteWithText),
@@ -2423,6 +2790,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.completions = None;
                 editor.insert_text(&text);
                 mark_edited(state, &path);
+                return scroll_cursor_into_view(state);
             }
         }
         Message::EditorScrolled { offset, viewport_height } => {
@@ -2517,6 +2885,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.json_collapsed.insert(key);
             }
         }
+        Message::JsonToggleTextMode => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.json_text_mode = !editor.json_text_mode;
+            }
+        }
         // Debounced, like VSCode's search-as-you-type: typing just records
         // *when* (`search_query_changed_at`), not a search itself — the
         // recurring `SearchDebounceTick` starts one once typing pauses.
@@ -2583,6 +2958,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::ClosePalette => state.palette_open = false,
+        Message::OpenGoToLine => {
+            if active_file_path(state).is_some() {
+                state.palette_open = true;
+                state.palette_query = ":".to_string();
+                state.palette_selected = 0;
+                state.settings_open = false;
+                return iced::widget::operation::focus(palette_query_id());
+            }
+        }
         Message::PaletteQueryChanged(query) => {
             state.palette_query = query;
             state.palette_selected = 0;
@@ -2785,6 +3169,20 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::PromptDiscardChange(path) => state.pending_discard = Some(path),
         Message::CancelDiscardChange => state.pending_discard = None,
         Message::ConfirmDiscardChange(path) => discard_change(state, path),
+        Message::PromptRevertLine { line } => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.pending_revert_line = Some(line);
+            }
+        }
+        Message::CancelRevertLine => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.pending_revert_line = None;
+            }
+        }
         Message::RevertLine { line } => {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
@@ -2885,11 +3283,20 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             let find_open = active_file_path(state)
                 .and_then(|path| find_editor(state, &path))
                 .is_some_and(|editor| editor.find.is_some());
+            let revert_line_armed = active_file_path(state)
+                .and_then(|path| find_editor(state, &path))
+                .is_some_and(|editor| editor.pending_revert_line.is_some());
             if find_open {
                 if let Some(path) = active_file_path(state)
                     && let Some(editor) = find_editor_mut(state, &path)
                 {
                     editor.find = None;
+                }
+            } else if revert_line_armed {
+                if let Some(path) = active_file_path(state)
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.pending_revert_line = None;
                 }
             } else if state.draft.is_some() {
                 state.draft = None;
@@ -3026,8 +3433,26 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
         PaletteAction::OpenSettings => state.settings_open = true,
         PaletteAction::SaveFile => return save_current_file(state),
         PaletteAction::NewUntitledFile => begin_untitled_buffer(state),
+        PaletteAction::GoToLine(line) => return goto_line(state, line),
     }
     iced::Task::none()
+}
+
+/// Moves the active file's cursor to the start of `line` (1-based, clamped
+/// to the document's own line count) and scrolls it into view — the
+/// palette's `:N` syntax (`filtered_palette_entries`) and `Ctrl+G`'s job.
+fn goto_line(state: &mut State, line: usize) -> iced::Task<Message> {
+    let font_size = state.editor_font_size;
+    let Some(path) = active_file_path(state) else {
+        return iced::Task::none();
+    };
+    let Some(editor) = find_editor_mut(state, &path) else {
+        return iced::Task::none();
+    };
+    let target = line.saturating_sub(1).min(editor.document.line_count().saturating_sub(1));
+    editor.cursor = CursorPos { line: target, col: 0 };
+    editor.selection_anchor = None;
+    center_line_in_viewport(editor, font_size, target)
 }
 
 /// `⌘S` / palette "Save File". An untitled buffer (`document.path()` still
@@ -3052,7 +3477,7 @@ fn save_current_file(state: &mut State) -> iced::Task<Message> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    match editor.document.save() {
+    match editor.save() {
         Ok(()) => {
             push_toast(state, ToastKind::Success, format!("Saved {name}"));
             refresh_changed_files(state);
@@ -3116,7 +3541,7 @@ fn save_all_dirty_files(state: &mut State) {
         let Some(editor) = find_editor_mut(state, path) else {
             continue;
         };
-        match editor.document.save() {
+        match editor.save() {
             Ok(()) => saved += 1,
             Err(err) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -3498,7 +3923,7 @@ fn complete_save_as(state: &mut State, old_path: PathBuf, new_path: PathBuf) {
     editor.resync_after_edit();
 
     let name = new_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    match editor.document.save() {
+    match editor.save() {
         Ok(()) => {
             refresh_tree(state);
             refresh_changed_files(state);
@@ -3623,9 +4048,16 @@ fn find_step(state: &mut State, delta: i32) -> iced::Task<Message> {
     let cursor: CursorPos = editor.document.line_col(target.start).into();
     editor.cursor = cursor;
     editor.selection_anchor = None;
+    center_line_in_viewport(editor, font_size, cursor.line)
+}
 
+/// Scrolls `editor`'s viewport just enough to center `line`, if it isn't
+/// already fully visible — shared by Find's "jump to next match" and Go to
+/// Line, which both want "leave it alone if visible, otherwise recenter"
+/// rather than `scroll_cursor_into_view`'s minimal nudge.
+fn center_line_in_viewport(editor: &mut EditorState, font_size: f32, line: usize) -> iced::Task<Message> {
     let line_height = editor_canvas::line_height_px(font_size);
-    let line_top = editor_canvas::line_top(cursor.line, font_size);
+    let line_top = editor_canvas::line_top(line, font_size);
     let line_bottom = line_top + line_height;
     let viewport_height = if editor.viewport_height > 0.0 {
         editor.viewport_height
@@ -3640,6 +4072,62 @@ fn find_step(state: &mut State, delta: i32) -> iced::Task<Message> {
     }
 
     let target_offset = (line_top - viewport_height / 2.0).max(0.0);
+    // Updated by hand, same reasoning as `scroll_cursor_into_view`: the next
+    // caller in the same tick (e.g. a held Find-next) must see this scroll
+    // as already applied, not recompute against the pre-scroll viewport.
+    editor.scroll_offset = target_offset;
+    iced::widget::operation::scroll_to(
+        editor_scroll_id(),
+        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target_offset },
+    )
+}
+
+/// Scrolls the active file tab's editor just far enough to put the caret's
+/// line on screen, if it isn't already.
+///
+/// Without this the view never followed the cursor at all — `scroll_to` was
+/// reachable only from `find_step` (now `center_line_in_viewport`) — so
+/// holding Down, or typing past the bottom edge, walked the caret off-screen
+/// and left you editing blind.
+///
+/// Scrolls *minimally*, unlike `center_line_in_viewport`'s deliberate
+/// centering: arrowing one line past the edge should nudge the view one
+/// line, not fling the caret into the middle of the screen. A no-op while
+/// the caret is already visible, which matters because this runs on every
+/// cursor move and every keystroke — it must never fight the user's own
+/// scrolling.
+fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
+    let Some(path) = active_file_path(state) else {
+        return iced::Task::none();
+    };
+    let font_size = state.editor_font_size;
+    let Some(editor) = find_editor_mut(state, &path) else {
+        return iced::Task::none();
+    };
+    let line_top = editor_canvas::line_top(editor.cursor.line, font_size);
+    let line_bottom = line_top + editor_canvas::line_height_px(font_size);
+    let viewport_height = if editor.viewport_height > 0.0 {
+        editor.viewport_height
+    } else {
+        ASSUMED_VIEWPORT_HEIGHT
+    };
+    let visible_top = editor.scroll_offset;
+    let visible_bottom = visible_top + viewport_height;
+
+    let target_offset = if line_top < visible_top {
+        line_top
+    } else if line_bottom > visible_bottom {
+        line_bottom - viewport_height
+    } else {
+        return iced::Task::none();
+    }
+    .max(0.0);
+
+    // Updated by hand rather than waiting for the scrollable's `on_scroll` to
+    // report back: the next keystroke of a held arrow key redoes this same
+    // arithmetic, and a `scroll_offset` still describing the pre-scroll
+    // viewport would make it scroll a second time for a line already visible.
+    editor.scroll_offset = target_offset;
     iced::widget::operation::scroll_to(
         editor_scroll_id(),
         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target_offset },
@@ -3761,8 +4249,23 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
 /// The palette entries matching `state.palette_query`, in the same order
 /// both the view and `PaletteExecute`/`PaletteMove` use — keeping them in
 /// sync is what makes "press Enter" run the entry actually shown selected.
+///
+/// A query starting with `:` is Go to Line, not a text filter — `:42` never
+/// substring-matches a command label anyway, so this is purely additive: it
+/// turns what used to be an always-empty result into the one synthetic entry
+/// that actually jumps there.
 pub fn filtered_palette_entries(state: &State) -> Vec<PaletteEntry> {
-    let query = state.palette_query.to_ascii_lowercase();
+    let query = state.palette_query.trim();
+    if let Some(rest) = query.strip_prefix(':') {
+        return match rest.trim().parse::<usize>() {
+            Ok(line) if line > 0 && active_file_path(state).is_some() => vec![PaletteEntry {
+                label: format!("Go to line {line}"),
+                action: PaletteAction::GoToLine(line),
+            }],
+            _ => Vec::new(),
+        };
+    }
+    let query = query.to_ascii_lowercase();
     all_palette_entries(state)
         .into_iter()
         .filter(|entry| query.is_empty() || entry.label.to_ascii_lowercase().contains(&query))
@@ -4085,6 +4588,9 @@ fn recompute_diff_for(state: &mut State, path: &Path) {
         // selection made against the old grouping no longer applies.
         editor.diff_selected_hunks.clear();
         editor.pending_hunk_revert = false;
+        // A stale armed line-number after the diff moves would confirm-revert
+        // whatever line now sits there, not the one the user meant.
+        editor.pending_revert_line = None;
     }
 }
 
@@ -4877,6 +5383,9 @@ fn global_keys(event: keyboard::Event) -> Message {
             }
             if c.eq_ignore_ascii_case("u") {
                 return Message::ChatAttachFileDialog;
+            }
+            if c.eq_ignore_ascii_case("g") {
+                return Message::OpenGoToLine;
             }
             if c.eq_ignore_ascii_case("/") {
                 return Message::OpenShortcutsHelp;

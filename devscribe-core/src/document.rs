@@ -72,6 +72,16 @@ impl Document {
         self.dirty
     }
 
+    /// Overrides the dirty flag without touching the buffer.
+    ///
+    /// For undo/redo, which restores a whole `Document` snapshot — including
+    /// the `dirty` it carried when it was taken. That flag can predate a
+    /// save, in which case restoring it verbatim claims a buffer matching
+    /// nothing on disk is unmodified. See `EditorState::undo`.
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
+
     pub fn line_count(&self) -> usize {
         self.text.len_lines()
     }
@@ -86,6 +96,43 @@ impl Document {
     pub fn remove(&mut self, char_range: std::ops::Range<usize>) {
         self.text.remove(char_range);
         self.dirty = true;
+    }
+
+    /// The char index one position after `idx`, treating a `\r\n` pair as a
+    /// single indivisible position. Clamped to the document's end.
+    ///
+    /// The cursor must never land *between* the `\r` and the `\n`:
+    /// `line_len_chars` excludes both, so `char_index` clamps such a position
+    /// straight back onto the `\r` — which means a naive `idx + 1` leaves the
+    /// caret unable to cross the line ending at all, bouncing between the two
+    /// forever. `open` reads files verbatim (no line-ending normalization),
+    /// so CRLF buffers are ordinary, not exotic.
+    pub fn next_char_index(&self, idx: usize) -> usize {
+        let len = self.text.len_chars();
+        if idx >= len {
+            return len;
+        }
+        let next = idx + 1;
+        if self.text.char(idx) == '\r' && next < len && self.text.char(next) == '\n' {
+            next + 1
+        } else {
+            next
+        }
+    }
+
+    /// The char index one position before `idx` — the mirror of
+    /// `next_char_index`, CRLF-atomic for the same reason.
+    pub fn prev_char_index(&self, idx: usize) -> usize {
+        let idx = idx.min(self.text.len_chars());
+        if idx == 0 {
+            return 0;
+        }
+        let prev = idx - 1;
+        if self.text.char(prev) == '\n' && prev > 0 && self.text.char(prev - 1) == '\r' {
+            prev - 1
+        } else {
+            prev
+        }
     }
 
     /// Number of chars on `line`, excluding its trailing line terminator
@@ -124,6 +171,21 @@ impl Document {
         let len = self.line_len_chars(line).min(max_chars);
         let start = self.text.line_to_char(line);
         self.text.slice(start..start + len).to_string()
+    }
+
+    /// The `col`-th char of `line`, or `None` at or past the line's end (its
+    /// terminator excluded, same as `line_len_chars`).
+    ///
+    /// O(log n) and allocation-free — for scanning a line *in place* (e.g.
+    /// double-click word expansion) rather than materializing it, which on a
+    /// pathological line is megabytes per call. Same motivation as
+    /// `line_text_capped`, for the callers that don't want a prefix either.
+    pub fn line_char(&self, line: usize, col: usize) -> Option<char> {
+        let line = line.min(self.text.len_lines().saturating_sub(1));
+        if col >= self.line_len_chars(line) {
+            return None;
+        }
+        Some(self.text.char(self.text.line_to_char(line) + col))
     }
 
     /// Converts a `(line, col)` position (both clamped to valid ranges) into

@@ -38,6 +38,7 @@ pub enum Language {
     Python,
     JavaScript,
     TypeScript,
+    Tsx,
     Cpp,
     Yaml,
     Xml,
@@ -54,13 +55,31 @@ impl Language {
             "java" => Some(Language::Java),
             "py" | "pyi" => Some(Language::Python),
             "js" | "mjs" | "cjs" => Some(Language::JavaScript),
-            "ts" | "mts" | "cts" | "tsx" => Some(Language::TypeScript),
+            "ts" | "mts" | "cts" => Some(Language::TypeScript),
+            "tsx" => Some(Language::Tsx),
             "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" => Some(Language::Cpp),
             "yml" | "yaml" => Some(Language::Yaml),
             "xml" | "svg" | "xsd" | "xsl" | "xslt" | "plist" => Some(Language::Xml),
             "ini" | "cfg" | "properties" => Some(Language::Ini),
             "md" | "markdown" => Some(Language::Markdown),
             _ => None,
+        }
+    }
+
+    /// This language's single-line comment token, for `Ctrl+/` toggle-comment
+    /// — `None` for a language with no such thing (`Json` has no comment
+    /// syntax at all; `Xml`/`Markdown` only have block comments, which toggle
+    /// differently and aren't wired up).
+    pub fn line_comment(self) -> Option<&'static str> {
+        match self {
+            Language::Rust
+            | Language::Java
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::Cpp => Some("//"),
+            Language::Python | Language::Toml | Language::Yaml | Language::Ini => Some("#"),
+            Language::Json | Language::Xml | Language::Markdown => None,
         }
     }
 
@@ -74,6 +93,7 @@ impl Language {
             Language::Python => "Python",
             Language::JavaScript => "JavaScript",
             Language::TypeScript => "TypeScript",
+            Language::Tsx => "TSX",
             Language::Cpp => "C/C++",
             Language::Yaml => "YAML",
             Language::Xml => "XML",
@@ -249,14 +269,58 @@ fn javascript_config() -> &'static HighlightConfiguration {
     })
 }
 
+/// TypeScript's own `HIGHLIGHTS_QUERY` only adds TS-specific captures (type
+/// annotations, TS-only keywords like `interface`/`enum`) — the TypeScript
+/// and TSX grammars are both JavaScript supersets that reuse its node types
+/// for everything else (strings, comments, functions, `let`/`const`/`if`...),
+/// so the JS query has to be layered underneath or all of that goes
+/// uncolored. Mirrors how nvim-treesitter's own `typescript` query declares
+/// `; inherits: ecma`.
+fn ts_base_highlights_query() -> String {
+    format!(
+        "{}\n{}",
+        tree_sitter_javascript::HIGHLIGHT_QUERY,
+        tree_sitter_typescript::HIGHLIGHTS_QUERY
+    )
+}
+
+/// Tag/attribute captures for JSX nodes. Neither the JavaScript nor the
+/// TypeScript crate ships a JSX-aware `highlights.scm` (JSX support is
+/// purely grammar-level for them), so `.tsx` needs its own query on top of
+/// `ts_base_highlights_query` to get tag names and prop names colored
+/// instead of falling through to plain text.
+const JSX_HIGHLIGHTS_QUERY: &str = r#"
+(jsx_opening_element name: [(identifier) (member_expression)] @tag)
+(jsx_closing_element name: [(identifier) (member_expression)] @tag)
+(jsx_self_closing_element name: [(identifier) (member_expression)] @tag)
+(jsx_attribute (property_identifier) @attribute)
+"#;
+
 fn typescript_config() -> &'static HighlightConfiguration {
     static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let mut config = HighlightConfiguration::new(
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "typescript",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
+            &ts_base_highlights_query(),
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_typescript::LOCALS_QUERY,
+        )
+        .expect("tree-sitter-typescript ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn tsx_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let highlights_query = format!("{}\n{}", ts_base_highlights_query(), JSX_HIGHLIGHTS_QUERY);
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            &highlights_query,
+            tree_sitter_javascript::INJECTIONS_QUERY,
             tree_sitter_typescript::LOCALS_QUERY,
         )
         .expect("tree-sitter-typescript ships a valid highlights.scm");
@@ -396,6 +460,7 @@ fn config_for(language: Language) -> &'static HighlightConfiguration {
         Language::Python => python_config(),
         Language::JavaScript => javascript_config(),
         Language::TypeScript => typescript_config(),
+        Language::Tsx => tsx_config(),
         Language::Cpp => cpp_config(),
         Language::Yaml => yaml_config(),
         Language::Xml => xml_config(),

@@ -42,6 +42,38 @@ fn key_label(key: Option<&str>, p: Palette) -> Option<Element<'static, Message>>
     })
 }
 
+/// Switches this tab out of the read-only tree view into the normal
+/// editable `code_area` — see `shell.rs::content_area`. The mirror image,
+/// switching back, is a plain button on the breadcrumb bar since that's
+/// what wraps `code_area` for every file, JSON included.
+fn edit_button(p: Palette) -> Element<'static, Message> {
+    button(
+        text("Edit as Text")
+            .font(fonts::mono(Weight::Medium))
+            .size(crate::text_scale::px(12.0))
+            .color(color(p.text_muted)),
+    )
+    .padding([4.0, 10.0])
+    .on_press(Message::JsonToggleTextMode)
+    .style(move |_theme, status| {
+        let hovered = status == button::Status::Hovered;
+        button::Style {
+            background: if hovered {
+                Some(color(p.surface_raised).into())
+            } else {
+                None
+            },
+            border: iced::Border {
+                color: color(p.border_hairline),
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
 fn toggle(p: Palette, path: String, collapsed: bool) -> Element<'static, Message> {
     button(widgets::center_fill(
         text(if collapsed { "\u{25b8}" } else { "\u{25be}" })
@@ -187,6 +219,8 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
                         .font(fonts::mono(Weight::Bold))
                         .size(crate::text_scale::px(13.0))
                         .color(color(p.status_danger)),
+                    Space::new().width(Length::Fill),
+                    edit_button(p),
                 ]
                 .spacing(8.0)
                 .align_y(Alignment::Center),
@@ -215,6 +249,8 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
                     .font(fonts::mono(Weight::Bold))
                     .size(crate::text_scale::px(13.0))
                     .color(color(p.text_muted)),
+                Space::new().width(Length::Fill),
+                edit_button(p),
             ]
             .spacing(8.0)
             .align_y(Alignment::Center)

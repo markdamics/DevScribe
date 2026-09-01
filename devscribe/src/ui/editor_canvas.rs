@@ -43,6 +43,7 @@ pub struct EditorCanvas {
     /// gutter click's `Message::RevertLine` acts on. Empty for a file with
     /// no diff (no repo, untracked, or unchanged).
     pub gutter_marks: Rc<Vec<Option<GutterMark>>>,
+    pub pending_revert_line: Option<usize>,
     /// Toggled from the settings panel. Only hides the inline `// message`
     /// annotation — the wavy underline stays either way.
     pub problem_lens_enabled: bool,
@@ -114,13 +115,31 @@ impl EditorCanvas {
 
         let publish = |message: Message| Some(canvas::Action::publish(message).and_capture());
 
-        if let Key::Named(named) = key {
+        // Command/control/alt-modified keys are shortcuts, not text or
+        // navigation. This has to be decided *before* the named-key branch
+        // below, which returns unconditionally: with the check left until
+        // after it, Ctrl+Enter inserted a newline, Ctrl+Tab typed four
+        // spaces, Ctrl+Backspace ate a character, and any app-wide shortcut
+        // on a named key was silently swallowed by this canvas.
+        //
+        // Shift is deliberately absent: it is what turns the arrow/Home/End
+        // keys into selection-extending moves.
+        let plain = !(modifiers.command() || modifiers.control() || modifiers.alt());
+
+        if plain && let Key::Named(named) = key {
             let extend = modifiers.shift();
             return match named {
                 Named::Enter => publish(Message::EditorInsertText("\n".into())),
+                Named::Space => publish(Message::EditorInsertText(" ".into())),
                 Named::Backspace => publish(Message::EditorBackspace),
                 Named::Delete => publish(Message::EditorDelete),
-                Named::Tab => publish(Message::EditorInsertText("    ".into())),
+                Named::Tab => {
+                    if extend {
+                        publish(Message::EditorDedent)
+                    } else {
+                        publish(Message::EditorIndent)
+                    }
+                }
                 Named::ArrowLeft => publish(Message::EditorMove {
                     dir: Direction::Left,
                     extend,
@@ -168,14 +187,21 @@ impl EditorCanvas {
                 }
             } else if c.eq_ignore_ascii_case("y") {
                 publish(Message::EditorRedo)
+            } else if c.eq_ignore_ascii_case("/") {
+                // Captured here rather than left to bubble to the app-wide
+                // shortcut handler, which maps the same chord to "open
+                // shortcuts help" — toggle-comment is what `Cmd+/` should do
+                // while actually typing in a file; the help screen stays
+                // reachable from everywhere else (sidebar, chat, welcome).
+                publish(Message::EditorToggleComment)
             } else {
                 None
             };
         }
 
-        // Command/control/alt-modified keys are shortcuts, not text — never
-        // insert their `text` payload (e.g. Ctrl+S shouldn't type an "s").
-        if modifiers.command() || modifiers.control() || modifiers.alt() {
+        // Same reasoning as `plain` above, now for the `text` payload: Ctrl+S
+        // shouldn't type an "s".
+        if !plain {
             return None;
         }
 
@@ -200,19 +226,49 @@ impl canvas::Program<Message> for EditorCanvas {
     ) -> Option<canvas::Action<Message>> {
         match event {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let position = cursor.position_in(bounds)?;
+                // A press outside this canvas hands focus away. Nothing used
+                // to clear `focused` at all, and `handle_key` captures every
+                // keystroke while it is set — so after one click in the
+                // editor, typing into the chat panel's input (which sits
+                // *after* `code_area` in the shell's row, and so only sees
+                // events this canvas declines) went into the source file
+                // instead. Focus has to be released explicitly, because an
+                // outside click is exactly the event that never reaches the
+                // branch below.
+                let Some(position) = cursor.position_in(bounds) else {
+                    state.focused = false;
+                    return None;
+                };
                 state.focused = true;
                 let (line, col) = self.hit_test(position);
 
-                // A click on a changed line's gutter marker reverts that
-                // line instead of placing the cursor or starting a drag-
-                // select — the marker itself is the affordance (unlike a
-                // Changes-panel row, a changed line's bar is always visible,
-                // so there's no separate hover-reveal step needed).
-                // Unmarked-line gutter clicks fall through unchanged, to
-                // today's cursor-to-column-0.
+                // A click on a changed line's gutter marker arms that line
+                // for revert instead of placing the cursor or starting a
+                // drag-select — the marker itself is the affordance (unlike
+                // a Changes-panel row, a changed line's bar is always
+                // visible, so there's no separate hover-reveal step
+                // needed). A second click on the same already-armed marker
+                // confirms and actually reverts it (drawn as a "Revert"
+                // label in place of the line number — see `draw`), so a
+                // stray click can't silently discard edits. Unmarked-line
+                // gutter clicks fall through unchanged, to today's
+                // cursor-to-column-0.
                 if position.x < GUTTER_WIDTH && self.gutter_marks.get(line).and_then(Option::as_ref).is_some() {
-                    return Some(canvas::Action::publish(Message::RevertLine { line }).and_capture());
+                    let message = if self.pending_revert_line == Some(line) {
+                        Message::RevertLine { line }
+                    } else {
+                        Message::PromptRevertLine { line }
+                    };
+                    return Some(canvas::Action::publish(message).and_capture());
+                }
+
+                // Any other click while a revert is armed just dismisses the
+                // prompt, the same "click away to cancel" shape as a context
+                // menu — a stray click can't both cancel the prompt and move
+                // the cursor/selection in one motion, so the next click
+                // always lands where the user actually meant it to.
+                if self.pending_revert_line.is_some() {
+                    return Some(canvas::Action::publish(Message::CancelRevertLine).and_capture());
                 }
                 state.dragging = true;
 
@@ -255,6 +311,16 @@ impl canvas::Program<Message> for EditorCanvas {
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
+                None
+            }
+            // Right/middle presses outside the canvas give focus away too —
+            // same reason as the left-button case above (a right-click into
+            // the sidebar opens its context menu, and shouldn't leave this
+            // canvas still eating the keyboard).
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(_)) => {
+                if cursor.position_in(bounds).is_none() {
+                    state.focused = false;
+                }
                 None
             }
             canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
@@ -447,15 +513,21 @@ impl canvas::Program<Message> for EditorCanvas {
             // their own in the new buffer, so they can't get a full-height
             // mark). Clicking anywhere in the gutter on a marked line
             // (`update()`, above) reverts it to `HEAD`.
+            let armed = self.pending_revert_line == Some(line);
             if let Some(mark) = self.gutter_marks.get(line).and_then(Option::as_ref) {
                 let accent = match mark {
                     GutterMark::Added => p.status_success,
                     GutterMark::Modified { .. } => p.status_warning,
                     GutterMark::RemovedAbove { .. } => p.status_danger,
                 };
+                // Armed (one click already landed here, waiting on the
+                // confirming second one) reads as an unmistakably different,
+                // stronger-danger cell than the passive added/modified/
+                // removed tint above — see `update()`'s gutter click
+                // handling for the two-click shape this is confirming.
                 frame.fill(
                     &Path::rectangle(Point::new(0.0, y), Size::new(GUTTER_WIDTH, line_height)),
-                    tint(accent, 0.16),
+                    tint(if armed { p.status_danger } else { accent }, if armed { 0.30 } else { 0.16 }),
                 );
                 match mark {
                     GutterMark::Added | GutterMark::Modified { .. } => {
@@ -473,17 +545,23 @@ impl canvas::Program<Message> for EditorCanvas {
                 }
             }
 
+            // Armed lines swap their line number for a "Revert" prompt —
+            // the same marker cell doubles as the confirm button a second
+            // click on it fires (`update()`), so labeling it is what makes
+            // that second click legible rather than a guess.
             frame.fill_text(Text {
-                content: (line + 1).to_string(),
-                position: Point::new(GUTTER_WIDTH - 14.0, y),
-                color: if is_cursor_line {
+                content: if armed { "Revert".to_string() } else { (line + 1).to_string() },
+                position: Point::new(GUTTER_WIDTH - if armed { 4.0 } else { 14.0 }, y),
+                color: if armed {
+                    color(p.status_danger)
+                } else if is_cursor_line {
                     color(p.text_strong)
                 } else {
                     tint(p.text_muted, 0.6)
                 },
-                size: Pixels(11.0),
+                size: Pixels(if armed { 10.0 } else { 11.0 }),
                 line_height: LineHeight::Absolute(Pixels(line_height)),
-                font: mono,
+                font: if armed { fonts::sans(iced::font::Weight::Medium) } else { mono },
                 align_x: Alignment::Right,
                 align_y: Vertical::Top,
                 ..Text::default()
@@ -679,22 +757,23 @@ fn draw_wavy_underline(frame: &mut Frame, x0: f32, x1: f32, y: f32, color: Color
     );
 }
 
-/// Maps a syntax category onto the current theme's tokens. Chosen to match
-/// the original mockup's static Rust code sample exactly (keyword→accent,
-/// type→status-info, string→status-ok, constant→status-warn, comment→muted).
+/// Maps a syntax category onto the current theme's dedicated `syntax_*`
+/// tokens — a wider, more mutually-distinct hue set than the chrome tokens
+/// (`accent_solid`, `status_info`, etc.) it used to borrow, which collapsed
+/// several kinds onto the same color (keyword and type were identical).
 pub(crate) fn highlight_color(kind: HighlightKind, p: Palette) -> Color {
     match kind {
         HighlightKind::Default => color(p.text_body),
-        HighlightKind::Keyword => color(p.accent_solid),
-        HighlightKind::Type => color(p.status_info),
-        HighlightKind::Function => color(p.text_strong),
-        HighlightKind::Macro => color(p.seal_solid),
-        HighlightKind::String => color(p.status_success),
-        HighlightKind::Number => color(p.seal_solid),
-        HighlightKind::Comment => color(p.text_muted),
-        HighlightKind::Constant => color(p.status_warning),
-        HighlightKind::Attribute => color(p.text_muted),
-        HighlightKind::Punctuation => color(p.text_body),
+        HighlightKind::Keyword => color(p.syntax_keyword),
+        HighlightKind::Type => color(p.syntax_type),
+        HighlightKind::Function => color(p.syntax_function),
+        HighlightKind::Macro => color(p.syntax_macro),
+        HighlightKind::String => color(p.syntax_string),
+        HighlightKind::Number => color(p.syntax_number),
+        HighlightKind::Comment => color(p.syntax_comment),
+        HighlightKind::Constant => color(p.syntax_constant),
+        HighlightKind::Attribute => color(p.syntax_attribute),
+        HighlightKind::Punctuation => color(p.syntax_punctuation),
     }
 }
 
