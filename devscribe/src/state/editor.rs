@@ -38,6 +38,23 @@ pub struct EditorDiagnostic {
     pub message: String,
 }
 
+/// One clickable row in the Locations dock panel (`references_panel.rs`) —
+/// "Go to Definition" (when the server names more than one candidate, e.g.
+/// several trait impls) and "Find All References" both land here rather
+/// than each needing their own panel. Char-based (`col`, not a UTF-16
+/// offset) and carrying its own `preview` line, same reasoning as
+/// `EditorDiagnostic`: computed once up front so the view doesn't
+/// re-convert or re-read the target file on every frame.
+#[derive(Debug, Clone)]
+pub struct LocationEntry {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+    /// The target line's own text, trimmed and length-capped — what the
+    /// panel row shows next to the `file:line` label.
+    pub preview: String,
+}
+
 /// Status of the language server for the currently supported language
 /// (Rust, via `rust-analyzer`). Surfaced in the status bar and the
 /// settings panel's Toolchains category.
@@ -2511,6 +2528,63 @@ pub fn convert_diagnostics(document: &Document, diagnostics: Vec<lsp::Diagnostic
             }
         })
         .collect()
+}
+
+/// Converts one LSP `Location` into a clickable `LocationEntry` — preferring
+/// the already-open editor's live buffer for the target line's text and
+/// UTF-16-to-char column conversion when the file has one (so a dirty,
+/// unsaved file's own in-progress edits are reflected), and falling back to
+/// reading the file straight off disk otherwise, since a definition or
+/// reference is very often in a file the user hasn't opened yet. `None` if
+/// the location's `uri` isn't a `file://` path, or the on-disk read fails.
+fn location_entry(state: &State, loc: &lsp::Location) -> Option<LocationEntry> {
+    let path = loc.uri.to_file_path().ok()?;
+    let line_idx = loc.range.start.line as usize;
+    let line_text = if let Some(editor) = find_editor(state, &path) {
+        editor.document.line_text(line_idx)
+    } else {
+        std::fs::read_to_string(&path).ok()?.lines().nth(line_idx).unwrap_or("").to_string()
+    };
+    let col = utf16_col_to_char_col(&line_text, loc.range.start.character as usize);
+    Some(LocationEntry {
+        path,
+        line: line_idx,
+        col,
+        preview: line_text.trim().chars().take(160).collect(),
+    })
+}
+
+/// Shared landing logic for both `LspEvent::Definition` and
+/// `LspEvent::References`: a single result (by far the common case for Go to
+/// Definition — most symbols have exactly one) jumps straight there; several
+/// results (an overridden method, a trait with multiple impls, or any real
+/// Find-All-References with more than one usage) open the Locations dock
+/// panel so the user picks; zero results is a toast rather than a silent
+/// no-op — a go-to-definition that quietly does nothing reads as "broken",
+/// not "there was nothing to find".
+pub fn apply_locations(state: &mut State, locations: Vec<lsp::Location>, label: &'static str) -> iced::Task<Message> {
+    let mut entries: Vec<LocationEntry> = locations.iter().filter_map(|loc| location_entry(state, loc)).collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    match entries.len() {
+        0 => {
+            push_toast(state, ToastKind::Warning, format!("No {} found", label.to_lowercase()));
+            iced::Task::none()
+        }
+        1 => {
+            let entry = entries.remove(0);
+            open_or_focus_file(state, entry.path.clone());
+            if let Some(editor) = find_editor_mut(state, &entry.path) {
+                editor.click(entry.line, entry.col, false);
+            }
+            scroll_cursor_into_view(state)
+        }
+        n => {
+            state.references_label = format!("{label} \u{2014} {n} results");
+            state.references_results = entries;
+            state.references_open = true;
+            iced::Task::none()
+        }
+    }
 }
 
 /// Spawns a background OS thread that installs `language`'s server binary

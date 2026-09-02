@@ -85,6 +85,35 @@ fn row_tint(mut c: Rgba) -> Color {
     color(c)
 }
 
+/// How many unchanged lines to show immediately around a hunk, on each side
+/// — mirrors `git diff`'s default context. Gaps between hunks (or before the
+/// first/after the last) longer than this collapse behind `context_separator`
+/// instead of rendering the whole file.
+const CONTEXT_LINES: usize = 3;
+
+/// The collapsed-gap row standing in for `hidden` skipped unchanged lines.
+/// Indented to roughly the text column so it reads as "elided" rather than
+/// as a real diff row.
+fn context_separator(hidden: usize, p: Palette) -> Element<'static, Message> {
+    container(
+        text(format!(
+            "\u{22ef} {hidden} unchanged line{} \u{22ef}",
+            if hidden == 1 { "" } else { "s" }
+        ))
+        .font(fonts::mono(Weight::Medium))
+        .size(crate::text_scale::px(12.0))
+        .color(color(p.text_muted)),
+    )
+    .width(Length::Fill)
+    .padding(Padding {
+        top: 4.0,
+        right: 12.0,
+        bottom: 4.0,
+        left: 8.0 + MARKER_WIDTH + GUTTER_WIDTH * 2.0,
+    })
+    .into()
+}
+
 /// One hunk's rows, wrapped in a single button so clicking anywhere in it
 /// toggles the whole hunk's selection — the checkbox glyph on its first row
 /// is a visual cue, not the only click target (small glyphs make poor click
@@ -232,16 +261,40 @@ pub fn view(state: &State, path: &Path, p: Palette) -> Element<'static, Message>
             let mut rows: Vec<Element<'static, Message>> = Vec::new();
             let mut hunk_iter = editor.hunks.iter().peekable();
             let mut i = 0;
+            let mut seen_hunk = false;
             while i < lines.len() {
                 if hunk_iter.peek().is_some_and(|h| h.range.start == i) {
                     let hunk = hunk_iter.next().unwrap();
                     let selected = editor.diff_selected_hunks.contains(&hunk.range.start);
                     rows.push(hunk_block(lines, hunk, selected, path_buf.clone(), p));
                     i = hunk.range.end;
-                } else {
-                    rows.push(diff_row(&lines[i], "", color(p.text_muted), p));
-                    i += 1;
+                    seen_hunk = true;
+                    continue;
                 }
+
+                // A run of `Equal` lines between hunks (or leading/trailing
+                // the whole diff) — show up to `CONTEXT_LINES` adjacent to
+                // each neighboring hunk and collapse the rest, rather than
+                // rendering every unchanged line in the file.
+                let gap_end = hunk_iter.peek().map(|h| h.range.start).unwrap_or(lines.len());
+                let gap_len = gap_end - i;
+                let lead = if seen_hunk { CONTEXT_LINES.min(gap_len) } else { 0 };
+                let trail = if hunk_iter.peek().is_some() { CONTEXT_LINES.min(gap_len) } else { 0 };
+
+                if lead + trail >= gap_len {
+                    for line in &lines[i..gap_end] {
+                        rows.push(diff_row(line, "", color(p.text_muted), p));
+                    }
+                } else {
+                    for line in &lines[i..i + lead] {
+                        rows.push(diff_row(line, "", color(p.text_muted), p));
+                    }
+                    rows.push(context_separator(gap_len - lead - trail, p));
+                    for line in &lines[gap_end - trail..gap_end] {
+                        rows.push(diff_row(line, "", color(p.text_muted), p));
+                    }
+                }
+                i = gap_end;
             }
 
             let selected_count = editor.diff_selected_hunks.len();

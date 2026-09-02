@@ -9,8 +9,8 @@ use crate::state::{self, ChatMode, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
     breadcrumb_bar, chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash,
-    hover_popup, json_view, markdown_view, search_view, settings_panel, sidebar, status_bar, tab_bar,
-    title_bar, toast, welcome,
+    hover_popup, json_view, markdown_view, references_panel, search_view, settings_panel, sidebar,
+    status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
 
@@ -209,6 +209,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let mut main_column = column![tab_bar::view(state, p), content_area(state, p)];
     if state.problems_panel_open {
         main_column = main_column.push(status_bar::dock_panel(state, p));
+    }
+    if state.references_open {
+        main_column = main_column.push(references_panel::dock_panel(state, p));
     }
     let main_column = main_column
         .push(status_bar::view(state, p))

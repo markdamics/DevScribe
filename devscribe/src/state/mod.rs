@@ -337,6 +337,18 @@ pub struct State {
     /// every diagnostic across all open files. Toggled by clicking the
     /// status bar's Problems indicator — see `status_bar.rs`.
     pub problems_panel_open: bool,
+    /// `true` while the Locations dock panel is open — populated by either
+    /// "Go to Definition" (when the server names more than one candidate)
+    /// or "Find All References", both landing in the same panel; see
+    /// `apply_locations`. Not persisted across sessions: a stale set of
+    /// locations from a project that's since changed would be actively
+    /// misleading, unlike the Problems panel's open/closed state.
+    pub references_open: bool,
+    /// Header text for the Locations panel (e.g. "References — 4 results")
+    /// — set alongside `references_results` so the panel doesn't have to
+    /// guess which of the two actions populated it.
+    pub references_label: String,
+    pub references_results: Vec<LocationEntry>,
     /// When the most recent edit landed, or `None` when nothing is pending.
     /// Drives the `EditSettleTick` subscription, which only exists while
     /// this is `Some` — an unconditional tick would rebuild the entire view
@@ -515,6 +527,9 @@ impl Default for State {
             changes_panel_open: false,
             pending_discard: None,
             problems_panel_open: false,
+            references_open: false,
+            references_label: String::new(),
+            references_results: Vec::new(),
             edit_settled_at: None,
             pending_edits: Vec::new(),
             search_query: String::new(),
@@ -937,6 +952,16 @@ pub enum Message {
     /// subscribed to while some editor actually has a pending hover
     /// position, same shape as `SearchDebounceTick`.
     HoverDebounceTick,
+    /// Ctrl/Cmd+Click on `(line, col)`, or `F12` on the cursor's own
+    /// position — "Go to Definition". A single result jumps there directly;
+    /// more than one opens the Locations panel (`apply_locations`).
+    GoToDefinition { line: usize, col: usize },
+    /// `Shift+F12` on the cursor's position — "Find All References" across
+    /// the whole project.
+    FindReferences { line: usize, col: usize },
+    ToggleReferencesPanel,
+    /// A row in the Locations dock panel was clicked.
+    JumpToLocation(PathBuf, CursorPos),
     Noop,
 }
 
@@ -1461,6 +1486,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 {
                     editor.apply_hover_response(line, character, text);
                 }
+            }
+            LspEvent::Definition { locations, .. } => {
+                return apply_locations(state, locations, "Definition");
+            }
+            LspEvent::References { locations, .. } => {
+                return apply_locations(state, locations, "References");
             }
             LspEvent::NeedsInstall => {
                 // Binary not on PATH and not in the managed dir — kick off
@@ -2098,6 +2129,43 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.mark_hover_requested(pos);
                 }
             }
+        }
+        Message::GoToDefinition { line, col } => {
+            if let Some(path) = active_file_path(state)
+                && matches!(state.lsp_status, LspStatus::Ready)
+                && let Some(uri) = lsp_uri(&path)
+            {
+                let line_text = find_editor(state, &path).map(|e| e.document.line_text(line)).unwrap_or_default();
+                let character = char_col_to_utf16_col(&line_text, col);
+                if let Some(sender) = state.lsp_sender.as_mut() {
+                    let _ = sender.try_send(LspCommand::GotoDefinition { uri, line: line as u32, character });
+                }
+            }
+        }
+        Message::FindReferences { line, col } => {
+            if let Some(path) = active_file_path(state)
+                && matches!(state.lsp_status, LspStatus::Ready)
+                && let Some(uri) = lsp_uri(&path)
+            {
+                let line_text = find_editor(state, &path).map(|e| e.document.line_text(line)).unwrap_or_default();
+                let character = char_col_to_utf16_col(&line_text, col);
+                if let Some(sender) = state.lsp_sender.as_mut() {
+                    let _ = sender.try_send(LspCommand::References { uri, line: line as u32, character });
+                }
+            }
+        }
+        Message::ToggleReferencesPanel => {
+            state.references_open = !state.references_open;
+        }
+        Message::JumpToLocation(path, pos) => {
+            // Left open, same as the Problems panel's `OpenDiagnosticAt` —
+            // browsing several results one after another is the common case
+            // for both, not a single pick-and-dismiss.
+            open_or_focus_file(state, path.clone());
+            if let Some(editor) = find_editor_mut(state, &path) {
+                editor.click(pos.line, pos.col, false);
+            }
+            return scroll_cursor_into_view(state);
         }
         Message::Noop => {}
     }

@@ -11,10 +11,12 @@ use std::process::Stdio;
 
 use async_lsp::lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverClientCapabilities, HoverContents, HoverParams, InitializeParams, InitializedParams,
-    LogMessageParams, MarkedString, PartialResultParams, Position, ProgressParams,
-    PublishDiagnosticsParams, ShowMessageParams, TextDocumentClientCapabilities,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DynamicRegistrationClientCapabilities, GotoCapability, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverContents, HoverParams,
+    InitializeParams, InitializedParams, LocationLink, LogMessageParams, MarkedString,
+    PartialResultParams, ProgressParams, PublishDiagnosticsParams, ReferenceContext,
+    ReferenceParams, ShowMessageParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     WorkspaceFolder,
@@ -24,7 +26,9 @@ use async_lsp::{LanguageClient, LanguageServer, MainLoop, ResponseError};
 use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
 
-pub use async_lsp::lsp_types::{CompletionItem, Diagnostic, DiagnosticSeverity, InsertTextFormat, Url};
+pub use async_lsp::lsp_types::{
+    CompletionItem, Diagnostic, DiagnosticSeverity, InsertTextFormat, Location, Position, Range, Url,
+};
 
 /// A language DevScribe knows how to talk to a language server for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,6 +94,12 @@ pub enum LspCommand {
     DidClose { uri: Url },
     Completion { uri: Url, line: u32, character: u32 },
     Hover { uri: Url, line: u32, character: u32 },
+    /// `textDocument/definition` — "Go to Definition".
+    GotoDefinition { uri: Url, line: u32, character: u32 },
+    /// `textDocument/references` — "Find All References", across the whole
+    /// project (every server this app talks to indexes the workspace, not
+    /// just the open file).
+    References { uri: Url, line: u32, character: u32 },
 }
 
 /// An event a running worker reports back to the app.
@@ -116,6 +126,24 @@ pub enum LspEvent {
         line: u32,
         character: u32,
         text: Option<String>,
+    },
+    /// The result of a `LspCommand::GotoDefinition` request, already
+    /// normalized to a flat list regardless of which of the three shapes
+    /// `textDocument/definition` is allowed to reply with (see
+    /// `goto_definition_to_locations`). Empty means the server had nothing
+    /// to offer for that position, not an error.
+    Definition {
+        uri: Url,
+        line: u32,
+        character: u32,
+        locations: Vec<Location>,
+    },
+    /// The result of a `LspCommand::References` request.
+    References {
+        uri: Url,
+        line: u32,
+        character: u32,
+        locations: Vec<Location>,
     },
     /// Binary not found anywhere — the app should auto-install it.
     NeedsInstall,
@@ -271,6 +299,12 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                             ..Default::default()
                         }),
                         hover: Some(HoverClientCapabilities {
+                            ..Default::default()
+                        }),
+                        definition: Some(GotoCapability {
+                            ..Default::default()
+                        }),
+                        references: Some(DynamicRegistrationClientCapabilities {
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -470,9 +504,105 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                                 .await;
                         }
                     }
+                    LspCommand::GotoDefinition { uri, line, character } => {
+                        let def_fut = server
+                            .definition(GotoDefinitionParams {
+                                text_document_position_params: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                    position: Position { line, character },
+                                },
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                                partial_result_params: PartialResultParams::default(),
+                            })
+                            .fuse();
+                        futures::pin_mut!(def_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = def_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(response) = result {
+                            let locations = response.map(goto_definition_to_locations).unwrap_or_default();
+                            let _ = output
+                                .send(LspEvent::Definition { uri, line, character, locations })
+                                .await;
+                        }
+                    }
+                    LspCommand::References { uri, line, character } => {
+                        let refs_fut = server
+                            .references(ReferenceParams {
+                                text_document_position: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                    position: Position { line, character },
+                                },
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                                partial_result_params: PartialResultParams::default(),
+                                // Include the declaration itself as one of
+                                // the results — same as VS Code's "Find All
+                                // References" list, which shows the
+                                // declaration alongside every usage rather
+                                // than only the usages.
+                                context: ReferenceContext { include_declaration: true },
+                            })
+                            .fuse();
+                        futures::pin_mut!(refs_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = refs_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(response) = result {
+                            let locations = response.unwrap_or_default();
+                            let _ = output
+                                .send(LspEvent::References { uri, line, character, locations })
+                                .await;
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/// Flattens any of `textDocument/definition`'s three legal response shapes
+/// into a plain list — a single scalar `Location`, an array of them, or (for
+/// servers advertising the newer `LocationLink` capability, which this
+/// client's capabilities never actually request — see the `definition`
+/// capability above — so this arm is defensive rather than expected in
+/// practice) a list of links, each reduced to its target's selection range.
+fn goto_definition_to_locations(response: GotoDefinitionResponse) -> Vec<Location> {
+    match response {
+        GotoDefinitionResponse::Scalar(loc) => vec![loc],
+        GotoDefinitionResponse::Array(locs) => locs,
+        GotoDefinitionResponse::Link(links) => links
+            .into_iter()
+            .map(|link: LocationLink| Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            })
+            .collect(),
     }
 }
 

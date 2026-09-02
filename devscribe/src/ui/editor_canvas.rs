@@ -173,6 +173,16 @@ impl EditorCanvas {
                     dir: Direction::LineEnd,
                     extend,
                 }),
+                // Same VS Code bindings: `F12` "Go to Definition", `Shift+F12`
+                // "Find All References" — both act on the cursor's current
+                // position rather than needing a fresh click.
+                Named::F12 => {
+                    if extend {
+                        publish(Message::FindReferences { line: self.cursor.line, col: self.cursor.col })
+                    } else {
+                        publish(Message::GoToDefinition { line: self.cursor.line, col: self.cursor.col })
+                    }
+                }
                 _ => None,
             };
         }
@@ -259,6 +269,15 @@ impl canvas::Program<Message> for EditorCanvas {
                 };
                 state.focused = true;
                 let (line, col) = self.hit_test(position);
+
+                // Ctrl/Cmd+Click jumps to the symbol's definition instead of
+                // placing the cursor or starting a drag-select — the same
+                // modifier VS Code uses for this gesture. Checked before the
+                // gutter/revert handling below since it's meant to apply
+                // anywhere over the text, not just plain clicks.
+                if state.modifiers.command() {
+                    return Some(canvas::Action::publish(Message::GoToDefinition { line, col }).and_capture());
+                }
 
                 // A click on a changed line's gutter marker arms that line
                 // for revert instead of placing the cursor or starting a

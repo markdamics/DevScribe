@@ -2897,3 +2897,92 @@ fn completion_select_inserts_plain_text_items_verbatim() {
     assert!(editor.document.text().to_string().contains("collect"));
     assert!(!editor.snippet_active(), "a plain-text item must never start a snippet Tab walk");
 }
+
+fn location_at(path: &Path, line: u32, character: u32) -> lsp::Location {
+    lsp::Location {
+        uri: lsp::Url::from_file_path(path).unwrap(),
+        range: lsp::Range {
+            start: lsp::Position { line, character },
+            end: lsp::Position { line, character },
+        },
+    }
+}
+
+#[test]
+fn apply_locations_with_a_single_result_jumps_directly() {
+    let files = TempFiles::new("goto-def-single");
+    std::fs::write(&files.b, "fn target() {}\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+
+    let _ = apply_locations(&mut state, vec![location_at(&files.b, 0, 3)], "Definition");
+
+    assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())), "a single result must jump there directly");
+    let editor = find_editor(&state, &files.b).unwrap();
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 3 });
+    assert!(!state.references_open, "a single result must not open the picker panel");
+}
+
+#[test]
+fn apply_locations_with_multiple_results_opens_the_locations_panel() {
+    let files = TempFiles::new("goto-def-multi");
+    std::fs::write(&files.a, "impl A for X {}\n").unwrap();
+    std::fs::write(&files.b, "impl A for Y {}\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let starting_tab = state.active_tab.clone();
+
+    let _ = apply_locations(
+        &mut state,
+        vec![location_at(&files.a, 0, 0), location_at(&files.b, 0, 0)],
+        "Definition",
+    );
+
+    assert!(state.references_open, "more than one candidate must open the picker rather than guessing");
+    assert_eq!(state.references_results.len(), 2);
+    assert!(state.references_label.contains("2 results"), "label was: {}", state.references_label);
+    assert_eq!(state.active_tab, starting_tab, "must not navigate anywhere on its own");
+}
+
+#[test]
+fn apply_locations_with_no_results_shows_a_toast_instead_of_doing_nothing() {
+    let files = TempFiles::new("goto-def-none");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+
+    let _ = apply_locations(&mut state, vec![], "Definition");
+
+    assert!(!state.references_open);
+    assert_eq!(state.toasts.len(), 1);
+    assert!(state.toasts[0].message.to_lowercase().contains("no definition found"), "message was: {}", state.toasts[0].message);
+}
+
+#[test]
+fn apply_locations_prefers_the_live_open_buffer_over_a_stale_disk_read() {
+    let files = TempFiles::new("goto-def-dirty");
+    std::fs::write(&files.b, "on disk\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+    {
+        let editor = find_editor_mut(&mut state, &files.b).unwrap();
+        editor.cursor = CursorPos { line: 0, col: 0 };
+        editor.insert_text("edited in the live buffer");
+    }
+    open_or_focus_file(&mut state, files.a.clone());
+
+    // A second location alongside it just to force the multi-result branch,
+    // whose panel entries expose the `preview` text this test checks.
+    let _ = apply_locations(
+        &mut state,
+        vec![location_at(&files.a, 0, 0), location_at(&files.b, 0, 0)],
+        "Definition",
+    );
+
+    let entry = state.references_results.iter().find(|e| e.path == files.b).unwrap();
+    assert!(
+        entry.preview.contains("edited in the live buffer"),
+        "must reflect the live, unsaved buffer rather than what's on disk: {:?}",
+        entry.preview
+    );
+}

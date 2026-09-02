@@ -629,6 +629,14 @@ fn shortcuts_content(p: Palette) -> Element<'static, Message> {
             ]
         ]
         .spacing(8.0),
+        column![
+            section_label("NAVIGATION", p),
+            column![
+                shortcut_row("Go to definition", "\u{2318}Click / F12", p),
+                shortcut_row("Find all references", "\u{21e7}F12", p),
+            ]
+        ]
+        .spacing(8.0),
     ]
     .spacing(24.0)
     .into()

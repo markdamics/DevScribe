@@ -615,7 +615,11 @@ fn changes_row(entry: &ChangesEntry, row_h: f32, pending_discard: bool, p: Palet
     .width(Length::Fill)
     .height(Length::Fixed(row_h))
     .padding(0.0)
-    .on_press(Message::OpenDiffFor(path))
+    .on_press(if matches!(entry.kind, ChangeKind::Added | ChangeKind::Untracked) {
+        Message::SelectFile(path)
+    } else {
+        Message::OpenDiffFor(path)
+    })
     .style(move |_theme, status| {
         let hovered = status == button::Status::Hovered;
         button::Style {
