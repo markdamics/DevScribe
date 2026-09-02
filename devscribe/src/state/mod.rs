@@ -398,6 +398,13 @@ pub struct State {
     /// bar, palette, settings, toasts). Independent of `editor_font_size` —
     /// see `text_scale`.
     pub ui_font_scale: f32,
+    /// Spaces inserted per `Tab`/removed per `Shift+Tab` — see
+    /// `EditorState::indent`/`dedent`.
+    pub tab_size: u8,
+    /// Gates the gutter's per-line number text (`editor_canvas.rs`'s
+    /// `draw`) — the gutter itself (git-diff marks, revert clicks) stays
+    /// regardless, since those aren't "line numbers".
+    pub show_line_numbers: bool,
     pub toasts: Vec<Toast>,
     next_toast_id: u64,
     /// Non-`None` while the sidebar tree has an inline new-file/new-folder/
@@ -430,6 +437,11 @@ pub const UI_FONT_SCALE_MIN: f32 = 0.8;
 pub const UI_FONT_SCALE_MAX: f32 = 1.5;
 pub const UI_FONT_SCALE_DEFAULT: f32 = 1.0;
 pub const UI_FONT_SCALE_STEP: f32 = 0.1;
+
+pub const TAB_SIZE_MIN: u8 = 2;
+pub const TAB_SIZE_MAX: u8 = 8;
+pub const TAB_SIZE_DEFAULT: u8 = 4;
+pub const TAB_SIZE_STEP: u8 = 2;
 
 /// The persisted settings (`settings::save`, written by `persist_settings`
 /// on every settings-changing message), or defaults for whatever wasn't
@@ -524,6 +536,8 @@ impl Default for State {
             problem_lens_enabled: settings.problem_lens_enabled,
             editor_font_size: settings.editor_font_size,
             ui_font_scale: settings.ui_font_scale,
+            tab_size: settings.tab_size,
+            show_line_numbers: settings.show_line_numbers,
             toasts: Vec::new(),
             next_toast_id: 0,
             draft: None,
@@ -800,6 +814,8 @@ pub enum Message {
     OpenShortcutsHelp,
     SetEditorFontSize(f32),
     SetUiFontScale(f32),
+    SetTabSize(u8),
+    ToggleShowLineNumbers,
     DismissToast(u64),
     PruneToasts,
     EditorSave,
@@ -909,6 +925,18 @@ pub enum Message {
     CompletionSelect,
     /// Closes the completion popup without inserting.
     CloseCompletion,
+    /// The mouse (not dragging) moved onto a new `(line, col)` cell of the
+    /// active editor's canvas — starts/restarts the hover dwell timer. Only
+    /// published on an actual cell change (`editor_canvas::CanvasState`
+    /// tracks the last cell), not on every raw `CursorMoved` event.
+    EditorHoverMove { line: usize, col: usize },
+    /// The mouse left the active editor's canvas entirely.
+    EditorHoverLeave,
+    /// Fires the `LspCommand::Hover` request for whatever position has been
+    /// resting long enough (`EditorState::due_hover_request`) — only
+    /// subscribed to while some editor actually has a pending hover
+    /// position, same shape as `SearchDebounceTick`.
+    HoverDebounceTick,
     Noop,
 }
 
@@ -1126,11 +1154,20 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
 
                 if let Some(editor) = find_editor_mut(state, &path) {
-                    // Any non-trigger keystroke closes a stale popup.
-                    if editor.completions.is_some() && text != "." && text != ":" {
-                        editor.completions = None;
+                    // A trigger char (`.`/`:`) always starts its own fresh
+                    // request below, so any popup already open gets closed
+                    // outright rather than fuzzy-matched against it. A word
+                    // character (letter/digit/`_`) instead narrows whatever
+                    // popup is already open — see `refilter_completions`.
+                    // Anything else (space, punctuation, a pasted chunk with
+                    // any of those in it, ...) closes it: none of that can
+                    // ever be part of an identifier the popup would match.
+                    if editor.completions_active() && !is_word_text(&text) {
+                        editor.close_completions();
                     }
+                    editor.clear_hover();
                     editor.insert_text(&text);
+                    editor.refilter_completions();
                 }
                 mark_edited(state, &path);
                 maybe_trigger_completion(state, &path, &text);
@@ -1141,10 +1178,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state) {
                 if let Some(editor) = find_editor_mut(state, &path) {
                     // Same stale-popup-closing rule as `EditorInsertText`.
-                    if editor.completions.is_some() && ch != '.' && ch != ':' {
-                        editor.completions = None;
+                    let text = ch.to_string();
+                    if editor.completions_active() && !is_word_text(&text) {
+                        editor.close_completions();
                     }
+                    editor.clear_hover();
                     editor.type_char(ch);
+                    editor.refilter_completions();
                 }
                 mark_edited(state, &path);
                 maybe_trigger_completion(state, &path, &ch.to_string());
@@ -1159,12 +1199,29 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if !find_editor_mut(state, &path).is_some_and(|e| e.backspace()) {
                     return iced::Task::none();
                 }
+                // Backspacing past the trigger character closes the popup
+                // outright (`refilter_completions` handles that); backspacing
+                // within the typed prefix instead re-narrows it — the popup
+                // must not simply stay frozen at whatever it last showed.
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.clear_hover();
+                    editor.refilter_completions();
+                }
                 mark_edited(state, &path);
                 return scroll_cursor_into_view(state);
             }
         }
         Message::EditorDelete => {
             if let Some(path) = active_file_path(state) {
+                // Forward-delete while a completion is open is an unusual
+                // enough combination (it deletes text *ahead* of the typed
+                // prefix, not part of it) that closing outright is simpler
+                // and safer than trying to make it a sensible edit to the
+                // prefix.
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.close_completions();
+                    editor.clear_hover();
+                }
                 if !find_editor_mut(state, &path).is_some_and(|e| e.delete_forward()) {
                     return iced::Task::none();
                 }
@@ -1181,8 +1238,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if completions_open {
                     return update(state, Message::CompletionSelect);
                 }
+                // Tab with a snippet expansion in progress jumps to the next
+                // placeholder instead of indenting — see `advance_snippet`.
+                if find_editor_mut(state, &path).is_some_and(|e| e.advance_snippet()) {
+                    return scroll_cursor_into_view(state);
+                }
+                let tab_size = state.tab_size;
                 if let Some(editor) = find_editor_mut(state, &path) {
-                    editor.indent();
+                    editor.indent(tab_size);
                 }
                 mark_edited(state, &path);
                 return scroll_cursor_into_view(state);
@@ -1190,7 +1253,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::EditorDedent => {
             if let Some(path) = active_file_path(state) {
-                if !find_editor_mut(state, &path).is_some_and(|e| e.dedent()) {
+                let tab_size = state.tab_size;
+                if !find_editor_mut(state, &path).is_some_and(|e| e.dedent(tab_size)) {
                     return iced::Task::none();
                 }
                 mark_edited(state, &path);
@@ -1230,10 +1294,11 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                         }
                         _ => {
                             // Any other cursor movement dismisses the popup.
-                            editor.completions = None;
+                            editor.close_completions();
                         }
                     }
                 }
+                editor.close_snippet();
                 editor.move_cursor(dir, extend);
             }
             return scroll_cursor_into_view(state);
@@ -1242,7 +1307,9 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
-                editor.completions = None;
+                editor.close_completions();
+                editor.close_snippet();
+                editor.clear_hover();
                 editor.click(line, col, extend);
             }
         }
@@ -1250,7 +1317,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
-                editor.completions = None;
+                editor.close_completions();
+                editor.close_snippet();
                 editor.select_word_at(line, col);
             }
         }
@@ -1258,7 +1326,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
-                editor.completions = None;
+                editor.close_completions();
+                editor.close_snippet();
                 editor.select_line_at(line);
             }
         }
@@ -1266,7 +1335,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
-                editor.completions = None;
+                editor.close_completions();
+                editor.close_snippet();
                 editor.select_all();
             }
         }
@@ -1295,6 +1365,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
                 && editor.undo()
             {
+                editor.close_completions();
+                editor.close_snippet();
                 mark_edited(state, &path);
                 // Undo can land the caret anywhere — including a screenful
                 // away from wherever the view currently sits.
@@ -1306,6 +1378,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
                 && editor.redo()
             {
+                editor.close_completions();
+                editor.close_snippet();
                 mark_edited(state, &path);
                 return scroll_cursor_into_view(state);
             }
@@ -1316,7 +1390,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
-                editor.completions = None;
+                editor.close_completions();
+                editor.close_snippet();
                 editor.insert_text(&text);
                 mark_edited(state, &path);
                 return scroll_cursor_into_view(state);
@@ -1363,17 +1438,28 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if let Some(path) = uri.to_file_path().ok()
                     && let Some(editor) = find_editor_mut(state, &path)
                 {
-                    // Discard stale results: only apply if the cursor hasn't
-                    // moved since the request was sent.
+                    // Discard stale results: only apply if the anchor the
+                    // request was sent for is still the one in effect.
                     let anchor = editor.completion_anchor;
                     if anchor.line == line as usize {
                         let line_text = editor.document.line_text(anchor.line);
                         let anchor_utf16 = char_col_to_utf16_col(&line_text, anchor.col);
                         if anchor_utf16 == character {
-                            editor.completions = if items.is_empty() { None } else { Some(items) };
-                            editor.completion_selected = 0;
+                            // `set_completions` re-filters against whatever's
+                            // been typed since (`editor.cursor`, live) rather
+                            // than showing the raw response — the user may
+                            // have kept typing past the trigger while this
+                            // was in flight.
+                            editor.set_completions(items);
                         }
                     }
+                }
+            }
+            LspEvent::Hover { uri, line, character, text } => {
+                if let Some(path) = uri.to_file_path().ok()
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.apply_hover_response(line, character, text);
                 }
             }
             LspEvent::NeedsInstall => {
@@ -1607,6 +1693,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.ui_font_scale = scale.clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
             persist_settings(state);
         }
+        Message::SetTabSize(size) => {
+            state.tab_size = size.clamp(TAB_SIZE_MIN, TAB_SIZE_MAX);
+            persist_settings(state);
+        }
+        Message::ToggleShowLineNumbers => {
+            state.show_line_numbers = !state.show_line_numbers;
+            persist_settings(state);
+        }
         Message::DismissToast(id) => state.toasts.retain(|t| t.id != id),
         Message::PruneToasts => {
             state.toasts.retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
@@ -1838,7 +1932,18 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if let Some(path) = active_file_path(state)
                     && let Some(editor) = find_editor_mut(state, &path)
                 {
-                    editor.completions = None;
+                    editor.close_completions();
+                }
+                return iced::Task::none();
+            }
+            let snippet_active = active_file_path(state)
+                .and_then(|ref path| find_editor(state, path))
+                .is_some_and(|e| e.snippet_active());
+            if snippet_active {
+                if let Some(path) = active_file_path(state)
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.close_snippet();
                 }
                 return iced::Task::none();
             }
@@ -1906,17 +2011,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::CompletionSelect => {
             if let Some(path) = active_file_path(state) {
-                let insert_text = find_editor(state, &path).and_then(|editor| {
+                let selected = find_editor(state, &path).and_then(|editor| {
                     let items = editor.completions.as_ref()?;
                     let sel = editor.completion_selected.min(items.len().saturating_sub(1));
-                    let item = items.get(sel)?;
-                    let text = item.insert_text.as_deref().unwrap_or(&item.label).to_string();
-                    Some((text, editor.completion_anchor, editor.cursor))
+                    let item = items.get(sel)?.clone();
+                    Some((item, editor.completion_anchor, editor.cursor))
                 });
-                if let Some((text, anchor, cursor)) = insert_text {
+                if let Some((item, anchor, cursor)) = selected {
                     if let Some(editor) = find_editor_mut(state, &path) {
-                        editor.completions = None;
-                        editor.completion_selected = 0;
+                        editor.close_completions();
                         // Replace text typed since the trigger with the completion.
                         let start = editor.document.char_index(anchor.line, anchor.col);
                         let end = editor.document.char_index(cursor.line, cursor.col);
@@ -1927,9 +2030,29 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                             editor.edit_remove(start..end);
                             editor.cursor = editor.document.line_col(start).into();
                         }
-                        editor.insert_text(&text);
+                        let raw = item.insert_text.as_deref().unwrap_or(item.label.as_str());
+                        // Snippets (`fn ${1:name}(${2:args}) {\n    $0\n}` and
+                        // the like) need their `$`-placeholder syntax parsed
+                        // out before insertion — inserting `raw` verbatim
+                        // would put the literal dollar-sign syntax in the
+                        // buffer. Plain-text items (`insert_text_format`
+                        // unset or `PlainText`) just insert as-is, same as
+                        // before.
+                        if item.insert_text_format == Some(lsp::InsertTextFormat::SNIPPET) {
+                            let parsed = crate::snippet::parse(raw);
+                            editor.insert_text(&parsed.text);
+                            let stops = parsed
+                                .tab_stops
+                                .into_iter()
+                                .map(|s| (start + s.range.0, start + s.range.1))
+                                .collect();
+                            editor.begin_snippet(stops);
+                        } else {
+                            editor.insert_text(raw);
+                        }
                     }
                     mark_edited(state, &path);
+                    return scroll_cursor_into_view(state);
                 }
             }
         }
@@ -1937,7 +2060,43 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
-                editor.completions = None;
+                editor.close_completions();
+            }
+        }
+        Message::EditorHoverMove { line, col } => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.hover_move(line, col);
+            }
+        }
+        Message::EditorHoverLeave => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.clear_hover();
+            }
+        }
+        Message::HoverDebounceTick => {
+            if let Some(path) = active_file_path(state)
+                && matches!(state.lsp_status, LspStatus::Ready)
+                && let Some(pos) = find_editor(state, &path).and_then(|e| e.due_hover_request())
+                && let Some(uri) = lsp_uri(&path)
+            {
+                let line_text = find_editor(state, &path)
+                    .map(|e| e.document.line_text(pos.line))
+                    .unwrap_or_default();
+                let utf16_char = char_col_to_utf16_col(&line_text, pos.col);
+                if let Some(sender) = state.lsp_sender.as_mut() {
+                    let _ = sender.try_send(LspCommand::Hover {
+                        uri,
+                        line: pos.line as u32,
+                        character: utf16_char,
+                    });
+                }
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.mark_hover_requested(pos);
+                }
             }
         }
         Message::Noop => {}
@@ -2019,6 +2178,8 @@ fn persist_settings(state: &State) {
         lsp_enabled: state.lsp_enabled,
         chat_mode: state.chat_mode,
         chat_panel_width: state.chat_panel_width,
+        tab_size: state.tab_size,
+        show_line_numbers: state.show_line_numbers,
     });
 }
 
@@ -2459,6 +2620,14 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     }
     if state.search_query_changed_at.is_some() {
         subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::SearchDebounceTick));
+    }
+    // Same shape again: only ticks while the active editor actually has a
+    // rested-on position waiting on `HOVER_DWELL`/a reply, not permanently.
+    let hover_pending = active_file_path(state)
+        .and_then(|path| find_editor(state, &path))
+        .is_some_and(|e| e.hover_pending_active());
+    if hover_pending {
+        subs.push(iced::time::every(Duration::from_millis(80)).map(|_| Message::HoverDebounceTick));
     }
     if state.sidebar_resizing {
         subs.push(iced::event::listen_with(sidebar_resize_events));

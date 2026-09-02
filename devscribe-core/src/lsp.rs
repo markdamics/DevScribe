@@ -11,9 +11,10 @@ use std::process::Stdio;
 
 use async_lsp::lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializedParams, LogMessageParams, PartialResultParams, Position,
-    ProgressParams, PublishDiagnosticsParams, ShowMessageParams, TextDocumentClientCapabilities,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
+    HoverClientCapabilities, HoverContents, HoverParams, InitializeParams, InitializedParams,
+    LogMessageParams, MarkedString, PartialResultParams, Position, ProgressParams,
+    PublishDiagnosticsParams, ShowMessageParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     WorkspaceFolder,
@@ -23,7 +24,7 @@ use async_lsp::{LanguageClient, LanguageServer, MainLoop, ResponseError};
 use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
 
-pub use async_lsp::lsp_types::{CompletionItem, Diagnostic, DiagnosticSeverity, Url};
+pub use async_lsp::lsp_types::{CompletionItem, Diagnostic, DiagnosticSeverity, InsertTextFormat, Url};
 
 /// A language DevScribe knows how to talk to a language server for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -88,6 +89,7 @@ pub enum LspCommand {
     DidChange { uri: Url, text: String },
     DidClose { uri: Url },
     Completion { uri: Url, line: u32, character: u32 },
+    Hover { uri: Url, line: u32, character: u32 },
 }
 
 /// An event a running worker reports back to the app.
@@ -104,6 +106,16 @@ pub enum LspEvent {
         line: u32,
         character: u32,
         items: Vec<CompletionItem>,
+    },
+    /// The hover documentation for the position a `LspCommand::Hover`
+    /// request asked about, already flattened to plain text (see
+    /// `hover_to_text`) — `None` if the server had nothing to say about that
+    /// position, which is a normal, common response, not an error.
+    Hover {
+        uri: Url,
+        line: u32,
+        character: u32,
+        text: Option<String>,
     },
     /// Binary not found anywhere — the app should auto-install it.
     NeedsInstall,
@@ -256,6 +268,9 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                 capabilities: ClientCapabilities {
                     text_document: Some(TextDocumentClientCapabilities {
                         completion: Some(CompletionClientCapabilities {
+                            ..Default::default()
+                        }),
+                        hover: Some(HoverClientCapabilities {
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -419,9 +434,69 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                                 .await;
                         }
                     }
+                    LspCommand::Hover { uri, line, character } => {
+                        // Same "drive mainloop alongside the request" shape
+                        // as `LspCommand::Completion` above.
+                        let hover_fut = server
+                            .hover(HoverParams {
+                                text_document_position_params: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                    position: Position { line, character },
+                                },
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                            })
+                            .fuse();
+                        futures::pin_mut!(hover_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = hover_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(response) = result {
+                            let text = response.map(hover_to_text).filter(|s| !s.trim().is_empty());
+                            let _ = output
+                                .send(LspEvent::Hover { uri, line, character, text })
+                                .await;
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/// Flattens any of `HoverContents`' three shapes into plain text for the
+/// editor's tooltip — which doesn't render Markdown, so no distinction is
+/// made between a `Markup`'s Markdown/plaintext `kind` and a
+/// `MarkedString::LanguageString`'s embedded language tag; both just
+/// contribute their raw text.
+fn hover_to_text(hover: Hover) -> String {
+    match hover.contents {
+        HoverContents::Scalar(marked) => marked_string_to_text(marked),
+        HoverContents::Array(list) => list
+            .into_iter()
+            .map(marked_string_to_text)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        HoverContents::Markup(markup) => markup.value,
+    }
+}
+
+fn marked_string_to_text(marked: MarkedString) -> String {
+    match marked {
+        MarkedString::String(s) => s,
+        MarkedString::LanguageString(ls) => ls.value,
     }
 }
 

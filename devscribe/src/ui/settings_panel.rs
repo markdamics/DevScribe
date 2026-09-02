@@ -27,7 +27,8 @@ use crate::fonts;
 use crate::server_install;
 use crate::state::{
     self, Message, SettingsCategory, State, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    EDITOR_FONT_SIZE_STEP, UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
+    EDITOR_FONT_SIZE_STEP, TAB_SIZE_MAX, TAB_SIZE_MIN, TAB_SIZE_STEP, UI_FONT_SCALE_MAX,
+    UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
 };
 use crate::widgets;
 
@@ -100,6 +101,18 @@ fn font_size_row(state: &State, p: Palette) -> Element<'static, Message> {
         Message::SetEditorFontSize((size + EDITOR_FONT_SIZE_STEP).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX)),
         size > EDITOR_FONT_SIZE_MIN + f32::EPSILON,
         size < EDITOR_FONT_SIZE_MAX - f32::EPSILON,
+        p,
+    )
+}
+
+fn tab_size_row(state: &State, p: Palette) -> Element<'static, Message> {
+    let size = state.tab_size;
+    stepper_row(
+        format!("{size}"),
+        Message::SetTabSize(size.saturating_sub(TAB_SIZE_STEP).clamp(TAB_SIZE_MIN, TAB_SIZE_MAX)),
+        Message::SetTabSize(size.saturating_add(TAB_SIZE_STEP).clamp(TAB_SIZE_MIN, TAB_SIZE_MAX)),
+        size > TAB_SIZE_MIN,
+        size < TAB_SIZE_MAX,
         p,
     )
 }
@@ -422,6 +435,18 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
 fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
     column![
         column![section_label("FONT SIZE", p), font_size_row(state, p)].spacing(8.0),
+        column![section_label("TAB SIZE", p), tab_size_row(state, p)].spacing(8.0),
+        column![
+            section_label("GUTTER", p),
+            toggle_row(
+                "Show line numbers",
+                "Line number digits in the editor gutter",
+                state.show_line_numbers,
+                Message::ToggleShowLineNumbers,
+                p,
+            ),
+        ]
+        .spacing(8.0),
         column![
             section_label("DIAGNOSTICS", p),
             toggle_row(

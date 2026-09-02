@@ -109,6 +109,21 @@ pub struct FindState {
     pub replace_open: bool,
 }
 
+/// `Tab`-to-next-placeholder tracking for a snippet completion, from the
+/// moment it's inserted (`EditorState::begin_snippet`) until every stop has
+/// been visited (`advance_snippet`). `stops` are absolute char ranges into
+/// the *live* document — kept correct across the one stop currently being
+/// edited via the delta computed in `advance_snippet`, not by re-deriving
+/// them from the buffer, so a same-length or different-length retype of the
+/// current placeholder both leave every later stop pointing at the right
+/// place.
+#[derive(Debug, Clone)]
+struct ActiveSnippet {
+    stops: Vec<(usize, usize)>,
+    /// Index into `stops` that the next `advance_snippet` call visits.
+    next: usize,
+}
+
 /// An open file: its buffer plus interaction state (cursor, selection). Real
 /// keyboard/mouse editing lives here; `editor_canvas.rs` only ever reads it
 /// and turns raw input events into the `Message`s that call these methods.
@@ -220,12 +235,46 @@ pub struct EditorState {
     /// this file has otherwise gone to some lengths to keep O(1).
     max_line_chars: usize,
     /// Active completion popup: `None` = closed, `Some(items)` = showing.
+    /// This is the currently *displayed* (fuzzy-filtered, re-sorted) subset —
+    /// see `completions_all` for the full LSP response it's filtered from.
     pub completions: Option<Vec<CompletionItem>>,
+    /// The unfiltered response `completions` was last derived from —
+    /// `refilter_completions` re-scores this on every keystroke rather than
+    /// re-requesting the server, so typing past the trigger narrows the
+    /// popup instead of just closing it. `None` exactly when `completions`
+    /// is (see `close_completions`), except transiently when the current
+    /// prefix matches nothing — that keeps `completions` closed while still
+    /// letting a `Backspace` bring matches back without a fresh request.
+    completions_all: Option<Vec<CompletionItem>>,
     /// Keyboard-navigation index into `completions`.
     pub completion_selected: usize,
     /// Cursor position when the completion request was sent, used to discard
-    /// stale responses that arrive after the cursor moved elsewhere.
+    /// stale responses that arrive after the cursor moved elsewhere, and as
+    /// the start of the prefix `refilter_completions` matches against.
     pub completion_anchor: CursorPos,
+    /// `Tab`-to-next-placeholder state for a snippet completion still being
+    /// filled in — see `begin_snippet`/`advance_snippet`. `None` once every
+    /// stop has been visited, or the moment any non-typing action (a click,
+    /// an arrow key, undo, ...) makes the recorded stop positions no longer
+    /// trustworthy.
+    active_snippet: Option<ActiveSnippet>,
+    /// Where the mouse is currently resting (not dragging) over this
+    /// editor's canvas, and since when — set by `Message::EditorHoverMove`
+    /// (only on an actual cell change, see `editor_canvas::CanvasState`),
+    /// cleared by `Message::EditorHoverLeave` and by `clear_hover`. The
+    /// subscription's debounce tick (`due_hover_request`) fires the actual
+    /// `LspCommand::Hover` request once this has held still for
+    /// `HOVER_DWELL`.
+    hover_pending: Option<(CursorPos, Instant)>,
+    /// The position `hover_pending` was last turned into an actual request
+    /// for — keeps the debounce tick from re-sending the same request every
+    /// tick while a reply is still in flight, and lets `apply_hover_response`
+    /// discard a reply for a position the mouse has since left.
+    hover_requested_for: Option<CursorPos>,
+    /// The resolved tooltip and the position it's for — rendered by
+    /// `hover_popup.rs`. Distinct from `hover_pending`: this only changes
+    /// once an actual response lands (or resolves to "nothing to show").
+    pub hover: Option<(CursorPos, String)>,
     /// Undo history — snapshots taken just before an edit that starts a new
     /// undo step (see `record_undo_boundary`). Consecutive same-kind edits
     /// (typing character after character, backspacing run after run)
@@ -369,8 +418,13 @@ impl EditorState {
             viewport_width: 0.0,
             max_line_chars,
             completions: None,
+            completions_all: None,
             completion_selected: 0,
             completion_anchor: CursorPos::default(),
+            active_snippet: None,
+            hover_pending: None,
+            hover_requested_for: None,
+            hover: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_kind: None,
@@ -941,34 +995,37 @@ impl EditorState {
     }
 
     /// `Tab`. Block-indents every line touched by an active selection
-    /// (inserting four spaces at each line's start), even a single-line one;
-    /// with no selection at all, behaves like plain typing and inserts four
-    /// spaces at the cursor. Without the selection branch, Tab used to
-    /// *replace* whatever was selected with four spaces — a quietly
-    /// destructive shortcut for something that should only ever indent.
-    pub fn indent(&mut self) {
+    /// (inserting `tab_size` spaces at each line's start), even a
+    /// single-line one; with no selection at all, behaves like plain typing
+    /// and inserts `tab_size` spaces at the cursor. Without the selection
+    /// branch, Tab used to *replace* whatever was selected with the indent —
+    /// a quietly destructive shortcut for something that should only ever
+    /// indent.
+    pub fn indent(&mut self, tab_size: u8) {
+        let indent = " ".repeat(tab_size as usize);
         if self.selection().is_none() {
-            self.insert_text("    ");
+            self.insert_text(&indent);
             return;
         }
         let (start_line, end_line) = self.selection_line_range();
         self.record_undo_boundary(EditKind::Other);
         for line in start_line..=end_line {
             let at = self.document.char_index(line, 0);
-            self.edit_insert(at, "    ");
-            self.shift_cols_after_edit(line, 0, 4);
+            self.edit_insert(at, &indent);
+            self.shift_cols_after_edit(line, 0, tab_size as i32);
             self.note_line_length(line);
         }
         self.resync_after_edit();
     }
 
     /// `Shift+Tab`. Removes up to one indent level (a leading tab, or up to
-    /// four leading spaces) from the start of every line the selection
+    /// `tab_size` leading spaces) from the start of every line the selection
     /// spans, or just the cursor's line with no selection. `false` if no
     /// targeted line had any leading whitespace to remove, in which case
     /// nothing happened — same no-op-must-not-touch-undo shape as
     /// `backspace`/`delete_forward`.
-    pub fn dedent(&mut self) -> bool {
+    pub fn dedent(&mut self, tab_size: u8) -> bool {
+        let tab_size = tab_size as usize;
         let (start_line, end_line) = self.selection_line_range();
         let removals: Vec<(usize, usize)> = (start_line..=end_line)
             .filter_map(|line| {
@@ -977,7 +1034,7 @@ impl EditorState {
                     return Some((line, 1));
                 }
                 let mut n = 0;
-                while n < 4 && n < len && self.document.line_char(line, n) == Some(' ') {
+                while n < tab_size && n < len && self.document.line_char(line, n) == Some(' ') {
                     n += 1;
                 }
                 (n > 0).then_some((line, n))
@@ -1316,7 +1373,249 @@ impl EditorState {
         }
         text
     }
+
+    /// Whether a completion response is currently being tracked — `true`
+    /// exactly when there's a `completions_all` to `refilter_completions`
+    /// against, whether or not `completions` itself has anything to show
+    /// right now (see `completions_all`'s doc for why those can differ).
+    pub fn completions_active(&self) -> bool {
+        self.completions_all.is_some()
+    }
+
+    /// Closes the completion popup and discards the last LSP response's
+    /// full item list — every action that invalidates "what's on screen
+    /// still matches what's in the buffer" (a click, a cursor move, an
+    /// undo, ...) calls this rather than just clearing `completions`, so a
+    /// stale `completions_all` can't outlive the popup it was filtered for.
+    pub fn close_completions(&mut self) {
+        self.completions = None;
+        self.completions_all = None;
+        self.completion_selected = 0;
+    }
+
+    /// Stores a freshly arrived LSP completion response and immediately
+    /// filters it against whatever's already been typed since the anchor —
+    /// a slow response can land after the user kept typing past the
+    /// trigger, so this can't just show the raw list. An empty response
+    /// closes the popup outright rather than showing nothing to select.
+    pub fn set_completions(&mut self, items: Vec<CompletionItem>) {
+        if items.is_empty() {
+            self.close_completions();
+            return;
+        }
+        self.completions_all = Some(items);
+        self.refilter_completions();
+    }
+
+    /// Re-scores `completions_all` against whatever's been typed since
+    /// `completion_anchor` (fuzzy-matched against each item's
+    /// `filter_text`, falling back to its `label`) and replaces
+    /// `completions` with the result, best match first. A no-op if there's
+    /// no response being tracked (`completions_active()` is `false`) —
+    /// callers don't need to check that themselves first.
+    ///
+    /// Called after every keystroke while a completion session is active,
+    /// so typing narrows the popup instead of just closing it (the
+    /// pre-fuzzy-filter behavior: `.` opened it, and the very next
+    /// character always dismissed it). Closes the session outright
+    /// (`close_completions`) if the cursor has left the anchor's line or
+    /// backed up past the anchor itself — deleting the trigger character —
+    /// but only sets `completions` to `None` (keeping `completions_all`
+    /// around) when the cursor is still in range but nothing currently
+    /// matches, so a `Backspace` back to a matching prefix can still bring
+    /// the popup back without a fresh round trip to the server.
+    pub fn refilter_completions(&mut self) {
+        let Some(all) = self.completions_all.as_ref() else {
+            return;
+        };
+        let anchor = self.completion_anchor;
+        let cursor = self.cursor;
+        if cursor.line != anchor.line || cursor.col < anchor.col {
+            self.close_completions();
+            return;
+        }
+        if cursor.col == anchor.col {
+            self.completions = Some(all.clone());
+            self.completion_selected = 0;
+            return;
+        }
+        let line_text = self.document.line_text(anchor.line);
+        let prefix: String = line_text.chars().skip(anchor.col).take(cursor.col - anchor.col).collect();
+        let mut scored: Vec<(i32, &CompletionItem)> = all
+            .iter()
+            .filter_map(|item| {
+                let text = item.filter_text.as_deref().unwrap_or(item.label.as_str());
+                crate::fuzzy::score(&prefix, text).map(|s| (s, item))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
+        self.completions = if scored.is_empty() {
+            None
+        } else {
+            Some(scored.into_iter().map(|(_, item)| item.clone()).collect())
+        };
+        self.completion_selected = 0;
+    }
+
+    /// Whether a snippet `Tab` walk is currently in progress — `Escape`
+    /// cancels it before falling through to anything else Escape would
+    /// otherwise close, the same priority `completions_active` gets.
+    pub fn snippet_active(&self) -> bool {
+        self.active_snippet.is_some()
+    }
+
+    /// Clears any in-progress snippet `Tab` walk — called from the same
+    /// actions that invalidate it as `close_completions` (a click, an arrow
+    /// key, undo, ...), since those make the recorded stop positions no
+    /// longer trustworthy.
+    pub fn close_snippet(&mut self) {
+        self.active_snippet = None;
+    }
+
+    /// Places the cursor/selection at the char range `(start, end)` — a
+    /// zero-width range just moves the cursor there, a non-empty one
+    /// selects it (so typing immediately overtypes the placeholder's
+    /// default text, the standard snippet-mode gesture).
+    fn place_snippet_stop(&mut self, start: usize, end: usize) {
+        let start_pos: CursorPos = self.document.line_col(start).into();
+        let end_pos: CursorPos = self.document.line_col(end).into();
+        if start == end {
+            self.selection_anchor = None;
+            self.cursor = start_pos;
+        } else {
+            self.selection_anchor = Some(start_pos);
+            self.cursor = end_pos;
+        }
+    }
+
+    /// Starts `Tab`-to-next-placeholder tracking for a just-inserted
+    /// snippet's `stops` (absolute char ranges, already offset by where the
+    /// snippet text landed in the document) and selects the first one — a
+    /// snippet's very first placeholder is meant to already be selected the
+    /// moment it lands, same as every other editor's snippet mode. A
+    /// snippet with at most one stop (just a trailing `$0`, or no stops at
+    /// all) isn't worth tracking: there's nothing to jump between, so the
+    /// cursor is simply placed there and no `Tab` walk begins.
+    pub fn begin_snippet(&mut self, stops: Vec<(usize, usize)>) {
+        if stops.len() <= 1 {
+            if let Some(&(start, end)) = stops.first() {
+                self.place_snippet_stop(start, end);
+            }
+            return;
+        }
+        self.place_snippet_stop(stops[0].0, stops[0].1);
+        self.active_snippet = Some(ActiveSnippet { stops, next: 1 });
+    }
+
+    /// `Tab` while a snippet walk is active: jumps to the next stop.
+    /// Returns `false` (consuming nothing) if there's no active walk, so
+    /// the caller falls through to a normal indent.
+    ///
+    /// Before jumping, shifts every stop from here on by exactly how much
+    /// the stop just being left changed length — comparing the live cursor
+    /// (wherever typing left it) against that stop's original end position.
+    /// This only stays correct as long as the cursor never moved some other
+    /// way since the stop was selected (a click, an arrow key, ...), which
+    /// is exactly the set of actions that already call `close_snippet`
+    /// elsewhere — so by the time this runs, every edit since the last
+    /// `place_snippet_stop` call has been ordinary typing at this position.
+    pub fn advance_snippet(&mut self) -> bool {
+        let Some(snippet) = self.active_snippet.as_mut() else {
+            return false;
+        };
+        if snippet.next >= snippet.stops.len() {
+            self.active_snippet = None;
+            return false;
+        }
+        let prev_end = snippet.stops[snippet.next - 1].1;
+        let current_end = self.document.char_index(self.cursor.line, self.cursor.col);
+        let delta = current_end as i64 - prev_end as i64;
+        if delta != 0 {
+            for stop in &mut snippet.stops[snippet.next..] {
+                stop.0 = (stop.0 as i64 + delta).max(0) as usize;
+                stop.1 = (stop.1 as i64 + delta).max(0) as usize;
+            }
+        }
+        let (start, end) = snippet.stops[snippet.next];
+        snippet.next += 1;
+        let done = snippet.next >= snippet.stops.len();
+        self.place_snippet_stop(start, end);
+        if done {
+            self.active_snippet = None;
+        }
+        true
+    }
+
+    /// Mouse now resting over `(line, col)` — called from
+    /// `Message::EditorHoverMove`, which only fires on an actual cell
+    /// change. Restarts the dwell timer and discards whatever tooltip (or
+    /// pending request) was showing for the previous position, since it no
+    /// longer applies.
+    pub fn hover_move(&mut self, line: usize, col: usize) {
+        self.hover_pending = Some((CursorPos { line, col }, Instant::now()));
+        self.hover_requested_for = None;
+        self.hover = None;
+    }
+
+    /// The mouse left the canvas, or some other action (a keypress, an
+    /// edit, a click, ...) made a pending or shown hover no longer
+    /// meaningful.
+    pub fn clear_hover(&mut self) {
+        self.hover_pending = None;
+        self.hover_requested_for = None;
+        self.hover = None;
+    }
+
+    /// Whether there's currently a rested-on position at all — what
+    /// `subscription()` checks to decide whether the debounce tick needs to
+    /// run at all.
+    pub fn hover_pending_active(&self) -> bool {
+        self.hover_pending.is_some()
+    }
+
+    /// The position to send a `LspCommand::Hover` request for, if
+    /// `hover_pending` has rested long enough (`HOVER_DWELL`) and hasn't
+    /// already been requested — what the debounce tick calls each time it
+    /// fires. `None` means "nothing to do this tick", not an error.
+    pub fn due_hover_request(&self) -> Option<CursorPos> {
+        let (pos, at) = self.hover_pending?;
+        if self.hover_requested_for == Some(pos) || at.elapsed() < HOVER_DWELL {
+            return None;
+        }
+        Some(pos)
+    }
+
+    /// Marks `pos` as the position a request has now actually been sent
+    /// for — called right after sending it, so `due_hover_request` doesn't
+    /// fire again for the same position while the reply is in flight.
+    pub fn mark_hover_requested(&mut self, pos: CursorPos) {
+        self.hover_requested_for = Some(pos);
+    }
+
+    /// Applies a `LspEvent::Hover` response — discarded if the mouse has
+    /// since left the position it was requested for, the same stale-response
+    /// guard `LspEvent::Completions` uses against `completion_anchor`.
+    pub fn apply_hover_response(&mut self, line: u32, character: u32, text: Option<String>) {
+        let Some(requested) = self.hover_requested_for else {
+            return;
+        };
+        if requested.line != line as usize {
+            return;
+        }
+        let line_text = self.document.line_text(requested.line);
+        if char_col_to_utf16_col(&line_text, requested.col) != character {
+            return;
+        }
+        self.hover = text.map(|t| (requested, t));
+    }
 }
+
+/// How long the mouse has to rest on the same cell, motionless, before a
+/// `textDocument/hover` request fires for it — long enough that sweeping the
+/// mouse across a line while reading doesn't fire a request per character,
+/// short enough that pausing to actually look at something shows docs
+/// promptly.
+pub const HOVER_DWELL: Duration = Duration::from_millis(300);
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum CharClass {
@@ -2107,6 +2406,14 @@ pub fn send_did_open_for(state: &mut State, path: &Path) {
     if let Some(sender) = state.lsp_sender.as_mut() {
         let _ = sender.try_send(LspCommand::DidOpen { uri, text });
     }
+}
+
+/// Whether every char of `text` could plausibly be part of an identifier —
+/// used by `EditorInsertText`/`EditorTypeChar` to decide whether typed text
+/// should narrow an open completion popup (`refilter_completions`) or close
+/// it outright. `false` for an empty string: there's nothing to narrow with.
+pub fn is_word_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// Fires the LSP completion request that typing `.` or the second `:` of

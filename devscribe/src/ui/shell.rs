@@ -9,8 +9,8 @@ use crate::state::{self, ChatMode, EditorState, Message, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
     breadcrumb_bar, chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash,
-    json_view, markdown_view, search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast,
-    welcome,
+    hover_popup, json_view, markdown_view, search_view, settings_panel, sidebar, status_bar, tab_bar,
+    title_bar, toast, welcome,
 };
 use crate::widgets;
 
@@ -32,6 +32,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     let gutter_marks = editor.gutter_marks.clone();
     let pending_revert_line = editor.pending_revert_line;
     let problem_lens_enabled = state.problem_lens_enabled;
+    let show_line_numbers = state.show_line_numbers;
     let font_size = state.editor_font_size;
     let scroll_offset = editor.scroll_offset;
     let max_line_chars = editor.max_line_chars();
@@ -51,6 +52,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             gutter_marks: gutter_marks.clone(),
             pending_revert_line,
             problem_lens_enabled,
+            show_line_numbers,
             font_size,
             find_matches: find_matches.clone(),
             find_current,
@@ -243,6 +245,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
 
     let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
     layers.extend(completions::view(state, p));
+    layers.extend(hover_popup::view(state, p));
     layers.extend(command_palette::view(state));
     layers.extend(settings_panel::view(state));
     layers.extend(tab_bar::overflow_menu(state, p));

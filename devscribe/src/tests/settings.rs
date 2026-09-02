@@ -79,6 +79,8 @@ fn sample_settings() -> Settings {
         lsp_enabled: false,
         chat_mode: ChatMode::Collapsed,
         chat_panel_width: 420.0,
+        tab_size: 2,
+        show_line_numbers: false,
     }
 }
 

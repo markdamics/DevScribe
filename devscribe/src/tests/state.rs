@@ -2309,7 +2309,7 @@ fn tab_block_indents_a_multi_line_selection_instead_of_replacing_it() {
     editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
     editor.cursor = CursorPos { line: 2, col: 0 };
 
-    editor.indent();
+    editor.indent(4);
 
     assert_eq!(
         editor.document.text().to_string(),
@@ -2327,7 +2327,7 @@ fn tab_indents_rather_than_replaces_even_a_single_line_selection() {
     editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
     editor.cursor = CursorPos { line: 0, col: 3 };
 
-    editor.indent();
+    editor.indent(4);
 
     assert_eq!(editor.document.text().to_string(), "    abc");
 }
@@ -2337,9 +2337,29 @@ fn tab_with_no_selection_inserts_four_spaces_at_the_cursor() {
     let mut editor = EditorState::new(Document::from_str("ab"), PathBuf::from("t.txt"));
     editor.cursor = CursorPos { line: 0, col: 1 };
 
-    editor.indent();
+    editor.indent(4);
 
     assert_eq!(editor.document.text().to_string(), "a    b");
+}
+
+#[test]
+fn tab_with_no_selection_honors_a_custom_tab_size() {
+    let mut editor = EditorState::new(Document::from_str("ab"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 1 };
+
+    editor.indent(2);
+
+    assert_eq!(editor.document.text().to_string(), "a  b");
+}
+
+#[test]
+fn shift_tab_dedents_by_a_custom_tab_size_but_never_more_than_that() {
+    let mut editor = EditorState::new(Document::from_str("      a\n"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 0 };
+
+    assert!(editor.dedent(2));
+
+    assert_eq!(editor.document.text().to_string(), "    a\n", "only two of the six leading spaces should be removed");
 }
 
 #[test]
@@ -2348,7 +2368,7 @@ fn shift_tab_dedents_every_selected_line_by_one_level() {
     editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
     editor.cursor = CursorPos { line: 2, col: 0 };
 
-    assert!(editor.dedent());
+    assert!(editor.dedent(4));
     assert_eq!(
         editor.document.text().to_string(),
         "a\nb\nc\n",
@@ -2362,7 +2382,7 @@ fn shift_tab_on_lines_with_no_leading_whitespace_is_a_no_op() {
     editor.insert_text("x");
     assert!(editor.undo());
 
-    assert!(!editor.dedent(), "nothing to remove");
+    assert!(!editor.dedent(4), "nothing to remove");
     assert_eq!(editor.redo_stack.len(), 1, "an inert Shift+Tab must not have discarded the pending redo");
 }
 
@@ -2668,4 +2688,212 @@ fn scroll_cursor_into_view_is_a_no_op_when_already_visible() {
     let editor = find_editor(&state, &files.a).unwrap();
     assert_eq!(editor.scroll_offset_x, 0.0);
     assert_eq!(editor.scroll_offset, 0.0);
+}
+
+fn completion_item(label: &str) -> CompletionItem {
+    CompletionItem { label: label.to_string(), ..Default::default() }
+}
+
+#[test]
+fn set_completions_shows_the_full_response_before_anything_is_typed() {
+    let mut editor = EditorState::new(Document::from_str("foo.\n"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 4 };
+    editor.completion_anchor = CursorPos { line: 0, col: 4 };
+
+    editor.set_completions(vec![completion_item("close"), completion_item("open")]);
+
+    assert_eq!(editor.completions.as_ref().map(Vec::len), Some(2));
+    assert!(editor.completions_active());
+}
+
+#[test]
+fn set_completions_with_an_empty_response_closes_the_session_outright() {
+    let mut editor = EditorState::new(Document::from_str("foo.\n"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 4 };
+    editor.completion_anchor = CursorPos { line: 0, col: 4 };
+
+    editor.set_completions(vec![]);
+
+    assert!(editor.completions.is_none());
+    assert!(!editor.completions_active());
+}
+
+#[test]
+fn refilter_completions_narrows_matches_as_the_user_types() {
+    let mut editor = EditorState::new(Document::from_str("foo.\n"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 4 };
+    editor.completion_anchor = CursorPos { line: 0, col: 4 };
+    editor.set_completions(vec![completion_item("close"), completion_item("collect"), completion_item("open")]);
+
+    editor.insert_text("cl");
+    editor.refilter_completions();
+
+    let labels: Vec<&str> = editor.completions.as_ref().unwrap().iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(labels, vec!["close", "collect"], "only items matching the typed prefix remain, best match first");
+}
+
+#[test]
+fn refilter_completions_closes_the_session_once_the_cursor_backs_up_past_the_anchor() {
+    let mut editor = EditorState::new(Document::from_str("foo.\n"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 4 };
+    editor.completion_anchor = CursorPos { line: 0, col: 4 };
+    editor.set_completions(vec![completion_item("close")]);
+
+    // Simulates backspacing away the trigger `.` itself.
+    editor.cursor = CursorPos { line: 0, col: 3 };
+    editor.refilter_completions();
+
+    assert!(editor.completions.is_none());
+    assert!(!editor.completions_active(), "the whole session must be discarded, not just hidden");
+}
+
+#[test]
+fn refilter_completions_recovers_after_backspacing_away_a_non_matching_prefix() {
+    let mut editor = EditorState::new(Document::from_str("foo.\n"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 4 };
+    editor.completion_anchor = CursorPos { line: 0, col: 4 };
+    editor.set_completions(vec![completion_item("close")]);
+
+    editor.insert_text("z");
+    editor.refilter_completions();
+    assert!(editor.completions.is_none(), "\"z\" matches nothing in the list");
+    assert!(editor.completions_active(), "the session survives so a Backspace can recover it");
+
+    assert!(editor.backspace());
+    editor.refilter_completions();
+    assert!(editor.completions.is_some(), "back to a matching prefix must bring the popup back without a fresh request");
+}
+
+#[test]
+fn close_completions_discards_the_full_response_too() {
+    let mut editor = EditorState::new(Document::from_str("foo.\n"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 4 };
+    editor.completion_anchor = CursorPos { line: 0, col: 4 };
+    editor.set_completions(vec![completion_item("close")]);
+
+    editor.close_completions();
+
+    assert!(editor.completions.is_none());
+    assert!(!editor.completions_active());
+    assert_eq!(editor.completion_selected, 0);
+}
+
+#[test]
+fn begin_snippet_selects_the_first_placeholder() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+    editor.insert_text("[aa][bb]");
+
+    editor.begin_snippet(vec![(1, 3), (5, 7)]);
+
+    assert_eq!(editor.selection(), Some((1, 3)), "the first stop's default text must already be selected");
+    assert!(editor.snippet_active());
+}
+
+#[test]
+fn begin_snippet_with_a_single_stop_places_the_cursor_without_starting_a_tab_walk() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+    editor.insert_text("foo()");
+
+    editor.begin_snippet(vec![(4, 4)]);
+
+    assert!(editor.selection().is_none(), "a zero-width stop is a cursor position, not a selection");
+    assert_eq!(editor.cursor, editor.document.line_col(4).into());
+    assert!(!editor.snippet_active(), "nothing to Tab between with only one stop");
+}
+
+#[test]
+fn advance_snippet_jumps_through_stops_and_rebases_later_ones_after_a_retype() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+    editor.insert_text("[aa][bb]");
+    editor.begin_snippet(vec![(1, 3), (5, 7)]);
+    assert_eq!(editor.selection(), Some((1, 3)));
+
+    // Retype the 2-char placeholder "aa" with the 1-char "x" — everything
+    // after it must shift left by exactly 1, not stay at its original spot.
+    editor.insert_text("x");
+    assert_eq!(editor.document.text().to_string(), "[x][bb]");
+
+    assert!(editor.advance_snippet(), "Tab must consume and move to the next stop");
+    assert_eq!(editor.selection(), Some((4, 6)), "the second stop must be rebased by the retype's length delta");
+    assert_eq!(editor.document.text().slice(4..6).to_string(), "bb");
+
+    assert!(!editor.advance_snippet(), "there is no third stop to jump to");
+    assert!(!editor.snippet_active(), "the walk must end once every stop has been visited");
+}
+
+#[test]
+fn advance_snippet_with_no_active_walk_is_a_no_op() {
+    let mut editor = EditorState::new(Document::from_str("abc"), PathBuf::from("t.rs"));
+    assert!(!editor.advance_snippet());
+}
+
+#[test]
+fn close_snippet_ends_the_walk_without_touching_the_buffer() {
+    let mut editor = EditorState::new(Document::from_str(""), PathBuf::from("t.rs"));
+    editor.insert_text("[aa][bb]");
+    editor.begin_snippet(vec![(1, 3), (5, 7)]);
+
+    editor.close_snippet();
+
+    assert!(!editor.snippet_active());
+    assert!(!editor.advance_snippet(), "a closed walk must not still be jumpable");
+    assert_eq!(editor.document.text().to_string(), "[aa][bb]");
+}
+
+#[test]
+fn completion_select_expands_a_snippet_with_no_literal_dollar_syntax_left_in_the_buffer() {
+    let files = TempFiles::new("snippet-select");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+
+    {
+        let editor = find_editor_mut(&mut state, &path).unwrap();
+        editor.completion_anchor = editor.cursor;
+        editor.set_completions(vec![CompletionItem {
+            label: "fn".into(),
+            insert_text: Some("fn ${1:name}() {\n    $0\n}".into()),
+            insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }]);
+    }
+
+    let _ = update(&mut state, Message::CompletionSelect);
+
+    let editor = find_editor(&state, &path).unwrap();
+    let text = editor.document.text().to_string();
+    assert!(!text.contains('$'), "no literal snippet syntax must land in the buffer: {text:?}");
+    assert!(text.contains("fn name() {"), "the snippet's plain text must be inserted: {text:?}");
+    assert_eq!(
+        editor.selection().map(|(s, e)| editor.document.text().slice(s..e).to_string()),
+        Some("name".to_string()),
+        "the first placeholder must already be selected"
+    );
+    assert!(editor.snippet_active(), "a snippet with more than one stop must start a Tab walk");
+
+    let _ = update(&mut state, Message::EditorIndent);
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert!(editor.selection().is_none(), "$0 is a bare cursor position, not a selection");
+    assert!(!editor.snippet_active(), "the walk must end once $0 (the last stop) is reached");
+}
+
+#[test]
+fn completion_select_inserts_plain_text_items_verbatim() {
+    let files = TempFiles::new("plain-select");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+
+    {
+        let editor = find_editor_mut(&mut state, &path).unwrap();
+        editor.completion_anchor = editor.cursor;
+        editor.set_completions(vec![completion_item("collect")]);
+    }
+
+    let _ = update(&mut state, Message::CompletionSelect);
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert!(editor.document.text().to_string().contains("collect"));
+    assert!(!editor.snippet_active(), "a plain-text item must never start a snippet Tab walk");
 }

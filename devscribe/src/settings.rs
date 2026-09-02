@@ -1,6 +1,7 @@
 //! Persisted app-level settings: every value the Settings panel exposes —
-//! theme mode + accent, chrome density, UI/editor font size, and the
-//! Explorer/Editor/Toolchains toggles — in one JSON file under
+//! theme mode + accent, chrome density, UI/editor font size, tab size,
+//! line-number visibility, and the Explorer/Editor/Toolchains toggles — in
+//! one JSON file under
 //! `~/.config/devscribe/`, loaded once at startup, best-effort on write (a
 //! failure here is never a hard error — the app just falls back to
 //! defaults). `state.rs`'s `persist_settings` is the single place any of
@@ -29,6 +30,8 @@ pub struct Settings {
     pub lsp_enabled: bool,
     pub chat_mode: ChatMode,
     pub chat_panel_width: f32,
+    pub tab_size: u8,
+    pub show_line_numbers: bool,
 }
 
 impl Default for Settings {
@@ -54,6 +57,8 @@ impl Default for Settings {
             // `ChatToggle` press is what actually shows it, as a tab.
             chat_mode: ChatMode::Closed,
             chat_panel_width: crate::state::CHAT_DEFAULT_WIDTH,
+            tab_size: crate::state::TAB_SIZE_DEFAULT,
+            show_line_numbers: true,
         }
     }
 }
@@ -93,6 +98,10 @@ struct SettingsFile {
     chat_mode: String,
     #[serde(default = "default_chat_panel_width")]
     chat_panel_width: f32,
+    #[serde(default = "default_tab_size")]
+    tab_size: u8,
+    #[serde(default = "default_true")]
+    show_line_numbers: bool,
 }
 
 fn default_true() -> bool {
@@ -109,6 +118,10 @@ fn default_editor_font_size() -> f32 {
 
 fn default_chat_panel_width() -> f32 {
     crate::state::CHAT_DEFAULT_WIDTH
+}
+
+fn default_tab_size() -> u8 {
+    crate::state::TAB_SIZE_DEFAULT
 }
 
 fn store_path() -> Option<PathBuf> {
@@ -197,6 +210,8 @@ fn load_from(path: &Path) -> Option<Settings> {
         lsp_enabled: file.lsp_enabled,
         chat_mode: chat_mode_from_key(&file.chat_mode).unwrap_or(defaults.chat_mode),
         chat_panel_width: file.chat_panel_width,
+        tab_size: file.tab_size,
+        show_line_numbers: file.show_line_numbers,
     })
 }
 
@@ -229,6 +244,8 @@ fn save_to(path: &Path, settings: &Settings) {
         lsp_enabled: settings.lsp_enabled,
         chat_mode: chat_mode_key(settings.chat_mode).to_string(),
         chat_panel_width: settings.chat_panel_width,
+        tab_size: settings.tab_size,
+        show_line_numbers: settings.show_line_numbers,
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(path, json);

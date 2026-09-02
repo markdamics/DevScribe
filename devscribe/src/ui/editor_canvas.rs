@@ -47,6 +47,10 @@ pub struct EditorCanvas {
     /// Toggled from the settings panel. Only hides the inline `// message`
     /// annotation — the wavy underline stays either way.
     pub problem_lens_enabled: bool,
+    /// Toggled from the settings panel. Only hides the gutter's line-number
+    /// digits — the gutter itself (git-diff marks, revert clicks) still
+    /// works either way, and an armed line's "Revert" prompt still shows.
+    pub show_line_numbers: bool,
     /// Set from the settings panel's font-size stepper.
     pub font_size: f32,
     /// In-file find (Ctrl+F) match ranges, as absolute char ranges — same
@@ -77,6 +81,11 @@ pub struct CanvasState {
     /// 1 = plain click, 2 = double (select word), 3 = triple (select line),
     /// wrapping back to 1 on a fourth same-cell click.
     click_streak: u8,
+    /// The `(line, col)` the mouse was last resting over — lets hover
+    /// tracking publish `Message::EditorHoverMove` only on an actual cell
+    /// change, not on every sub-pixel `CursorMoved` a stationary mouse can
+    /// still generate.
+    hover_cell: Option<(usize, usize)>,
 }
 
 const CLICK_STREAK_WINDOW: Duration = Duration::from_millis(450);
@@ -318,6 +327,30 @@ impl canvas::Program<Message> for EditorCanvas {
                 let (line, col) = self.hit_test(position);
                 Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true }).and_capture())
             }
+            // Passive hover tracking (dwell-based `textDocument/hover`) —
+            // only published on an actual cell change, so a stationary
+            // mouse's sub-pixel `CursorMoved` noise doesn't restart the
+            // dwell timer or force a `view()` rebuild every frame.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if !state.dragging => {
+                match cursor.position_in(bounds) {
+                    Some(position) => {
+                        let cell = self.hit_test(position);
+                        if state.hover_cell == Some(cell) {
+                            None
+                        } else {
+                            state.hover_cell = Some(cell);
+                            Some(canvas::Action::publish(Message::EditorHoverMove {
+                                line: cell.0,
+                                col: cell.1,
+                            }))
+                        }
+                    }
+                    None if state.hover_cell.take().is_some() => {
+                        Some(canvas::Action::publish(Message::EditorHoverLeave))
+                    }
+                    None => None,
+                }
+            }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
                 None
@@ -558,24 +591,28 @@ impl canvas::Program<Message> for EditorCanvas {
             // Armed lines swap their line number for a "Revert" prompt —
             // the same marker cell doubles as the confirm button a second
             // click on it fires (`update()`), so labeling it is what makes
-            // that second click legible rather than a guess.
-            frame.fill_text(Text {
-                content: if armed { "Revert".to_string() } else { (line + 1).to_string() },
-                position: Point::new(GUTTER_WIDTH - if armed { 4.0 } else { 14.0 }, y),
-                color: if armed {
-                    color(p.status_danger)
-                } else if is_cursor_line {
-                    color(p.text_strong)
-                } else {
-                    tint(p.text_muted, 0.6)
-                },
-                size: Pixels(if armed { 10.0 } else { 11.0 }),
-                line_height: LineHeight::Absolute(Pixels(line_height)),
-                font: if armed { fonts::sans(iced::font::Weight::Medium) } else { mono },
-                align_x: Alignment::Right,
-                align_y: Vertical::Top,
-                ..Text::default()
-            });
+            // that second click legible rather than a guess. This still
+            // shows with `show_line_numbers` off: it's a pending action, not
+            // a line number.
+            if armed || self.show_line_numbers {
+                frame.fill_text(Text {
+                    content: if armed { "Revert".to_string() } else { (line + 1).to_string() },
+                    position: Point::new(GUTTER_WIDTH - if armed { 4.0 } else { 14.0 }, y),
+                    color: if armed {
+                        color(p.status_danger)
+                    } else if is_cursor_line {
+                        color(p.text_strong)
+                    } else {
+                        tint(p.text_muted, 0.6)
+                    },
+                    size: Pixels(if armed { 10.0 } else { 11.0 }),
+                    line_height: LineHeight::Absolute(Pixels(line_height)),
+                    font: if armed { fonts::sans(iced::font::Weight::Medium) } else { mono },
+                    align_x: Alignment::Right,
+                    align_y: Vertical::Top,
+                    ..Text::default()
+                });
+            }
 
             // Only the columns that fit on screen — see `max_cols`.
             let text = self.document.line_text_capped(line, max_cols);

@@ -7,6 +7,7 @@ pub mod diff_view;
 pub mod editor_canvas;
 pub mod find_bar;
 pub mod flash;
+pub mod hover_popup;
 pub mod json_view;
 pub mod logo_mark;
 pub mod markdown_view;
