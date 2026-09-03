@@ -34,6 +34,29 @@ impl Rgba {
         let b = (hex & 0xff) as f32 / 255.0;
         Self { r, g, b, a }
     }
+
+    /// From 8-bit `(r, g, b)` components, e.g. the custom accent color
+    /// picker's own RGB sliders (roadmap item 11) — same value space as
+    /// `hex`, just not packed into one `u32` since the picker keeps its
+    /// three channels separate.
+    pub fn from_rgb8(r: u8, g: u8, b: u8) -> Self {
+        Self { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
+    }
+
+    /// Linear interpolation toward `other`, `t` in `0.0..=1.0` — the custom
+    /// accent ramp's only color math (`ramp_from_rgb`) and the high-contrast
+    /// post-pass's (`apply_high_contrast`).
+    fn lerp(self, other: Rgba, t: f32) -> Rgba {
+        Rgba {
+            r: self.r + (other.r - self.r) * t,
+            g: self.g + (other.g - self.g) * t,
+            b: self.b + (other.b - self.b) * t,
+            a: self.a + (other.a - self.a) * t,
+        }
+    }
+
+    pub const WHITE: Rgba = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+    pub const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 }
 
 /// `--bg-canvas`/`--bg-base` base — dark ("Yoru") or light ("Asa").
@@ -129,6 +152,36 @@ const fn ramp(accent: Accent) -> Ramp {
     }
 }
 
+/// Packs an `Rgba` (each channel `0.0..=1.0`) back into a `0xRRGGBB` `u32` —
+/// `ramp_from_rgb`'s only reason to exist is that `Ramp` stores its steps
+/// packed this way (so `palette`'s `Rgba::hex(r.a400)` calls stay unchanged
+/// regardless of which kind of `Ramp` produced them).
+fn pack_rgb(c: Rgba) -> u32 {
+    let r = (c.r.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let g = (c.g.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let b = (c.b.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (r << 16) | (g << 8) | b
+}
+
+/// Derives a 4-step ramp from a single custom accent color (roadmap item
+/// 11's color picker) — there's no hand-tuned `Ramp` for an arbitrary RGB
+/// the way every built-in `Accent` has one, so this generates one instead:
+/// the picked color sits at `a500` (the ramp's own visual "base," per
+/// `ramp()`'s naming), lightened by mixing toward white for the two lighter
+/// steps and darkened by mixing toward black for `a600`. Simple linear
+/// mixing rather than a real HSL-space adjustment — good enough for a ramp
+/// that only ever needs "noticeably lighter/darker," not perceptually
+/// uniform steps.
+fn ramp_from_rgb(rgb: (u8, u8, u8)) -> Ramp {
+    let base = Rgba::from_rgb8(rgb.0, rgb.1, rgb.2);
+    Ramp {
+        a300: pack_rgb(base.lerp(Rgba::WHITE, 0.55)),
+        a400: pack_rgb(base.lerp(Rgba::WHITE, 0.25)),
+        a500: pack_rgb(base),
+        a600: pack_rgb(base.lerp(Rgba::BLACK, 0.30)),
+    }
+}
+
 /// One theme's full semantic color set (`colors.css`'s `:root` /
 /// `[data-theme="light"]` blocks, with the accent-scope overrides from
 /// `accents.css` folded in).
@@ -187,7 +240,42 @@ pub struct Palette {
 }
 
 pub const fn palette(mode: ThemeMode, accent: Accent) -> Palette {
-    let r = ramp(accent);
+    palette_from_ramp(mode, ramp(accent))
+}
+
+/// `palette`, but for a custom accent color (roadmap item 11) instead of a
+/// built-in `Accent` preset — `custom` overrides `accent` entirely when
+/// `Some`, same "the override wins outright, not blended with the preset"
+/// relationship `EditorState::set_language`'s override has with a file's
+/// real extension.
+pub fn palette_custom(mode: ThemeMode, accent: Accent, custom: Option<(u8, u8, u8)>) -> Palette {
+    let r = match custom {
+        Some(rgb) => ramp_from_rgb(rgb),
+        None => ramp(accent),
+    };
+    palette_from_ramp(mode, r)
+}
+
+/// Boosts `p`'s text/border contrast (roadmap item 11's "High Contrast"
+/// toggle) — pulls the low-contrast tokens (muted/faint text, hairline/
+/// strong/focus borders) most of the way toward `text_strong`, and makes
+/// `border_hairline` fully opaque (it's semi-transparent in every built-in
+/// palette, which is exactly the kind of low-contrast chrome this toggle is
+/// for). Leaves `bg`/`surface`/`accent`/`status`/`syntax` tokens alone —
+/// those already carry real hue contrast against each other, unlike text
+/// and hairlines, which lean on *opacity* for their hierarchy in the
+/// built-in palettes and so are what actually vanishes for low-contrast
+/// vision.
+pub fn apply_high_contrast(mut p: Palette) -> Palette {
+    p.text_muted = p.text_muted.lerp(p.text_strong, 0.55);
+    p.text_faint = p.text_faint.lerp(p.text_strong, 0.55);
+    p.border_hairline = Rgba { a: 1.0, ..p.border_hairline.lerp(p.text_strong, 0.35) };
+    p.border_strong = p.border_strong.lerp(p.text_strong, 0.35);
+    p.border_focus = p.border_focus.lerp(p.text_strong, 0.2);
+    p
+}
+
+const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
     match mode {
         ThemeMode::Dark => Palette {
             bg_canvas: Rgba::hex(0x04060A),

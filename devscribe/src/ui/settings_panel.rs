@@ -14,9 +14,9 @@
 //!
 //! Switch rows otherwise carry the mockup's own title + description copy
 //! verbatim — see `toggle_row`.
-use devscribe_core::theme::{Accent, Palette, ThemeMode};
+use devscribe_core::theme::{Accent, Palette, Rgba, ThemeMode};
 use iced::font::Weight;
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, slider, text, Space};
 use iced::{Alignment, Border, Color, Element, Length};
 
 use devscribe_core::lsp::LspLanguage;
@@ -26,9 +26,9 @@ use crate::density::Density;
 use crate::fonts;
 use crate::server_install;
 use crate::state::{
-    self, Message, SettingsCategory, State, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    EDITOR_FONT_SIZE_STEP, TAB_SIZE_MAX, TAB_SIZE_MIN, TAB_SIZE_STEP, UI_FONT_SCALE_MAX,
-    UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
+    self, Message, SettingsCategory, State, ThemePreview, EDITOR_FONT_SIZE_MAX,
+    EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_STEP, TAB_SIZE_MAX, TAB_SIZE_MIN, TAB_SIZE_STEP,
+    UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
 };
 use crate::widgets;
 
@@ -130,12 +130,20 @@ fn ui_scale_row(state: &State, p: Palette) -> Element<'static, Message> {
 }
 
 /// Dark/Light toggle (2 buttons) — replaces the old ten-named-theme grid.
+/// Hovering either button live-previews it app-wide (roadmap item 11)
+/// before `on_press` actually commits it.
 fn theme_mode_row(state: &State, p: Palette) -> Element<'static, Message> {
     let buttons: Vec<Element<'static, Message>> = ThemeMode::ALL
         .into_iter()
         .map(|mode| {
             let active = state.theme_mode == mode;
-            button(
+            let preview = ThemePreview {
+                theme_mode: mode,
+                accent: state.accent,
+                custom_accent: state.custom_accent,
+                high_contrast: state.high_contrast,
+            };
+            let btn = button(
                 text(mode.label())
                     .font(fonts::mono(Weight::Medium))
                     .size(crate::text_scale::px(13.0))
@@ -161,8 +169,8 @@ fn theme_mode_row(state: &State, p: Palette) -> Element<'static, Message> {
                     },
                     ..button::Style::default()
                 }
-            })
-            .into()
+            });
+            mouse_area(btn).on_enter(Message::PreviewTheme(preview)).on_exit(Message::ClearThemePreview).into()
         })
         .collect();
 
@@ -178,9 +186,15 @@ fn accent_row(state: &State, p: Palette) -> Element<'static, Message> {
             let buttons: Vec<Element<'static, Message>> = chunk
                 .iter()
                 .map(|&accent| {
-                    let active = state.accent == accent;
+                    let active = state.accent == accent && state.custom_accent.is_none();
                     let swatch = devscribe_core::theme::palette(state.theme_mode, accent).accent_solid;
-                    button(
+                    let preview = ThemePreview {
+                        theme_mode: state.theme_mode,
+                        accent,
+                        custom_accent: None,
+                        high_contrast: state.high_contrast,
+                    };
+                    let btn = button(
                         row![
                             widgets::dot(color(swatch), 6.0),
                             text(accent.label())
@@ -211,8 +225,8 @@ fn accent_row(state: &State, p: Palette) -> Element<'static, Message> {
                             },
                             ..button::Style::default()
                         }
-                    })
-                    .into()
+                    });
+                    mouse_area(btn).on_enter(Message::PreviewTheme(preview)).on_exit(Message::ClearThemePreview).into()
                 })
                 .collect();
             row(buttons).spacing(8.0).into()
@@ -220,6 +234,104 @@ fn accent_row(state: &State, p: Palette) -> Element<'static, Message> {
         .collect();
 
     column(rows).spacing(8.0).into()
+}
+
+/// One RGB channel's labeled slider (0..=255) — dragging it fires
+/// `Message::AdjustCustomAccentDraft` with the other two channels held at
+/// their current draft value, live-previewing app-wide as it moves
+/// (roadmap item 11).
+fn rgb_slider_row(label: &'static str, draft: (u8, u8, u8), channel: u8, p: Palette) -> Element<'static, Message> {
+    let value = match channel {
+        0 => draft.0,
+        1 => draft.1,
+        _ => draft.2,
+    };
+    row![
+        text(label).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(12.0)).color(color(p.text_muted)).width(Length::Fixed(14.0)),
+        slider(0..=255, value, move |v| {
+            let next = match channel {
+                0 => (v, draft.1, draft.2),
+                1 => (draft.0, v, draft.2),
+                _ => (draft.0, draft.1, v),
+            };
+            Message::AdjustCustomAccentDraft(next.0, next.1, next.2)
+        })
+        .width(Length::Fill)
+        .style(move |_theme, _status| iced::widget::slider::Style {
+            rail: iced::widget::slider::Rail {
+                backgrounds: (color(p.accent_solid).into(), color(p.surface_raised).into()),
+                width: 4.0,
+                border: Border { color: color(p.border_hairline), width: 1.0, radius: 2.0.into() },
+            },
+            handle: iced::widget::slider::Handle {
+                shape: iced::widget::slider::HandleShape::Circle { radius: 7.0 },
+                background: color(p.bg_base).into(),
+                border_width: 1.5,
+                border_color: color(p.accent_solid),
+            },
+        }),
+        text(value.to_string()).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(12.0)).color(color(p.text_muted)).width(Length::Fixed(28.0)),
+    ]
+    .spacing(8.0)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The custom accent color picker (roadmap item 11) — three RGB sliders
+/// live-previewing app-wide as they're dragged, a swatch showing the
+/// draft color, and "Apply"/"Reset to preset" actions. Distinct from
+/// `accent_row`'s fixed presets above it — this is the "not just presets"
+/// half of the item.
+fn custom_accent_picker(state: &State, p: Palette) -> Element<'static, Message> {
+    let draft = state.custom_accent_draft;
+    let swatch_color = Rgba::from_rgb8(draft.0, draft.1, draft.2);
+
+    let swatch = container(Space::new().width(Length::Fixed(28.0)).height(Length::Fixed(28.0)))
+        .style(move |_theme| container::Style {
+            background: Some(color(swatch_color).into()),
+            border: Border { color: color(p.border_hairline), width: 1.0, radius: 4.0.into() },
+            ..container::Style::default()
+        });
+
+    let active = state.custom_accent.is_some();
+    let apply = button(text("Apply").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.bg_base)))
+        .padding([5.0, 12.0])
+        .on_press(Message::SetCustomAccent(draft.0, draft.1, draft.2))
+        .style(move |_theme, _status| button::Style {
+            background: Some(color(p.accent_solid).into()),
+            border: Border { radius: 3.0.into(), ..Border::default() },
+            ..button::Style::default()
+        });
+
+    let reset = button(text("Reset to preset").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.text_muted)))
+        .padding([5.0, 12.0])
+        .on_press_maybe(active.then_some(Message::ClearCustomAccent))
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if hovered { Some(color(p.surface_hover).into()) } else { None },
+                border: Border { color: color(p.border_hairline), width: 1.0, radius: 3.0.into() },
+                ..button::Style::default()
+            }
+        });
+
+    column![
+        row![
+            swatch,
+            column![
+                rgb_slider_row("R", draft, 0, p),
+                rgb_slider_row("G", draft, 1, p),
+                rgb_slider_row("B", draft, 2, p),
+            ]
+            .spacing(4.0)
+            .width(Length::Fill),
+        ]
+        .spacing(10.0)
+        .align_y(Alignment::Center),
+        row![apply, reset].spacing(8.0),
+    ]
+    .spacing(10.0)
+    .into()
 }
 
 fn section_label(label: &'static str, p: Palette) -> Element<'static, Message> {
@@ -384,6 +496,18 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
     column![
         column![section_label("THEME", p), theme_mode_row(state, p)].spacing(8.0),
         column![section_label("ACCENT", p), accent_row(state, p)].spacing(8.0),
+        column![section_label("CUSTOM ACCENT", p), custom_accent_picker(state, p)].spacing(8.0),
+        column![
+            section_label("ACCESSIBILITY", p),
+            toggle_row(
+                "High Contrast",
+                "Stronger text and border contrast throughout the app",
+                state.high_contrast,
+                Message::ToggleHighContrast,
+                p,
+            ),
+        ]
+        .spacing(8.0),
         column![section_label("ROW DENSITY", p), density_row(state, p)].spacing(8.0),
         column![section_label("UI TEXT SIZE", p), ui_scale_row(state, p)].spacing(8.0),
         column![
@@ -739,7 +863,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if !state.settings_open {
         return None;
     }
-    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
+    let p = crate::state::active_palette(state);
 
     let header = row![
         text("SETTINGS")

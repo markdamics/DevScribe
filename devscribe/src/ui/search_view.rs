@@ -31,12 +31,13 @@ fn query_box(p: Palette, query: &str) -> Element<'static, Message> {
         .padding([8.0, 12.0])
         .on_input(Message::SearchQueryChanged)
         .on_submit(Message::SearchSubmit)
-        .style(move |_theme, _status| text_input::Style {
+        .style(move |_theme, status| text_input::Style {
             background: color(p.bg_canvas).into(),
-            border: Border {
-                color: color(p.border_hairline),
-                width: 1.5,
-                radius: 3.0.into(),
+            // Visible keyboard-focus indicator (accessibility pass, item 12).
+            border: if matches!(status, text_input::Status::Focused { .. }) {
+                Border { color: color(p.border_focus), width: 1.5, radius: 3.0.into() }
+            } else {
+                Border { color: color(p.border_hairline), width: 1.5, radius: 3.0.into() }
             },
             icon: color(p.text_muted),
             placeholder: color(p.text_muted),

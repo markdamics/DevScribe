@@ -72,6 +72,15 @@ pub enum LspStatus {
     Disabled,
 }
 
+/// One in-flight `$/progress` operation — see `State::lsp_progress`'s own
+/// doc comment.
+#[derive(Debug, Clone)]
+pub struct LspProgressEntry {
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<u32>,
+}
+
 impl LspStatus {
     /// (status-dot color, label) — the single source of truth both
     /// `status_bar.rs` and `settings_panel.rs`'s Toolchains/About content
@@ -139,6 +148,28 @@ pub struct GhostCompletion {
     pub item: serde_json::Value,
 }
 
+/// `textDocument/signatureHelp`'s response, kept as-is (the server already
+/// computes `active_signature`/`active_parameter` for the position it was
+/// asked about) — shown as a small popup above the cursor while typing a
+/// call's argument list. `anchor` is where the request was made for, the
+/// same staleness guard `completion_anchor` gives `LspEvent::Completions`.
+#[derive(Debug, Clone)]
+pub struct SignatureHelpState {
+    pub signatures: Vec<lsp::SignatureInformation>,
+    pub active_signature: usize,
+    pub active_parameter: Option<usize>,
+    pub anchor: CursorPos,
+}
+
+/// `(sort_text, label)` tuple used to order completion items that tie on
+/// fuzzy-match relevance — `sort_text` when the server bothered to set one
+/// (most rank by kind there: locals before globals, etc.), the label
+/// otherwise, with the label always appended second so items sharing one
+/// `sort_text` still land in a stable, readable order.
+fn completion_sort_key(item: &CompletionItem) -> (&str, &str) {
+    (item.sort_text.as_deref().unwrap_or(item.label.as_str()), item.label.as_str())
+}
+
 /// The diff panel's state for the current file, distinguishing the reasons
 /// a diff can be empty (worth showing differently) from an actual diff.
 #[derive(Debug, Clone, Default)]
@@ -176,6 +207,19 @@ pub struct FindState {
     /// Whether the replace row (`find_bar.rs`) is expanded below the find
     /// row. Toggled by the chevron button or Ctrl/Cmd+H.
     pub replace_open: bool,
+    /// Set while "Replace All" is asking the user to confirm how many
+    /// matches it's about to touch — `find_bar.rs` swaps the replace row's
+    /// buttons for a "Replace N matches? Yes/No" prompt instead of firing
+    /// the replacement immediately, since it's not undoable per-match the
+    /// way a single "Replace" is easy to eyeball first.
+    pub confirm_replace_all: bool,
+    /// Whether the "?" quick-help popover (find_bar.rs) is open.
+    pub help_open: bool,
+    /// Set by the most recent `find_step` exactly when it wrapped around
+    /// the start/end of `matches` — lets `find_bar.rs` show a "(wrapped)"
+    /// hint next to the "N of M" counter so hitting the boundary doesn't
+    /// read as the search being stuck.
+    pub just_wrapped: bool,
 }
 
 /// `Tab`-to-next-placeholder tracking for a snippet completion, from the
@@ -329,6 +373,17 @@ pub struct EditorState {
     /// See `GhostCompletion`'s own doc comment for why this doesn't attempt
     /// local prefix-narrowing the way `completions`/`completions_all` do.
     pub ghost_completion: Option<GhostCompletion>,
+    /// Active `textDocument/signatureHelp` popup, shown while typing a
+    /// call's argument list — independent of `completions`/`ghost_completion`
+    /// above; a signature-help popup and the dot-completion popup can be
+    /// showing at once (e.g. `foo(bar.|` — inside a call *and* right after a
+    /// dot), so this doesn't get cleared by the same triggers that toggle
+    /// those, only by `close_completions`'s broader "typing context changed"
+    /// triggers (clicks, cursor moves off the anchor line, etc).
+    pub signature_help: Option<SignatureHelpState>,
+    /// Cursor position the most recent signature-help request was sent for
+    /// — same staleness guard `completion_anchor` gives completions.
+    pub signature_help_anchor: CursorPos,
     /// `Tab`-to-next-placeholder state for a snippet completion still being
     /// filled in — see `begin_snippet`/`advance_snippet`. `None` once every
     /// stop has been visited, or the moment any non-typing action (a click,
@@ -499,6 +554,8 @@ impl EditorState {
             completion_selected: 0,
             completion_anchor: CursorPos::default(),
             ghost_completion: None,
+            signature_help: None,
+            signature_help_anchor: CursorPos::default(),
             active_snippet: None,
             hover_pending: None,
             hover_requested_for: None,
@@ -581,6 +638,24 @@ impl EditorState {
         self.reparse_markdown_with(text);
         self.tree = self.language.and_then(|lang| outline::parse(lang, text));
         self.recompute_max_line_chars();
+    }
+
+    /// The status bar's "Language Mode" picker (roadmap item 9) — overrides
+    /// what `language` this buffer highlights/outlines as, independent of
+    /// its real extension. Purely a display choice: LSP routing
+    /// (`is_lsp_language`/`active_lsp_language`) stays keyed off the file's
+    /// actual extension regardless, since the servers this app talks to are
+    /// matched by what a file really is on disk, not how it's being shown —
+    /// there's no `textDocument/didOpen` re-send here, and there shouldn't
+    /// be. Forces an immediate reparse rather than waiting for the next
+    /// edit's debounce, so the switch is visible the moment it's picked.
+    pub fn set_language(&mut self, language: Option<syntax::Language>) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        self.needs_reparse = true;
+        self.reparse_now();
     }
 
     /// The stack of enclosing scopes at the cursor, for the breadcrumb
@@ -782,6 +857,29 @@ impl EditorState {
         }
         let landing = (matches[0].start + replacement.chars().count()).min(self.document.text().len_chars());
         self.cursor = self.document.line_col(landing).into();
+        self.resync_after_edit();
+    }
+
+    /// The status bar EOL indicator's "Convert to LF/CRLF" action (roadmap
+    /// item 9) — rewrites every line terminator as one undo step. Goes
+    /// straight through `Document::convert_eol` rather than
+    /// `edit_insert`/`edit_remove` (unlike every other mutation here): a
+    /// terminator conversion touches every line at once, so there's no
+    /// single char range to describe, and `(line, col)` cursor positions
+    /// stay meaningful regardless — line terminators sit *after*
+    /// `line_len_chars`, never inside it, so no line's content or column
+    /// numbering shifts. `highlights` is cleared rather than shifted (it'd
+    /// otherwise point at stale byte offsets until the reparse `needs_reparse`
+    /// queues up actually lands) — a one-frame plain-text flash on an
+    /// operation that isn't performance-sensitive, in exchange for never
+    /// showing a misaligned highlight.
+    pub fn convert_eol(&mut self, target: Eol) {
+        if self.document.detect_eol() == target {
+            return;
+        }
+        self.record_undo_boundary(EditKind::Other);
+        self.document.convert_eol(target);
+        self.highlights = Rc::new(Vec::new());
         self.resync_after_edit();
     }
 
@@ -1520,7 +1618,9 @@ impl EditorState {
             return;
         }
         if cursor.col == anchor.col {
-            self.completions = Some(all.clone());
+            let mut items: Vec<CompletionItem> = all.clone();
+            items.sort_by(|a, b| completion_sort_key(a).cmp(&completion_sort_key(b)));
+            self.completions = Some(items);
             self.completion_selected = 0;
             return;
         }
@@ -1533,7 +1633,14 @@ impl EditorState {
                 crate::fuzzy::score(&prefix, text).map(|s| (s, item))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
+        // Best fuzzy match first; items tied on relevance fall back to the
+        // server's own preferred ordering (`sort_text`, when it bothered to
+        // set one — most servers rank by kind there, e.g. locals before
+        // globals) and finally to the label, so ties are still deterministic
+        // even against a server that never sets `sort_text`.
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| completion_sort_key(a.1).cmp(&completion_sort_key(b.1)))
+        });
         self.completions = if scored.is_empty() {
             None
         } else {
@@ -1692,6 +1799,45 @@ impl EditorState {
             return;
         }
         self.hover = text.map(|t| (requested, t));
+    }
+
+    /// Applies a `LspEvent::SignatureHelp` response, discarding it if the
+    /// cursor has since moved past the position it was requested for (same
+    /// staleness check `apply_hover_response` makes). An empty
+    /// `signatures` list closes the popup — the server saying "nothing
+    /// active here" is exactly what should happen right after `)` closes a
+    /// call.
+    pub fn apply_signature_help_response(
+        &mut self,
+        line: u32,
+        character: u32,
+        signatures: Vec<lsp::SignatureInformation>,
+        active_signature: Option<u32>,
+        active_parameter: Option<u32>,
+    ) {
+        let requested = self.signature_help_anchor;
+        if requested.line != line as usize {
+            return;
+        }
+        let line_text = self.document.line_text(requested.line);
+        if char_col_to_utf16_col(&line_text, requested.col) != character {
+            return;
+        }
+        if signatures.is_empty() {
+            self.signature_help = None;
+            return;
+        }
+        let active_signature = active_signature.unwrap_or(0) as usize;
+        let active_signature = active_signature.min(signatures.len().saturating_sub(1));
+        let active_parameter = active_parameter
+            .map(|p| p as usize)
+            .or_else(|| signatures[active_signature].active_parameter.map(|p| p as usize));
+        self.signature_help = Some(SignatureHelpState {
+            signatures,
+            active_signature,
+            active_parameter,
+            anchor: requested,
+        });
     }
 }
 
@@ -1980,7 +2126,13 @@ pub fn find_step(state: &mut State, delta: i32) -> iced::Task<Message> {
         return iced::Task::none();
     }
     let len = find.matches.len() as i32;
-    find.current = (find.current as i32 + delta).rem_euclid(len) as usize;
+    let next = (find.current as i32 + delta).rem_euclid(len) as usize;
+    find.just_wrapped = if delta > 0 {
+        next < find.current
+    } else {
+        next > find.current
+    };
+    find.current = next;
     let target = find.matches[find.current];
     let cursor: CursorPos = editor.document.line_col(target.start).into();
     editor.cursor = cursor;
@@ -2277,6 +2429,28 @@ pub fn active_editor(state: &State) -> Option<&EditorState> {
     find_editor(state, &active_file_path(state)?)
 }
 
+/// `(theme_mode, accent, custom_accent, high_contrast)` — `state.theme_preview`
+/// when the settings panel is live-previewing a change, else the committed
+/// settings. The single source every `active_palette` call (and so every
+/// `view()` in the app) reads, so a hovered swatch previews everywhere at
+/// once rather than just inside the settings panel itself (roadmap item 11).
+pub fn active_theme(state: &State) -> (ThemeMode, Accent, Option<(u8, u8, u8)>, bool) {
+    match state.theme_preview {
+        Some(preview) => (preview.theme_mode, preview.accent, preview.custom_accent, preview.high_contrast),
+        None => (state.theme_mode, state.accent, state.custom_accent, state.high_contrast),
+    }
+}
+
+/// The resolved `Palette` for whatever `active_theme` currently says —
+/// every `view()` function should call this rather than
+/// `devscribe_core::theme::palette(state.theme_mode, state.accent)`
+/// directly, or it won't pick up a live preview (roadmap item 11).
+pub fn active_palette(state: &State) -> theme::Palette {
+    let (mode, accent, custom, high_contrast) = active_theme(state);
+    let p = theme::palette_custom(mode, accent, custom);
+    if high_contrast { theme::apply_high_contrast(p) } else { p }
+}
+
 /// Every currently open `File` tab's path — used to replay `didOpen` for all
 /// of them once the LSP server becomes ready (it may become ready after
 /// files were already opened).
@@ -2417,6 +2591,46 @@ pub fn close_tab(state: &mut State, key: &TabKey) {
             .map(|t| t.key());
     }
     persist_session(state);
+}
+
+/// The Ctrl+Tab quick switcher's (roadmap item 2) candidate list, in the
+/// same order the tab bar itself renders them (`ui::tab_bar::view`): Chat
+/// first if it's pinned open, then every `open_tabs` entry. `Search` is
+/// deliberately excluded — it's a fixed entry point, not an "open tab" a
+/// user would be cycling back to.
+pub fn tab_switcher_entries(state: &State) -> Vec<TabKey> {
+    let mut entries = Vec::with_capacity(state.open_tabs.len() + 1);
+    if state.chat_tab_open {
+        entries.push(TabKey::Chat);
+    }
+    entries.extend(state.open_tabs.iter().map(|t| t.key()));
+    entries
+}
+
+/// Actually switches to `key` — shared by `ConfirmTabSwitcher` and a direct
+/// click on a switcher entry. Mirrors `Message::SelectOpenTab`'s and
+/// `Message::ChatOpenTab`'s own handling rather than calling them
+/// recursively (`update()` isn't set up for that), so any change to either
+/// needs to stay in sync with this.
+pub fn switch_to_tab(state: &mut State, key: &TabKey) -> iced::Task<Message> {
+    match key {
+        TabKey::Chat => {
+            state.chat_tab_open = true;
+            state.chat_mode = ChatMode::Closed;
+            state.active_tab = Some(TabKey::Chat);
+            state.chat_view_menu_open = false;
+            persist_settings(state);
+            persist_session(state);
+            focus_chat_input()
+        }
+        _ => {
+            if state.open_tabs.iter().any(|t| &t.key() == key) {
+                state.active_tab = Some(key.clone());
+                persist_session(state);
+            }
+            iced::Task::none()
+        }
+    }
 }
 
 /// Recomputes `path`'s diff against its `HEAD` version, if it's open.
@@ -2663,6 +2877,40 @@ pub fn maybe_trigger_completion(state: &mut State, path: &Path, text: &str) {
     }
     if let Some(editor) = find_editor_mut(state, path) {
         editor.completion_anchor = cursor;
+    }
+}
+
+/// Fires the LSP signature-help request that typing `(`, `,`, or `)` inside
+/// a call triggers — one request per keystroke rather than tracking paren
+/// depth client-side, same shape as `maybe_trigger_completion`. `)` is
+/// included so leaving a call gets a fresh (likely empty) response that
+/// closes the popup, rather than leaving the last argument list's signature
+/// stuck on screen.
+pub fn maybe_trigger_signature_help(state: &mut State, path: &Path, text: &str) {
+    if !matches!(state.lsp_status, LspStatus::Ready) || !matches!(text, "(" | "," | ")") {
+        return;
+    }
+    let Some(editor) = find_editor(state, path) else {
+        return;
+    };
+    let cursor = editor.cursor;
+    let line_text = editor.document.line_text(cursor.line);
+    let utf16_char = char_col_to_utf16_col(&line_text, cursor.col);
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    // Same reasoning as `maybe_trigger_completion`: flush the pending
+    // `didChange` for this keystroke first so the server sees it.
+    send_did_change_for(state, path);
+    if let Some(sender) = state.lsp_sender.as_mut() {
+        let _ = sender.try_send(LspCommand::SignatureHelp {
+            uri,
+            line: cursor.line as u32,
+            character: utf16_char,
+        });
+    }
+    if let Some(editor) = find_editor_mut(state, path) {
+        editor.signature_help_anchor = cursor;
     }
 }
 

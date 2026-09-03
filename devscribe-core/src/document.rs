@@ -1,5 +1,32 @@
 use ropey::Rope;
 
+/// A buffer's line-ending convention — for the status bar's EOL indicator
+/// (roadmap item 9). `open` never normalizes line endings (see
+/// `next_char_index`'s own doc comment on why CRLF is kept verbatim), so
+/// this is purely a read/convert affordance layered on top, not something
+/// the buffer tracks as separate state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eol {
+    Lf,
+    CrLf,
+    /// The buffer has both `\n` and `\r\n` line terminators — common right
+    /// after pasting content from elsewhere, or opening a file another
+    /// tool already left inconsistent. Shown as-is rather than silently
+    /// picked one way, so converting via `Document::convert_eol` is an
+    /// explicit choice, not a guess.
+    Mixed,
+}
+
+impl Eol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Eol::Lf => "LF",
+            Eol::CrLf => "CRLF",
+            Eol::Mixed => "Mixed",
+        }
+    }
+}
+
 /// A single open file's text buffer. Positions are `(line, column)` in
 /// `char`s, matching `ropey`'s indexing; byte offsets are derived on demand
 /// rather than stored, since `Rope` makes that conversion cheap.
@@ -219,6 +246,50 @@ impl Document {
             self.text.len_chars()
         };
         start..end
+    }
+
+    /// Scans every line terminator in the buffer to classify it as `Lf`,
+    /// `CrLf`, or `Mixed` — an empty buffer, or one with no line terminator
+    /// at all (a single unterminated line), reads as `Lf`, matching every
+    /// other editor's default for "nothing to detect yet".
+    pub fn detect_eol(&self) -> Eol {
+        let mut saw_lf = false;
+        let mut saw_crlf = false;
+        for line in self.text.lines() {
+            let len = line.len_chars();
+            if len == 0 {
+                continue;
+            }
+            if line.char(len - 1) != '\n' {
+                continue;
+            }
+            if len >= 2 && line.char(len - 2) == '\r' {
+                saw_crlf = true;
+            } else {
+                saw_lf = true;
+            }
+            if saw_lf && saw_crlf {
+                return Eol::Mixed;
+            }
+        }
+        if saw_crlf { Eol::CrLf } else { Eol::Lf }
+    }
+
+    /// Rewrites every line terminator in the buffer to `target`, as one
+    /// dirtying edit — the status bar EOL picker's "convert" action.
+    /// Rebuilds the whole buffer rather than patching terminators in place:
+    /// same "reparse/rebuild the whole thing rather than track incremental
+    /// edits" simplification the rest of this app leans on (see e.g.
+    /// `syntax`'s own module doc), and a line-ending conversion touches
+    /// every line anyway, so there's no cheaper partial update to make.
+    pub fn convert_eol(&mut self, target: Eol) {
+        let normalized = self.text.to_string().replace("\r\n", "\n");
+        let converted = match target {
+            Eol::Lf | Eol::Mixed => normalized,
+            Eol::CrLf => normalized.replace('\n', "\r\n"),
+        };
+        self.text = Rope::from_str(&converted);
+        self.dirty = true;
     }
 }
 

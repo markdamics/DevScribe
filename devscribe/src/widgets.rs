@@ -119,6 +119,40 @@ pub fn placeholder<'a, Message: 'a>(
     .into()
 }
 
+/// Wraps `content` (an icon-only control — a bare "\u{2715}"/"\u{2191}" glyph
+/// button, with no text label of its own) with a small hover tooltip naming
+/// what it does. iced 0.14 has no accessibility-tree/screen-reader API to
+/// hook into at all (no `accesskit` anywhere in this dependency tree), so
+/// this can't be a real ARIA-style hint for assistive tech — it's the
+/// closest working equivalent this framework actually offers: a visible,
+/// hoverable label for a control that otherwise has none, which is exactly
+/// the same information a screen reader's own accessible-name lookup would
+/// need if one were available (accessibility pass, item 12).
+pub fn tooltip<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: &'a str,
+    p: Palette,
+) -> Element<'a, Message> {
+    iced::widget::Tooltip::new(
+        content,
+        container(
+            text(label)
+                .font(fonts::mono(iced::font::Weight::Medium))
+                .size(crate::text_scale::px(12.0))
+                .color(color(p.text_strong)),
+        )
+        .padding([4.0, 8.0])
+        .style(move |_theme| container::Style {
+            background: Some(color(p.surface_raised).into()),
+            border: Border { color: color(p.border_hairline), width: 1.0, radius: 3.0.into() },
+            ..container::Style::default()
+        }),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .gap(6.0)
+    .into()
+}
+
 /// Shorthand for an unfilled rectangular border, e.g. panel dividers.
 #[allow(dead_code)]
 pub fn border_1(color: Color) -> Border {

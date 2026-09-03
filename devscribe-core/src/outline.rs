@@ -49,6 +49,21 @@ pub enum CrumbKind {
 pub struct Crumb {
     pub kind: CrumbKind,
     pub label: String,
+    /// The enclosing node's own start byte — for the breadcrumb strip's
+    /// "click to jump to this scope" (roadmap item 10): converted to a
+    /// `(line, col)` by the caller (`Document::line_col`, this crate has no
+    /// UI-side cursor type to return one in directly).
+    pub start_byte: usize,
+    /// A one-line signature/header for the breadcrumb strip's hover
+    /// tooltip (roadmap item 10) — the node's own source from its start up
+    /// to wherever its body begins (`fn foo(a: i32) -> i32`, `struct Foo`,
+    /// `impl Display for Point`), collapsed and capped the same way
+    /// `HeaderUpTo` labels already are. Falls back to `label` itself for a
+    /// node with no recognizable body field (rare: covers only the odd
+    /// grammar construct with no `body`/`consequence` field at all) or a
+    /// crumb whose `label` already *is* that computed header (every
+    /// control-flow crumb).
+    pub header: String,
 }
 
 /// Cap on a control-flow crumb's label — these have no real name to key
@@ -231,7 +246,8 @@ pub fn breadcrumbs_at(tree: &Tree, rope: &Rope, byte_offset: usize, language: La
         if let Some(landmark) = landmarks.iter().find(|l| l.node_kind == n.kind())
             && let Some(label) = resolve_label(&landmark.label, n, rope)
         {
-            crumbs.push(Crumb { kind: landmark.kind, label });
+            let header = node_header(n, rope).unwrap_or_else(|| label.clone());
+            crumbs.push(Crumb { kind: landmark.kind, label, start_byte: n.start_byte(), header });
         }
         node = n.parent();
     }
@@ -284,6 +300,28 @@ fn resolve_label(rule: &LabelRule, node: Node, rope: &Rope) -> Option<String> {
             Some(truncate_header(&header))
         }
     }
+}
+
+/// The node's own source from its start up to wherever its body begins —
+/// every landmark across every language wired here anchors its body on a
+/// `body` field, except `if`-family nodes (`consequence`), so trying both
+/// covers every landmark without needing a per-landmark field name. `None`
+/// for a node with neither field (a tuple/unit `struct` with no `{ ... }`
+/// body, say) — the caller falls back to the crumb's own `label` then,
+/// never a wrong or empty header.
+fn node_header(node: Node, rope: &Rope) -> Option<String> {
+    for field in ["body", "consequence"] {
+        let Some(anchor) = node.child_by_field_name(field) else { continue };
+        let end = anchor.start_byte();
+        let start = node.start_byte();
+        if end <= start {
+            continue;
+        }
+        if let Some(slice) = rope.get_byte_slice(start..end) {
+            return Some(truncate_header(&slice.to_string()));
+        }
+    }
+    None
 }
 
 /// Follows a C++ declarator's `declarator` field chain down to the actual

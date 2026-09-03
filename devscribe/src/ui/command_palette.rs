@@ -70,6 +70,16 @@ fn entry_row(
                     None
                 },
                 text_color: color(p.text_strong),
+                // The keyboard-selected row also gets a left accent bar,
+                // not just a background tint — a11y best practice ("don't
+                // convey state through color alone"), and the same visible-
+                // focus-indicator pass `text_input` fields got (accessibility
+                // pass, item 12).
+                border: if is_selected {
+                    Border { color: color(p.border_focus), width: 1.5, radius: 0.0.into() }
+                } else {
+                    Border::default()
+                },
                 ..button::Style::default()
             }
         })
@@ -80,7 +90,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if !state.palette_open {
         return None;
     }
-    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
+    let p = crate::state::active_palette(state);
 
     let entries = state::filtered_palette_entries(state);
     let selected = state.palette_selected.min(entries.len().saturating_sub(1));
@@ -128,12 +138,15 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         .padding([10.0, 12.0])
         .on_input(Message::PaletteQueryChanged)
         .on_submit(Message::PaletteExecute)
-        .style(move |_theme, _status| text_input::Style {
+        .style(move |_theme, status| text_input::Style {
             background: Color::TRANSPARENT.into(),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 0.0.into(),
+            // Visible keyboard-focus indicator (accessibility pass, item
+            // 12) — every `text_input` in this app used to render
+            // identically whether focused or not.
+            border: if matches!(status, text_input::Status::Focused { .. }) {
+                Border { color: color(p.border_focus), width: 1.5, radius: 0.0.into() }
+            } else {
+                Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() }
             },
             icon: color(p.text_muted),
             placeholder: color(p.text_muted),

@@ -12,9 +12,9 @@ use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguag
 use devscribe_core::outline;
 use devscribe_core::search::{self, SearchHit};
 use devscribe_core::syntax::{self, Span};
-use devscribe_core::theme::{Accent, ThemeMode};
+use devscribe_core::theme::{self, Accent, ThemeMode};
 use devscribe_core::watcher::{self, WatchEvent};
-use devscribe_core::Document;
+use devscribe_core::{Document, Eol};
 use iced::futures::channel::mpsc;
 use iced::keyboard;
 use iced::mouse;
@@ -174,9 +174,42 @@ pub struct PaletteEntry {
     pub action: PaletteAction,
 }
 
+/// A theme change being previewed, not yet committed — see
+/// `State::theme_preview`'s own doc comment. Every field mirrors a
+/// committed setting 1:1 and simply overrides it while `Some`
+/// (`active_theme` reads this first); nothing here is itself partial.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemePreview {
+    pub theme_mode: ThemeMode,
+    pub accent: Accent,
+    pub custom_accent: Option<(u8, u8, u8)>,
+    pub high_contrast: bool,
+}
+
 pub struct State {
     pub theme_mode: ThemeMode,
     pub accent: Accent,
+    /// See `settings::Settings::custom_accent`'s own doc comment.
+    pub custom_accent: Option<(u8, u8, u8)>,
+    /// See `settings::Settings::high_contrast`'s own doc comment.
+    pub high_contrast: bool,
+    /// The custom accent color picker's own RGB sliders (roadmap item 11)
+    /// — live, uncommitted draft values, seeded from `custom_accent` if one
+    /// was already set, else a reasonable starting color. Adjusting a
+    /// slider updates this *and* sets `theme_preview` so the whole app
+    /// reflects it live; nothing here becomes real until "Apply" sends
+    /// `Message::SetCustomAccent` with these same values.
+    pub custom_accent_draft: (u8, u8, u8),
+    /// A theme change the settings panel is showing a live preview of —
+    /// hovering a theme-mode/accent-preset/custom-color swatch, or dragging
+    /// its RGB sliders, sets this without touching the committed
+    /// `theme_mode`/`accent`/`custom_accent`/`high_contrast` fields above,
+    /// so the whole app (not just the settings panel itself) reflects the
+    /// hovered choice everywhere `active_theme`/`active_palette` is read —
+    /// then reverts the instant the preview ends (mouse leaves the swatch,
+    /// or the panel closes) with nothing to undo, since nothing was ever
+    /// committed. `None` outside of an active preview. Roadmap item 11.
+    pub theme_preview: Option<ThemePreview>,
     /// Every currently open tab, in the order they appear in the tab bar.
     pub open_tabs: Vec<OpenTab>,
     /// `None` only when `open_tabs` is empty.
@@ -218,6 +251,11 @@ pub struct State {
     /// the moment it was requested.
     pub chat_sessions: Vec<claude_agent::SessionSummary>,
     pub chat_sessions_open: bool,
+    /// The sessions picker's search box — filters `chat_sessions` by title,
+    /// case-insensitively. Cleared whenever the picker closes/reopens
+    /// (`Message::ChatToggleSessions`) so a stale filter never hides a
+    /// project's whole history behind a search term from last time.
+    pub chat_session_filter: String,
     /// The header's "View" popup — lists whichever of Docked/Tab/Collapsed
     /// the panel *isn't* currently presented as, same backdrop-close popup
     /// convention as `tab_bar::overflow_menu`. Closed automatically by
@@ -324,6 +362,15 @@ pub struct State {
     pub collapsed_dirs: HashSet<PathBuf>,
     pub caret_visible: bool,
     pub lsp_status: LspStatus,
+    /// In-flight `$/progress` operations the active language server has
+    /// reported (rust-analyzer's own "Indexing", "Fetching metadata", ...)
+    /// — keyed by the server's own token so a `WorkDoneProgress::End` for
+    /// one token clears only that entry, not every operation currently
+    /// running. Drives the status bar's progress indicator (visual-feedback
+    /// pass, item 8). Cleared outright at every `lsp_status` transition —
+    /// a respawn, install, or disable all invalidate whatever token space
+    /// a prior connection was tracking.
+    pub lsp_progress: std::collections::BTreeMap<String, LspProgressEntry>,
     lsp_sender: Option<mpsc::Sender<LspCommand>>,
     /// Off switches the LSP subscription off entirely (see `subscription`)
     /// rather than just ignoring its output — no language server process
@@ -368,6 +415,22 @@ pub struct State {
     /// every diagnostic across all open files. Toggled by clicking the
     /// status bar's Problems indicator — see `status_bar.rs`.
     pub problems_panel_open: bool,
+    /// `true` while the status bar's "Background Tasks" popover is open —
+    /// a roll-up of the language server's status/progress, the file
+    /// watcher, and git, for the visual-feedback pass (roadmap item 8).
+    /// Not persisted: it's a transient popover, same as `overflow_open`.
+    pub background_tasks_open: bool,
+    /// `true` while the status bar's EOL (LF/CRLF) picker popover is open
+    /// (roadmap item 9). Not persisted, same as `background_tasks_open`.
+    pub eol_picker_open: bool,
+    /// `true` while the status bar's language-mode picker popover is open
+    /// (roadmap item 9). Not persisted, same as `background_tasks_open`.
+    pub language_picker_open: bool,
+    /// `true` while the status bar's encoding info popover is open (roadmap
+    /// item 9) — `Document` only ever reads/writes UTF-8, so this is
+    /// informational rather than a real picker. Not persisted, same as
+    /// `background_tasks_open`.
+    pub encoding_info_open: bool,
     /// `true` while the Locations dock panel is open — populated by either
     /// "Go to Definition" (when the server names more than one candidate)
     /// or "Find All References", both landing in the same panel; see
@@ -474,6 +537,33 @@ pub struct State {
     /// after the tab closes, so two buffers can never end up with the same
     /// name/identity.
     next_untitled_id: u64,
+    /// `(hovered tab, when the hover started)` — drives the tab bar's hover
+    /// preview dwell timer (`TAB_PREVIEW_DWELL` in `ui::tab_bar`), the same
+    /// shape as `EditorState::hover_pending`. `None` whenever the mouse
+    /// isn't currently resting on a tab.
+    pub tab_hover: Option<(TabKey, Instant)>,
+    /// Non-`None` while the Ctrl+Tab quick switcher overlay (roadmap item 2)
+    /// is showing.
+    pub tab_switcher: Option<TabSwitcherState>,
+    /// `(hovered breadcrumb's index into the current crumb trail, when the
+    /// hover started)` — drives the breadcrumb strip's hover-context
+    /// tooltip dwell timer (roadmap item 10), same shape as `tab_hover`.
+    /// An index rather than an id: crumbs have no identity of their own
+    /// (they're recomputed fresh every `view()` from the cursor position),
+    /// but the index is stable for as long as the mouse stays over the same
+    /// segment, which is all a dwell timer needs.
+    pub breadcrumb_hover: Option<(usize, Instant)>,
+}
+
+/// A snapshot of the open tabs (in tab-bar order) taken the moment the
+/// Ctrl+Tab switcher opens, plus which entry is currently highlighted —
+/// further Ctrl+Tab/Ctrl+Shift+Tab presses just move `selected` through this
+/// same fixed list rather than re-deriving it (and potentially reordering
+/// mid-cycle) on every step.
+#[derive(Debug, Clone)]
+pub struct TabSwitcherState {
+    pub entries: Vec<TabKey>,
+    pub selected: usize,
 }
 
 const MAX_CLOSED_TABS: usize = 20;
@@ -519,6 +609,10 @@ impl Default for State {
         let mut state = Self {
             theme_mode: settings.theme_mode,
             accent: settings.accent,
+            custom_accent: settings.custom_accent,
+            high_contrast: settings.high_contrast,
+            custom_accent_draft: settings.custom_accent.unwrap_or((124, 156, 224)),
+            theme_preview: None,
             open_tabs: Vec::new(),
             active_tab: None,
             restoring_session: false,
@@ -530,6 +624,7 @@ impl Default for State {
             chat_session_id: claude_agent::new_session_id(),
             chat_sessions: Vec::new(),
             chat_sessions_open: false,
+            chat_session_filter: String::new(),
             chat_view_menu_open: false,
             chat_actions_open: false,
             chat_pinned_to_bottom: true,
@@ -558,6 +653,7 @@ impl Default for State {
             collapsed_dirs: snapshot.collapsed_dirs,
             caret_visible: true,
             lsp_status: LspStatus::default(),
+            lsp_progress: std::collections::BTreeMap::new(),
             lsp_sender: None,
             lsp_enabled: settings.lsp_enabled,
             lsp_restart_token: 0,
@@ -571,6 +667,10 @@ impl Default for State {
             changes_panel_open: false,
             pending_discard: None,
             problems_panel_open: false,
+            background_tasks_open: false,
+            eol_picker_open: false,
+            language_picker_open: false,
+            encoding_info_open: false,
             references_open: false,
             references_label: String::new(),
             references_results: Vec::new(),
@@ -605,6 +705,9 @@ impl Default for State {
             flash: None,
             closed_tabs: Vec::new(),
             next_untitled_id: 0,
+            tab_hover: None,
+            tab_switcher: None,
+            breadcrumb_hover: None,
         };
 
         if !state.welcome_open {
@@ -618,6 +721,26 @@ impl Default for State {
 pub enum Message {
     SetThemeMode(ThemeMode),
     SetAccent(Accent),
+    /// Commits a custom accent RGB color (roadmap item 11's color picker),
+    /// overriding whichever preset `accent` names — see
+    /// `theme::palette_custom`.
+    SetCustomAccent(u8, u8, u8),
+    /// "Reset to preset" — drops `custom_accent` back to `None`, so
+    /// `accent`'s own built-in ramp applies again.
+    ClearCustomAccent,
+    /// Dragged one of the custom-color picker's RGB sliders — updates
+    /// `custom_accent_draft` and live-previews it (`theme_preview`),
+    /// without committing (see `custom_accent_draft`'s own doc comment).
+    AdjustCustomAccentDraft(u8, u8, u8),
+    ToggleHighContrast,
+    /// Hovering a theme-mode/accent-preset/custom-color swatch in the
+    /// settings panel, or dragging its RGB sliders — live-previews that
+    /// choice everywhere (`State::theme_preview`) without committing it.
+    /// Roadmap item 11.
+    PreviewTheme(ThemePreview),
+    /// The mouse left the swatch/slider being previewed, or the settings
+    /// panel closed — reverts to the committed theme.
+    ClearThemePreview,
     SelectOpenTab(TabKey),
     CloseTab(TabKey),
     CloseActiveTab,
@@ -637,6 +760,20 @@ pub enum Message {
     /// Clicked the status bar's Problems indicator — see
     /// `State::problems_panel_open`.
     ToggleProblemsPanel,
+    /// Clicked the status bar's language-server indicator — opens the
+    /// "Background Tasks" popover (`State::background_tasks_open`).
+    ToggleBackgroundTasks,
+    /// Clicked the status bar's EOL (LF/CRLF) indicator.
+    ToggleEolPicker,
+    /// Picked a target from the EOL picker — see `EditorState::convert_eol`.
+    ConvertEol(Eol),
+    /// Clicked the status bar's language-mode indicator.
+    ToggleLanguagePicker,
+    /// Picked a language from the language-mode picker — see
+    /// `EditorState::set_language`.
+    SetEditorLanguage(Option<syntax::Language>),
+    /// Clicked the status bar's encoding indicator.
+    ToggleEncodingInfo,
     /// Clicked a diagnostic row in the Problems dock panel — opens (or
     /// focuses) `path` and moves the cursor to the diagnostic's start
     /// position, same as clicking a location in any other editor's problems
@@ -691,6 +828,10 @@ pub enum Message {
     /// buttons) to the system clipboard. Same `push_flash` confirmation as
     /// `CopyPath`.
     ChatCopyText(String),
+    /// "Edit" on a past operator message — reloads its text into the
+    /// composer, ready to tweak and resend (see the handler's own doc
+    /// comment on why this can't rewrite the transcript itself).
+    ChatEditMessage(String),
     /// Pressed the chat panel's edge resize handle.
     ChatResizeStarted,
     /// Cursor moved while resizing — carries the cursor's window-space X
@@ -715,6 +856,9 @@ pub enum Message {
     /// `start_loading_chat_sessions`.
     ChatToggleSessions,
     ChatSessionsLoaded(Vec<claude_agent::SessionSummary>),
+    /// The sessions picker's search box (`session_list_view`) — filters
+    /// `state.chat_sessions` by title as the user types.
+    ChatSessionFilterChanged(String),
     /// The chat panel's "Load earlier messages" row — only shown while
     /// `state.chat.history_truncated`. Kicks off `load_earlier_chat_history`,
     /// same background-task shape as `ChatToggleSessions`.
@@ -935,6 +1079,39 @@ pub enum Message {
     SetTabSize(u8),
     ToggleShowLineNumbers,
     ToggleWordWrap,
+    /// The mouse entered/left a tab bar entry — starts/clears the hover
+    /// preview's dwell timer (`State::tab_hover`). Mirrors
+    /// `EditorHoverMove`/`EditorHoverLeave`'s shape.
+    TabHoverStart(TabKey),
+    TabHoverEnd(TabKey),
+    /// Ticks while `State::tab_hover` is pending, purely to force a `view()`
+    /// rebuild once the dwell elapses — same shape as `HoverDebounceTick`.
+    TabPreviewTick,
+    /// The mouse entered/left a breadcrumb segment — starts/clears the
+    /// hover-context tooltip's dwell timer (`State::breadcrumb_hover`,
+    /// roadmap item 10). Mirrors `TabHoverStart`/`TabHoverEnd`.
+    BreadcrumbHoverStart(usize),
+    BreadcrumbHoverEnd(usize),
+    /// Ticks while `State::breadcrumb_hover` is pending — same shape as
+    /// `TabPreviewTick`.
+    BreadcrumbPreviewTick,
+    /// Clicked a breadcrumb segment — moves the cursor to that scope's
+    /// start and scrolls it into view.
+    JumpToBreadcrumb(usize),
+    /// Ctrl+Tab (`delta: 1`) / Ctrl+Shift+Tab (`delta: -1`) — opens the quick
+    /// switcher (roadmap item 2) if it isn't already showing, snapshotting
+    /// the current open-tab order, then steps `selected` through it on every
+    /// further press while held.
+    StepTabSwitcher(i32),
+    /// Fires whenever Ctrl stops being held (`ModifiersChanged`) — commits
+    /// whichever entry the switcher had selected and closes it. A no-op
+    /// whenever the switcher isn't open, so this is safe to emit
+    /// unconditionally from the global modifiers-changed handler.
+    ConfirmTabSwitcher,
+    /// A direct click on a switcher entry — selects and confirms it in one
+    /// step, without needing Ctrl to be released.
+    SelectTabSwitcherEntry(TabKey),
+    CloseTabSwitcher,
     DismissToast(u64),
     PruneToasts,
     EditorSave,
@@ -946,7 +1123,14 @@ pub enum Message {
     ToggleReplace,
     ReplaceQueryChanged(String),
     ReplaceOne,
+    /// "Replace All" button — first press asks for confirmation
+    /// (`FindState::confirm_replace_all`); doesn't touch the buffer itself.
     ReplaceAll,
+    /// The confirmation prompt's "Yes" — actually performs the replacement.
+    ConfirmReplaceAll,
+    /// The confirmation prompt's "No" — dismisses it without replacing.
+    CancelReplaceAll,
+    ToggleFindHelp,
     EscapePressed,
     /// Starts a new-file/new-folder draft in the project root — the
     /// Explorer header buttons and the global Ctrl/Cmd+N / Ctrl/Cmd+Shift+N
@@ -1073,6 +1257,35 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
     match message {
         Message::SetThemeMode(mode) => set_theme_mode(state, mode),
         Message::SetAccent(accent) => set_accent(state, accent),
+        Message::SetCustomAccent(r, g, b) => {
+            state.custom_accent = Some((r, g, b));
+            state.custom_accent_draft = (r, g, b);
+            state.theme_preview = None;
+            persist_settings(state);
+        }
+        Message::ClearCustomAccent => {
+            state.custom_accent = None;
+            persist_settings(state);
+        }
+        Message::AdjustCustomAccentDraft(r, g, b) => {
+            state.custom_accent_draft = (r, g, b);
+            state.theme_preview = Some(ThemePreview {
+                theme_mode: state.theme_mode,
+                accent: state.accent,
+                custom_accent: Some((r, g, b)),
+                high_contrast: state.high_contrast,
+            });
+        }
+        Message::ToggleHighContrast => {
+            state.high_contrast = !state.high_contrast;
+            persist_settings(state);
+        }
+        Message::PreviewTheme(preview) => {
+            state.theme_preview = Some(preview);
+        }
+        Message::ClearThemePreview => {
+            state.theme_preview = None;
+        }
         Message::SelectOpenTab(key) => {
             if state.open_tabs.iter().any(|t| t.key() == key) {
                 state.active_tab = Some(key);
@@ -1085,6 +1298,70 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 close_tab(state, &key);
             }
         }
+        Message::TabHoverStart(key) => {
+            state.tab_hover = Some((key, Instant::now()));
+        }
+        Message::TabHoverEnd(key) => {
+            if state.tab_hover.as_ref().is_some_and(|(k, _)| *k == key) {
+                state.tab_hover = None;
+            }
+        }
+        // No-op on purpose — this tick exists solely to force a `view()`
+        // rebuild once `State::tab_hover`'s dwell elapses, the same shape as
+        // `HoverDebounceTick`. `ui::tab_bar::hover_preview` is what actually
+        // checks the elapsed time and decides whether to render anything.
+        Message::TabPreviewTick => {}
+        Message::BreadcrumbHoverStart(index) => {
+            state.breadcrumb_hover = Some((index, Instant::now()));
+        }
+        Message::BreadcrumbHoverEnd(index) => {
+            if state.breadcrumb_hover.as_ref().is_some_and(|(i, _)| *i == index) {
+                state.breadcrumb_hover = None;
+            }
+        }
+        // No-op on purpose, same reasoning as `TabPreviewTick`.
+        Message::BreadcrumbPreviewTick => {}
+        Message::JumpToBreadcrumb(index) => {
+            state.breadcrumb_hover = None;
+            let Some(path) = active_file_path(state) else { return iced::Task::none() };
+            let font_size = state.editor_font_size;
+            let word_wrap = state.word_wrap;
+            let Some(editor) = find_editor_mut(state, &path) else { return iced::Task::none() };
+            let crumbs = editor.breadcrumbs();
+            let Some(crumb) = crumbs.get(index) else { return iced::Task::none() };
+            let char_idx = editor.document.text().byte_to_char(crumb.start_byte);
+            let (line, col) = editor.document.line_col(char_idx);
+            editor.cursor = CursorPos { line, col };
+            editor.selection_anchor = None;
+            return center_line_in_viewport(editor, font_size, word_wrap, line);
+        }
+        Message::StepTabSwitcher(delta) => {
+            if let Some(switcher) = state.tab_switcher.as_mut() {
+                let len = switcher.entries.len() as i32;
+                switcher.selected = (switcher.selected as i32 + delta).rem_euclid(len) as usize;
+            } else {
+                let entries = tab_switcher_entries(state);
+                // Nothing to switch *between* with 0 or 1 open tabs.
+                if entries.len() >= 2 {
+                    let current =
+                        entries.iter().position(|k| Some(k) == state.active_tab.as_ref()).unwrap_or(0);
+                    let selected = (current as i32 + delta).rem_euclid(entries.len() as i32) as usize;
+                    state.tab_switcher = Some(TabSwitcherState { entries, selected });
+                }
+            }
+        }
+        Message::ConfirmTabSwitcher => {
+            if let Some(switcher) = state.tab_switcher.take()
+                && let Some(key) = switcher.entries.get(switcher.selected).cloned()
+            {
+                return switch_to_tab(state, &key);
+            }
+        }
+        Message::SelectTabSwitcherEntry(key) => {
+            state.tab_switcher = None;
+            return switch_to_tab(state, &key);
+        }
+        Message::CloseTabSwitcher => state.tab_switcher = None,
         Message::FocusSearchTab => focus_search(state),
         Message::ChatToggle => toggle_chat(state),
         Message::ChatFocus => {
@@ -1306,9 +1583,22 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::ChatToggleSessions => {
             state.chat_sessions_open = !state.chat_sessions_open;
+            state.chat_session_filter.clear();
             if state.chat_sessions_open {
                 return start_loading_chat_sessions(state);
             }
+            return focus_chat_input();
+        }
+        Message::ChatSessionFilterChanged(text) => {
+            state.chat_session_filter = text;
+        }
+        Message::ChatEditMessage(text) => {
+            // "Edit" on a past turn can't rewrite `claude`'s own transcript
+            // (see `send_chat_text`'s doc comment on why turns are just
+            // prompts, not a rewindable state) — the closest useful thing is
+            // reloading it into the composer so it's one click away from
+            // being sent again, tweaked.
+            state.chat.input = iced::widget::text_editor::Content::with_text(&text);
             return focus_chat_input();
         }
         Message::ChatSessionsLoaded(sessions) => state.chat_sessions = sessions,
@@ -1365,6 +1655,42 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.problems_panel_open = !state.problems_panel_open;
             persist_session(state);
         }
+        Message::ToggleBackgroundTasks => {
+            let opening = !state.background_tasks_open;
+            close_status_bar_popovers(state);
+            state.background_tasks_open = opening;
+        }
+        Message::ToggleEolPicker => {
+            let opening = !state.eol_picker_open;
+            close_status_bar_popovers(state);
+            state.eol_picker_open = opening;
+        }
+        Message::ConvertEol(target) => {
+            state.eol_picker_open = false;
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.convert_eol(target);
+            }
+        }
+        Message::ToggleLanguagePicker => {
+            let opening = !state.language_picker_open;
+            close_status_bar_popovers(state);
+            state.language_picker_open = opening;
+        }
+        Message::SetEditorLanguage(language) => {
+            state.language_picker_open = false;
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.set_language(language);
+            }
+        }
+        Message::ToggleEncodingInfo => {
+            let opening = !state.encoding_info_open;
+            close_status_bar_popovers(state);
+            state.encoding_info_open = opening;
+        }
         Message::OpenDiagnosticAt(path, pos) => {
             open_or_focus_file(state, path.clone());
             if let Some(editor) = find_editor_mut(state, &path) {
@@ -1413,6 +1739,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
                 mark_edited(state, &path);
                 maybe_trigger_completion(state, &path, &text);
+                maybe_trigger_signature_help(state, &path, &text);
                 return scroll_cursor_into_view(state);
             }
         }
@@ -1430,6 +1757,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
                 mark_edited(state, &path);
                 maybe_trigger_completion(state, &path, &ch.to_string());
+                maybe_trigger_signature_help(state, &path, &ch.to_string());
                 return scroll_cursor_into_view(state);
             }
         }
@@ -1670,6 +1998,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             LspEvent::Ready(sender) => {
                 let was_starting = matches!(state.lsp_status, LspStatus::Starting);
                 state.lsp_status = LspStatus::Ready;
+                state.lsp_progress.clear();
                 state.lsp_sender = Some(sender);
                 for path in open_file_paths(state) {
                     send_did_open_for(state, &path);
@@ -1715,6 +2044,33 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.apply_hover_response(line, character, text);
                 }
             }
+            LspEvent::SignatureHelp { uri, line, character, signatures, active_signature, active_parameter } => {
+                if let Some(path) = uri.to_file_path().ok()
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.apply_signature_help_response(line, character, signatures, active_signature, active_parameter);
+                }
+            }
+            LspEvent::Progress { token, title, message, percentage, done } => {
+                if done {
+                    state.lsp_progress.remove(&token);
+                } else {
+                    let entry = state.lsp_progress.entry(token).or_insert_with(|| LspProgressEntry {
+                        title: title.clone().unwrap_or_default(),
+                        message: None,
+                        percentage: None,
+                    });
+                    if let Some(title) = title {
+                        entry.title = title;
+                    }
+                    if message.is_some() {
+                        entry.message = message;
+                    }
+                    if percentage.is_some() {
+                        entry.percentage = percentage;
+                    }
+                }
+            }
             LspEvent::Definition { locations, .. } => {
                 return apply_locations(state, locations, "Definition");
             }
@@ -1727,12 +2083,14 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if !matches!(state.lsp_status, LspStatus::Installing) {
                     if let Some(lang) = active_lsp_language(state) {
                         state.lsp_status = LspStatus::Installing;
+                        state.lsp_progress.clear();
                         return start_server_install(lang);
                     }
                 }
             }
             LspEvent::Unavailable(reason) => {
                 state.lsp_status = LspStatus::Unavailable(reason.clone());
+                state.lsp_progress.clear();
                 state.lsp_sender = None;
                 let name = active_server_name(state);
                 push_toast(state, ToastKind::Warning, format!("{name} unavailable: {reason}"));
@@ -1931,8 +2289,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if state.settings_open {
                 state.palette_open = false;
             }
+            state.theme_preview = None;
         }
-        Message::CloseSettings => state.settings_open = false,
+        Message::CloseSettings => {
+            state.settings_open = false;
+            state.theme_preview = None;
+        }
         Message::SetDensity(density) => {
             state.density = density;
             persist_settings(state);
@@ -1965,6 +2327,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 // `subscription`) picks this up and spawns a fresh worker;
                 // `Starting` holds until its `Ready`/`Unavailable` lands.
                 state.lsp_status = LspStatus::Starting;
+                state.lsp_progress.clear();
             } else {
                 // Dropping the subscription tears down the running worker
                 // (`kill_on_drop` kills its `rust-analyzer` child); clear
@@ -1972,6 +2335,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 // nothing lingers from before the server went away.
                 state.lsp_sender = None;
                 state.lsp_status = LspStatus::Disabled;
+                state.lsp_progress.clear();
                 for tab in &mut state.open_tabs {
                     if let OpenTab::File(editor) = tab {
                         editor.diagnostics = Rc::new(Vec::new());
@@ -2082,6 +2446,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 if let Some(find) = editor.find.as_mut() {
                     find.query = query;
                     find.current = 0;
+                    find.just_wrapped = false;
+                    find.confirm_replace_all = false;
                 }
                 editor.refind();
             }
@@ -2094,6 +2460,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 if let Some(find) = editor.find.as_mut() {
                     find.replace_open = !find.replace_open;
+                    find.confirm_replace_all = false;
                 } else {
                     let initial_query = editor
                         .selection()
@@ -2118,7 +2485,40 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::ReplaceOne => return replace_current_match(state),
-        Message::ReplaceAll => replace_all_matches(state),
+        Message::ReplaceAll => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && let Some(find) = editor.find.as_mut()
+                && !find.matches.is_empty()
+            {
+                find.confirm_replace_all = true;
+            }
+        }
+        Message::ConfirmReplaceAll => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && let Some(find) = editor.find.as_mut()
+            {
+                find.confirm_replace_all = false;
+            }
+            replace_all_matches(state);
+        }
+        Message::CancelReplaceAll => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && let Some(find) = editor.find.as_mut()
+            {
+                find.confirm_replace_all = false;
+            }
+        }
+        Message::ToggleFindHelp => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+                && let Some(find) = editor.find.as_mut()
+            {
+                find.help_open = !find.help_open;
+            }
+        }
         Message::BeginDraft(kind) => {
             // Pre-existing gap, fixed alongside this feature: `⌘N`/`⇧⌘N`
             // (`global_keys`) aren't otherwise gated on a project being
@@ -2275,6 +2675,17 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
                 return iced::Task::none();
             }
+            let signature_help_open = active_file_path(state)
+                .and_then(|ref path| find_editor(state, path))
+                .is_some_and(|e| e.signature_help.is_some());
+            if signature_help_open {
+                if let Some(path) = active_file_path(state)
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.signature_help = None;
+                }
+                return iced::Task::none();
+            }
             let snippet_active = active_file_path(state)
                 .and_then(|ref path| find_editor(state, path))
                 .is_some_and(|e| e.snippet_active());
@@ -2304,6 +2715,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 {
                     editor.pending_revert_line = None;
                 }
+            } else if state.tab_switcher.is_some() {
+                state.tab_switcher = None;
             } else if state.draft.is_some() {
                 state.draft = None;
             } else if state.ctx_menu.is_some() {
@@ -2326,11 +2739,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     // one that will now find the installed binary.
                     state.lsp_restart_token += 1;
                     state.lsp_status = LspStatus::Starting;
+                    state.lsp_progress.clear();
                     let name = active_server_name(state);
                     push_toast(state, ToastKind::Success, format!("{name} installed"));
                 }
                 Err(reason) => {
                     state.lsp_status = LspStatus::Unavailable(reason.clone());
+                    state.lsp_progress.clear();
                     let name = active_server_name(state);
                     push_toast(state, ToastKind::Error, format!("{name} install failed: {reason}"));
                 }
@@ -2544,6 +2959,8 @@ fn persist_settings(state: &State) {
     settings::save(&settings::Settings {
         theme_mode: state.theme_mode,
         accent: state.accent,
+        custom_accent: state.custom_accent,
+        high_contrast: state.high_contrast,
         density: state.density,
         ui_font_scale: state.ui_font_scale,
         editor_font_size: state.editor_font_size,
@@ -2682,7 +3099,23 @@ fn set_theme_mode(state: &mut State, mode: ThemeMode) {
 
 fn set_accent(state: &mut State, accent: Accent) {
     state.accent = accent;
+    // A preset always wins outright over a leftover custom color — same
+    // "the override wins, not blended" relationship the other direction
+    // (`Message::SetCustomAccent`) already has with `accent`.
+    state.custom_accent = None;
     persist_settings(state);
+}
+
+/// Closes every status-bar popover (Background Tasks, EOL, Language,
+/// Encoding) — all four anchor to roughly the same corner (see
+/// `status_bar.rs`'s own doc comments on why exact per-segment positioning
+/// isn't worth chasing here), so each one's own toggle closes the rest
+/// first rather than risking two stacked on top of each other.
+fn close_status_bar_popovers(state: &mut State) {
+    state.background_tasks_open = false;
+    state.eol_picker_open = false;
+    state.language_picker_open = false;
+    state.encoding_info_open = false;
 }
 
 fn push_toast(state: &mut State, kind: ToastKind, message: impl Into<String>) {
@@ -2861,6 +3294,27 @@ fn file_watcher(root: &PathBuf) -> impl iced::futures::Stream<Item = Vec<WatchEv
 /// captured, so this never steals a keystroke the editor canvas wants (e.g.
 /// typing a literal "k").
 fn global_keys(event: keyboard::Event) -> Message {
+    // Literal Ctrl, not `modifiers.command()` — `command()` is Cmd on macOS,
+    // where Cmd+Tab is the OS's own app switcher and never reaches this
+    // handler at all. Ctrl+Tab is the one binding that means "cycle tabs" on
+    // every platform, so it's checked directly rather than through the
+    // per-OS `command()` mapping the rest of this function uses.
+    if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
+        && modifiers.control()
+        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab))
+    {
+        return Message::StepTabSwitcher(if modifiers.shift() { -1 } else { 1 });
+    }
+    // Ctrl released while the switcher is open commits the highlighted
+    // entry, the same "hold to browse, release to pick" gesture Alt-Tab
+    // uses — see `Message::ConfirmTabSwitcher`'s own doc for why this is
+    // safe to emit unconditionally rather than only while the switcher is
+    // actually open.
+    if let keyboard::Event::ModifiersChanged(modifiers) = &event
+        && !modifiers.control()
+    {
+        return Message::ConfirmTabSwitcher;
+    }
     if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
         if modifiers.command()
             && let keyboard::Key::Character(c) = key.as_ref()
@@ -3019,6 +3473,17 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
         .is_some_and(|e| e.hover_pending_active());
     if hover_pending {
         subs.push(iced::time::every(Duration::from_millis(80)).map(|_| Message::HoverDebounceTick));
+    }
+    // Same shape again: only ticks while the mouse is actually resting on a
+    // tab, waiting on `ui::tab_bar::TAB_PREVIEW_DWELL` — see
+    // `Message::TabPreviewTick`'s own doc.
+    if state.tab_hover.is_some() {
+        subs.push(iced::time::every(Duration::from_millis(80)).map(|_| Message::TabPreviewTick));
+    }
+    // Same shape again: only ticks while the mouse is resting on a
+    // breadcrumb segment, waiting on `ui::breadcrumb_bar::HOVER_DWELL`.
+    if state.breadcrumb_hover.is_some() {
+        subs.push(iced::time::every(Duration::from_millis(80)).map(|_| Message::BreadcrumbPreviewTick));
     }
     if state.sidebar_resizing {
         subs.push(iced::event::listen_with(sidebar_resize_events));

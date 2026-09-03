@@ -47,6 +47,26 @@ pub enum Language {
 }
 
 impl Language {
+    /// Every known language, in the same order as the `enum` — for the
+    /// status bar's "Language Mode" picker (roadmap item 9), which lets
+    /// this be overridden for syntax highlighting alone (see
+    /// `EditorState::set_language`'s own doc comment).
+    pub const ALL: [Language; 13] = [
+        Language::Rust,
+        Language::Json,
+        Language::Toml,
+        Language::Java,
+        Language::Python,
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Tsx,
+        Language::Cpp,
+        Language::Yaml,
+        Language::Xml,
+        Language::Ini,
+        Language::Markdown,
+    ];
+
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Language::Rust),

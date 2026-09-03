@@ -11,5 +11,5 @@ pub mod syntax;
 pub mod theme;
 pub mod watcher;
 
-pub use document::Document;
+pub use document::{Document, Eol};
 pub use theme::{Accent, Palette, Theme, ThemeMode};

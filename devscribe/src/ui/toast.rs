@@ -62,7 +62,7 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
     if state.toasts.is_empty() {
         return None;
     }
-    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
+    let p = crate::state::active_palette(state);
 
     let cards: Vec<Element<'static, Message>> =
         state.toasts.iter().map(|toast| toast_card(toast, p)).collect();

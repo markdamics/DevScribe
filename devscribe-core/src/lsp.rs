@@ -16,10 +16,11 @@ use async_lsp::lsp_types::{
     GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverContents, HoverParams,
     InitializeParams, InitializedParams, LocationLink, LogMessageParams, MarkedString,
     PartialResultParams, ProgressParams, PublishDiagnosticsParams, ReferenceContext,
-    ReferenceParams, ShowMessageParams, TextDocumentClientCapabilities,
+    NumberOrString, ProgressParamsValue, ReferenceParams, ShowMessageParams,
+    SignatureHelpClientCapabilities, SignatureHelpParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceFolder,
+    TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgress,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use async_lsp::router::Router;
 use async_lsp::{LanguageClient, LanguageServer, MainLoop, ResponseError};
@@ -27,7 +28,9 @@ use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
 
 pub use async_lsp::lsp_types::{
-    CompletionItem, Diagnostic, DiagnosticSeverity, InsertTextFormat, Location, Position, Range, Url,
+    CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, Documentation,
+    InsertTextFormat, Location, MarkupContent, ParameterInformation, ParameterLabel, Position,
+    Range, SignatureInformation, Url,
 };
 
 /// A language DevScribe knows how to talk to a language server for.
@@ -94,6 +97,12 @@ pub enum LspCommand {
     DidClose { uri: Url },
     Completion { uri: Url, line: u32, character: u32 },
     Hover { uri: Url, line: u32, character: u32 },
+    /// `textDocument/signatureHelp` — requested on `(`/`,` while typing a
+    /// call, mirroring `Completion`'s "one request per trigger keystroke"
+    /// shape rather than tracking paren depth client-side; the server
+    /// already computes `active_signature`/`active_parameter` for whatever
+    /// position it's given.
+    SignatureHelp { uri: Url, line: u32, character: u32 },
     /// `textDocument/definition` — "Go to Definition".
     GotoDefinition { uri: Url, line: u32, character: u32 },
     /// `textDocument/references` — "Find All References", across the whole
@@ -127,6 +136,17 @@ pub enum LspEvent {
         character: u32,
         text: Option<String>,
     },
+    /// The result of a `LspCommand::SignatureHelp` request — empty
+    /// `signatures` means the server had nothing to offer at that position
+    /// (the cursor isn't inside a call it recognizes), not an error.
+    SignatureHelp {
+        uri: Url,
+        line: u32,
+        character: u32,
+        signatures: Vec<SignatureInformation>,
+        active_signature: Option<u32>,
+        active_parameter: Option<u32>,
+    },
     /// The result of a `LspCommand::GotoDefinition` request, already
     /// normalized to a flat list regardless of which of the three shapes
     /// `textDocument/definition` is allowed to reply with (see
@@ -149,10 +169,28 @@ pub enum LspEvent {
     NeedsInstall,
     /// The server binary couldn't be spawned, or the connection died.
     Unavailable(String),
+    /// A `$/progress` notification (`textDocument/... ` work-done progress —
+    /// rust-analyzer's own "Indexing", "Fetching metadata", etc.), for the
+    /// status bar's visual-feedback pass. `percentage`/`message` are
+    /// whatever `Report` last carried for this `token` (`None` for
+    /// indeterminate progress); `done: true` on the matching `End` says
+    /// this token's operation finished, so the app can clear it rather than
+    /// leaving a stale "Indexing…" on screen forever. Every server this app
+    /// talks to may report zero, one, or several concurrently-running
+    /// tokens; each gets its own `Progress` event, keyed by `token`, rather
+    /// than trying to merge them into one line here.
+    Progress {
+        token: String,
+        title: Option<String>,
+        message: Option<String>,
+        percentage: Option<u32>,
+        done: bool,
+    },
 }
 
 struct ClientState {
     diagnostics_tx: mpsc::UnboundedSender<PublishDiagnosticsParams>,
+    progress_tx: mpsc::UnboundedSender<ProgressParams>,
 }
 
 impl LanguageClient for ClientState {
@@ -164,7 +202,8 @@ impl LanguageClient for ClientState {
         ControlFlow::Continue(())
     }
 
-    fn progress(&mut self, _params: ProgressParams) -> Self::NotifyResult {
+    fn progress(&mut self, params: ProgressParams) -> Self::NotifyResult {
+        let _ = self.progress_tx.unbounded_send(params);
         ControlFlow::Continue(())
     }
 
@@ -260,8 +299,9 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
     let child_stdin = child.stdin.take().expect("piped stdin");
 
     let (diagnostics_tx, mut diagnostics_rx) = mpsc::unbounded();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded();
     let (mainloop, mut server) = MainLoop::new_client(|_server| {
-        let mut router = Router::from_language_client(ClientState { diagnostics_tx });
+        let mut router = Router::from_language_client(ClientState { diagnostics_tx, progress_tx });
         // Ignore any server notifications we don't explicitly handle (e.g.
         // jdtls sends language/status, language/actionableNotification, etc.).
         router.unhandled_notification(|_, _| ControlFlow::Continue(()));
@@ -299,6 +339,9 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                             ..Default::default()
                         }),
                         hover: Some(HoverClientCapabilities {
+                            ..Default::default()
+                        }),
+                        signature_help: Some(SignatureHelpClientCapabilities {
                             ..Default::default()
                         }),
                         definition: Some(GotoCapability {
@@ -386,6 +429,12 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                     diagnostics: params.diagnostics,
                 };
                 if output.send(event).await.is_err() {
+                    break;
+                }
+            }
+            progress = progress_rx.next() => {
+                let Some(params) = progress else { break };
+                if output.send(progress_params_to_event(params)).await.is_err() {
                     break;
                 }
             }
@@ -501,6 +550,49 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                             let text = response.map(hover_to_text).filter(|s| !s.trim().is_empty());
                             let _ = output
                                 .send(LspEvent::Hover { uri, line, character, text })
+                                .await;
+                        }
+                    }
+                    LspCommand::SignatureHelp { uri, line, character } => {
+                        // Same "drive mainloop alongside the request" shape
+                        // as `LspCommand::Completion`/`Hover` above.
+                        let sig_fut = server
+                            .signature_help(SignatureHelpParams {
+                                text_document_position_params: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                    position: Position { line, character },
+                                },
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                                context: None,
+                            })
+                            .fuse();
+                        futures::pin_mut!(sig_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = sig_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(Some(response)) = result {
+                            let _ = output
+                                .send(LspEvent::SignatureHelp {
+                                    uri,
+                                    line,
+                                    character,
+                                    signatures: response.signatures,
+                                    active_signature: response.active_signature,
+                                    active_parameter: response.active_parameter,
+                                })
                                 .await;
                         }
                     }
@@ -623,10 +715,80 @@ fn hover_to_text(hover: Hover) -> String {
     }
 }
 
+/// Flattens a raw `$/progress` notification to `LspEvent::Progress` —
+/// `token` is stringified once here (`NumberOrString` isn't `Hash`-friendly
+/// for a caller-side map key the way a plain `String` is) so `devscribe`'s
+/// state layer can key its per-token progress map on it directly.
+fn progress_params_to_event(params: ProgressParams) -> LspEvent {
+    let token = match params.token {
+        NumberOrString::Number(n) => n.to_string(),
+        NumberOrString::String(s) => s,
+    };
+    let ProgressParamsValue::WorkDone(progress) = params.value;
+    match progress {
+        WorkDoneProgress::Begin(begin) => LspEvent::Progress {
+            token,
+            title: Some(begin.title),
+            message: begin.message,
+            percentage: begin.percentage,
+            done: false,
+        },
+        WorkDoneProgress::Report(report) => LspEvent::Progress {
+            token,
+            title: None,
+            message: report.message,
+            percentage: report.percentage,
+            done: false,
+        },
+        WorkDoneProgress::End(end) => LspEvent::Progress {
+            token,
+            title: None,
+            message: end.message,
+            percentage: None,
+            done: true,
+        },
+    }
+}
+
 fn marked_string_to_text(marked: MarkedString) -> String {
     match marked {
         MarkedString::String(s) => s,
         MarkedString::LanguageString(ls) => ls.value,
+    }
+}
+
+/// Flattens a `CompletionItem::documentation` (either a bare string or
+/// `MarkupContent`) to plain text for the completion popup's doc-preview
+/// panel — same "just take the raw value, don't render Markdown" choice
+/// `hover_to_text` makes for the hover popup.
+pub fn documentation_to_text(doc: Documentation) -> String {
+    match doc {
+        Documentation::String(s) => s,
+        Documentation::MarkupContent(m) => m.value,
+    }
+}
+
+/// The active parameter's label text within `SignatureInformation::label`,
+/// for bolding it in the signature-help popup. `ParameterLabel::LabelOffsets`
+/// indexes UTF-16 code units into the label (LSP's usual string-indexing
+/// unit); `label` is ASCII-heavy source-code-like text in every server this
+/// app talks to, so a UTF-16-unit count and a `char` count coincide in
+/// practice, but this still walks UTF-16 units to stay correct if that ever
+/// stops being true.
+pub fn active_parameter_label(sig: &SignatureInformation, param_index: usize) -> Option<String> {
+    let param = sig.parameters.as_ref()?.get(param_index)?;
+    match &param.label {
+        ParameterLabel::Simple(s) => Some(s.clone()),
+        ParameterLabel::LabelOffsets([start, end]) => {
+            let units: Vec<u16> = sig.label.encode_utf16().collect();
+            let start = *start as usize;
+            let end = *end as usize;
+            if start <= end && end <= units.len() {
+                String::from_utf16(&units[start..end]).ok()
+            } else {
+                None
+            }
+        }
     }
 }
 

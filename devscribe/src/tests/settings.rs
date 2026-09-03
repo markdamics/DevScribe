@@ -69,6 +69,8 @@ fn sample_settings() -> Settings {
     Settings {
         theme_mode: ThemeMode::Light,
         accent: Accent::Kohaku,
+        custom_accent: Some((10, 20, 30)),
+        high_contrast: true,
         density: Density::Compact,
         ui_font_scale: 1.2,
         editor_font_size: 16.0,

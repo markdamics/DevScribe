@@ -650,13 +650,18 @@ impl canvas::Program<Message> for EditorCanvas {
                         .min(row_end_char - row_start_char + if row_is_last { 1 } else { 0 });
                     let x0 = text_x0 + sel_start_col as f32 * char_width;
                     let x1 = clamp_x(text_x0 + sel_end_col as f32 * char_width);
-                    frame.fill(
-                        &Path::rectangle(
-                            Point::new(x0, y),
-                            Size::new((x1 - x0).max(char_width * 0.4), line_height),
-                        ),
-                        tint(p.accent_solid, 0.22),
+                    // 0.35, not the old 0.22 — text paints on top of this
+                    // fill later in the same frame (see the glyph-drawing
+                    // pass below), so raising the alpha only makes the
+                    // selection itself easier to spot against syntax-colored
+                    // text; it can't hurt legibility. Matches the alpha
+                    // `command_palette.rs`'s own text-input selection uses,
+                    // rather than picking a new one-off value.
+                    let rect = Path::rectangle(
+                        Point::new(x0, y),
+                        Size::new((x1 - x0).max(char_width * 0.4), line_height),
                     );
+                    frame.fill(&rect, tint(p.accent_solid, 0.6));
                 }
 
                 for (i, (start, end)) in find_visible.iter().enumerate() {
@@ -1085,6 +1090,7 @@ pub fn cursor_pixel_pos(
 /// scroll" placement `cursor_pixel_pos` does. Falls back to the plain
 /// unwrapped version when `word_wrap` is false, so callers can always go
 /// through this one rather than branching themselves.
+#[allow(clippy::too_many_arguments)]
 pub fn cursor_pixel_pos_wrapped(
     document: &Document,
     word_wrap: bool,

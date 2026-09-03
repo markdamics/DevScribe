@@ -15,7 +15,7 @@ use crate::state::{Message, State};
 
 pub fn view(state: &State) -> Option<Element<'static, Message>> {
     let flash = state.flash.as_ref()?;
-    let p = devscribe_core::theme::palette(state.theme_mode, state.accent);
+    let p = crate::state::active_palette(state);
 
     let pill = container(
         text(flash.text.clone())

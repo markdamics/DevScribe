@@ -1,4 +1,4 @@
-use devscribe_core::theme::{palette, Palette};
+use devscribe_core::theme::Palette;
 use iced::font::Weight;
 use iced::widget::{button, canvas, column, container, responsive, row, scrollable, text};
 use iced::{Alignment, Border, Element, Length};
@@ -237,7 +237,7 @@ fn content_area(state: &State, p: Palette) -> Element<'_, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     crate::text_scale::set(state.ui_font_scale);
 
-    let p = palette(state.theme_mode, state.accent);
+    let p = state::active_palette(state);
 
     // No project open — the welcome screen replaces the whole editor
     // (title bar included: the window still has default OS decorations,
@@ -290,10 +290,18 @@ pub fn view(state: &State) -> Element<'_, Message> {
 
     let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
     layers.extend(completions::view(state, p));
+    layers.extend(completions::signature_help_view(state, p));
     layers.extend(hover_popup::view(state, p));
+    layers.extend(breadcrumb_bar::hover_view(state, p));
+    layers.extend(status_bar::background_tasks_panel(state, p));
+    layers.extend(status_bar::eol_picker_view(state, p));
+    layers.extend(status_bar::language_picker_view(state, p));
+    layers.extend(status_bar::encoding_info_view(state, p));
     layers.extend(command_palette::view(state));
     layers.extend(settings_panel::view(state));
     layers.extend(tab_bar::overflow_menu(state, p));
+    layers.extend(tab_bar::hover_preview(state, p));
+    layers.extend(tab_bar::switcher_view(state, p));
     layers.extend(sidebar::projects_menu(state, p));
     layers.extend(context_menu::view(state, p));
     layers.extend(chat_panel::view_menu(state, p));

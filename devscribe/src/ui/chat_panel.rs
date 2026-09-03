@@ -19,7 +19,7 @@ use devscribe_core::theme::{Palette, Rgba};
 use iced::font::Weight;
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_editor, Space};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_editor, text_input, Space};
 use iced::{Alignment, Border, Color, Element, Length};
 
 use std::collections::HashSet;
@@ -143,13 +143,59 @@ fn secondary_button(label: &'static str, message: Message, p: Palette) -> Elemen
         .into()
 }
 
+/// The `@path` tokens a turn's prompt referenced — `claude`'s own file-
+/// mention syntax (see `insert_chat_mention`'s doc comment), so parsing them
+/// back out of the sent text is enough to know what a turn was "about"
+/// without DevScribe tracking that separately. A bare `@` (nothing after
+/// it) or `@` mid-word (an email-shaped string, `foo@bar`) isn't a mention,
+/// so tokens are required to start the word.
+fn context_mentions(text_content: &str) -> Vec<&str> {
+    text_content
+        .split_whitespace()
+        .filter(|tok| tok.starts_with('@') && tok.len() > 1)
+        .map(|tok| tok.trim_start_matches('@').trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/' && c != '.'))
+        .filter(|tok| !tok.is_empty())
+        .collect()
+}
+
+/// A small "referenced" chip row under a turn's prompt, one per `@`-mention
+/// found in it (chat-panel UX pass, item 7's "context indicator") — skipped
+/// entirely for a turn that mentioned nothing, rather than an empty row.
+fn context_chips(text_content: &str, p: Palette) -> Option<Element<'static, Message>> {
+    let mentions = context_mentions(text_content);
+    if mentions.is_empty() {
+        return None;
+    }
+    let chips: Vec<Element<'static, Message>> = mentions
+        .into_iter()
+        .map(|m| {
+            container(
+                text(m.to_string())
+                    .font(fonts::mono(Weight::Medium))
+                    .size(crate::text_scale::px(11.0))
+                    .color(color(p.text_muted)),
+            )
+            .padding([2.0, 6.0])
+            .style(move |_theme| container::Style {
+                background: Some(color(p.surface_raised).into()),
+                border: Border { color: color(p.border_hairline), width: 1.0, radius: 3.0.into() },
+                ..container::Style::default()
+            })
+            .into()
+        })
+        .collect();
+    Some(row(chips).spacing(6.0).into())
+}
+
 fn operator_row(text_content: &str, p: Palette) -> Element<'static, Message> {
-    column![
+    let mut content = column![
         row![
             widgets::micro("OPERATOR", color(p.text_muted)),
             Space::new().width(Length::Fill),
+            link_button("Edit", Message::ChatEditMessage(text_content.to_string()), p),
             link_button("Copy", Message::ChatCopyText(text_content.to_string()), p),
         ]
+        .spacing(10.0)
         .align_y(Alignment::Center),
         container(
             text(text_content.to_string())
@@ -165,8 +211,11 @@ fn operator_row(text_content: &str, p: Palette) -> Element<'static, Message> {
             ..container::Style::default()
         }),
     ]
-    .spacing(6.0)
-    .into()
+    .spacing(6.0);
+    if let Some(chips) = context_chips(text_content, p) {
+        content = content.push(chips);
+    }
+    content.into()
 }
 
 /// `caret_visible` (state.rs's existing ~530ms blink tick) only ever
@@ -188,6 +237,25 @@ fn assistant_row(text_content: &str, streaming: bool, caret_visible: bool, provi
     column![
         header,
         text(shown).size(crate::text_scale::px(15.0)).color(color(p.text_body)),
+    ]
+    .spacing(6.0)
+    .into()
+}
+
+/// The gap between "sent" and "the first token/tool call landed" — see
+/// `thread_view`'s own call site for exactly when this shows. Reuses the
+/// same blink tick `assistant_row`'s streaming caret and `tool_status_glyph`
+/// already ride on, so it reads as one consistent "something is
+/// happening" idiom across the whole panel rather than a bespoke spinner.
+fn typing_indicator_row(provider: ChatProvider, caret_visible: bool, p: Palette) -> Element<'static, Message> {
+    column![
+        row![widgets::dot(color(p.accent_solid), 5.0), widgets::micro(provider.label(), color(p.text_muted))]
+            .spacing(7.0)
+            .align_y(Alignment::Center),
+        text(if caret_visible { "\u{2022}\u{2022}\u{2022}" } else { "\u{2022}\u{2022}\u{2022}\u{2022}" })
+            .font(fonts::mono(Weight::Bold))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_muted)),
     ]
     .spacing(6.0)
     .into()
@@ -904,9 +972,14 @@ fn input_bar(state: &State, p: Palette) -> Element<'_, Message> {
                 text_editor::Binding::from_key_press(press)
             }
         })
-        .style(move |_theme, _status| text_editor::Style {
+        .style(move |_theme, status| text_editor::Style {
             background: color(p.surface_inset).into(),
-            border: Border { color: color(p.border_strong), width: 1.5, radius: 3.0.into() },
+            // Visible keyboard-focus indicator (accessibility pass, item 12).
+            border: if matches!(status, text_editor::Status::Focused { .. }) {
+                Border { color: color(p.border_focus), width: 1.5, radius: 3.0.into() }
+            } else {
+                Border { color: color(p.border_strong), width: 1.5, radius: 3.0.into() }
+            },
             placeholder: color(p.text_muted),
             value: color(p.text_strong),
             selection: {
@@ -1149,17 +1222,57 @@ fn session_list_view(state: &State, p: Palette) -> Element<'static, Message> {
         }
     });
 
+    let filter = state.chat_session_filter.trim().to_ascii_lowercase();
+    let filtered: Vec<&SessionSummary> = state
+        .chat_sessions
+        .iter()
+        .filter(|s| filter.is_empty() || s.title.to_ascii_lowercase().contains(&filter))
+        .collect();
+
+    let search = text_input("Search sessions\u{2026}", &state.chat_session_filter)
+        .font(fonts::sans(Weight::Medium))
+        .size(crate::text_scale::px(13.0))
+        .padding([6.0, 10.0])
+        .on_input(Message::ChatSessionFilterChanged)
+        .style(move |_theme, status| text_input::Style {
+            background: color(p.surface_inset).into(),
+            // Visible keyboard-focus indicator (accessibility pass, item 12).
+            border: if matches!(status, text_input::Status::Focused { .. }) {
+                Border { color: color(p.border_focus), width: 1.5, radius: 4.0.into() }
+            } else {
+                Border { color: color(p.border_hairline), width: 1.0, radius: 4.0.into() }
+            },
+            icon: color(p.text_muted),
+            placeholder: color(p.text_muted),
+            value: color(p.text_strong),
+            selection: {
+                let mut c = p.accent_solid;
+                c.a = 0.35;
+                color(c)
+            },
+        });
+
     let list: Element<'static, Message> = if state.chat_sessions.is_empty() {
         widgets::placeholder("No past sessions for this project yet", p)
+    } else if filtered.is_empty() {
+        widgets::placeholder("No sessions match your search", p)
     } else {
-        let rows: Vec<Element<'static, Message>> = state.chat_sessions.iter().map(|s| session_row(s, p)).collect();
+        let rows: Vec<Element<'static, Message>> = filtered.into_iter().map(|s| session_row(s, p)).collect();
         scrollable(column(rows).spacing(2.0).padding([4.0, 8.0]).width(Length::Fill)).width(Length::Fill).height(Length::Fill).into()
     };
 
-    column![header, widgets::hline(color(p.border_hairline)), new_session, widgets::hline(color(p.border_hairline)), list]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    column![
+        header,
+        widgets::hline(color(p.border_hairline)),
+        new_session,
+        widgets::hline(color(p.border_hairline)),
+        container(search).padding([8.0, 10.0]).width(Length::Fill),
+        widgets::hline(color(p.border_hairline)),
+        list
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// The message list + input bar shared by docked/window/tab presentation
@@ -1170,15 +1283,32 @@ pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
         return session_list_view(state, p);
     }
 
-    let mut rows: Vec<Element<'static, Message>> = group_thread(&state.chat.messages)
-        .into_iter()
-        .map(|row| match row {
+    let thread_rows = group_thread(&state.chat.messages);
+    let mut rows: Vec<Element<'static, Message>> = Vec::with_capacity(thread_rows.len() + 2);
+    for (i, row) in thread_rows.into_iter().enumerate() {
+        // A divider ahead of every turn but the first — an Operator message
+        // is what starts a new turn (see `group_thread`'s own doc comment
+        // on what a "turn" is here) — so the transcript reads as a sequence
+        // of exchanges rather than one undifferentiated stream of bubbles
+        // (chat-panel UX pass, item 7's "message threading").
+        if i > 0 && matches!(row, ThreadRow::Message(ChatMessage::Operator(_))) {
+            rows.push(widgets::hline(color(p.border_hairline)));
+        }
+        rows.push(match row {
             ThreadRow::Message(msg) => message_row(msg, state.caret_visible, state.chat_provider, &state.chat.expanded_tools, p),
             ThreadRow::ToolGroup(tools) => tool_group_view(&tools, state.caret_visible, p),
-        })
-        .collect();
+        });
+    }
     if state.chat.history_truncated {
         rows.insert(0, load_earlier_row(p));
+    }
+    // `sending` clears the moment anything comes back (a delta, a tool
+    // call, ...) — see `ChatThread::sending`'s own doc comment — so it's
+    // only ever still `true` here while nothing has appeared for this turn
+    // yet, the gap a streaming bubble's own caret can't cover because
+    // there's no bubble at all until the first token lands.
+    if state.chat.sending {
+        rows.push(typing_indicator_row(state.chat_provider, state.caret_visible, p));
     }
     if !rows.is_empty()
         && let Some(row) = continuation_row(state, p)
