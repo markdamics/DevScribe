@@ -924,6 +924,39 @@ fn chat_toggle_closes_from_any_open_presentation() {
 }
 
 #[test]
+fn chat_focus_opens_the_panel_from_fully_closed_like_chat_toggle_does() {
+    let mut state = State { chat_mode: ChatMode::Closed, chat_tab_open: false, ..State::default() };
+    let _ = update(&mut state, Message::ChatFocus);
+    assert!(state.chat_tab_open);
+    assert_eq!(state.active_tab, Some(TabKey::Chat));
+}
+
+#[test]
+fn chat_focus_leaves_an_already_open_panel_open_unlike_chat_toggle() {
+    let mut state = State { chat_mode: ChatMode::Docked, ..State::default() };
+    let _ = update(&mut state, Message::ChatFocus);
+    assert_eq!(state.chat_mode, ChatMode::Docked, "ChatFocus must never close an already-open panel");
+}
+
+#[test]
+fn chat_scrolled_pins_within_slack_of_the_bottom_and_unpins_past_it() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::ChatScrolled(CHAT_SCROLL_PIN_SLACK));
+    assert!(state.chat_pinned_to_bottom, "still within slack of the bottom");
+    let _ = update(&mut state, Message::ChatScrolled(CHAT_SCROLL_PIN_SLACK + 1.0));
+    assert!(!state.chat_pinned_to_bottom, "scrolled up past the slack, reading older output");
+    let _ = update(&mut state, Message::ChatScrolled(0.0));
+    assert!(state.chat_pinned_to_bottom, "scrolling back down to the bottom re-pins");
+}
+
+#[test]
+fn chat_new_session_resets_pinned_to_bottom_even_if_the_user_had_scrolled_up() {
+    let mut state = State { chat_mode: ChatMode::Docked, chat_pinned_to_bottom: false, ..State::default() };
+    let _ = update(&mut state, Message::ChatNewSession);
+    assert!(state.chat_pinned_to_bottom);
+}
+
+#[test]
 fn chat_toggle_from_tab_mode_closes_both_instead_of_leaving_a_dual_presentation() {
     // Opening as a tab sets `chat_mode` to `Closed` already (see
     // `Message::ChatOpenTab`), so a naive "flip chat_mode" toggle would
@@ -1297,11 +1330,112 @@ fn chat_submit_ignores_a_blank_draft() {
 }
 
 #[test]
-fn chat_toggle_actions_flips_the_field() {
+fn chat_send_prompt_sends_text_verbatim_without_touching_the_draft() {
     let mut state = State::default();
+    let (tx, mut rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.input = iced::widget::text_editor::Content::with_text("unrelated draft");
+
+    let _ = update(&mut state, Message::ChatSendPrompt("Summarize this project.".to_string()));
+
+    assert_eq!(state.chat.input.text(), "unrelated draft", "ChatSendPrompt bypasses the draft entirely");
+    assert!(matches!(state.chat.messages.as_slice(), [ChatMessage::Operator(text)] if text == "Summarize this project."));
+    match rx.try_recv() {
+        Ok(ClaudeCommand::SendPrompt(text)) => assert_eq!(text, "Summarize this project."),
+        other => panic!("expected SendPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_send_prompt_with_no_live_session_does_nothing() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::ChatSendPrompt("hello".to_string()));
+    assert!(state.chat.messages.is_empty());
+}
+
+#[test]
+fn chat_retry_connection_bumps_the_restart_token_and_resets_status_to_starting() {
+    let mut state = State { chat: ChatThread { status: ChatStatus::Unavailable("claude CLI not found".to_string()), ..Default::default() }, ..State::default() };
+    let before = state.chat_restart_token;
+    let _ = update(&mut state, Message::ChatRetryConnection);
+    assert_eq!(state.chat_restart_token, before + 1);
+    assert_eq!(state.chat.status, ChatStatus::Starting);
+}
+
+#[test]
+fn last_operator_text_finds_the_most_recent_operator_message_past_later_activity() {
+    let messages = vec![
+        ChatMessage::Operator("first".to_string()),
+        ChatMessage::Assistant { text: "reply".to_string(), streaming: false },
+        ChatMessage::Operator("second".to_string()),
+        ChatMessage::Tool(ToolActivity { id: "1".to_string(), name: "Read".to_string(), input: serde_json::json!({}), permission: None, result: None }),
+    ];
+    assert_eq!(last_operator_text(&messages), Some("second".to_string()));
+}
+
+#[test]
+fn last_operator_text_is_none_with_no_operator_message_yet() {
+    assert_eq!(last_operator_text(&[]), None);
+}
+
+#[test]
+fn ask_about_file_prompt_mentions_the_open_file() {
+    let files = TempFiles::new("ask-about-file");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let prompt = ask_about_file_prompt(&state).expect("a file is open");
+    assert!(prompt.contains("@"), "should mention the file so claude folds it into context");
+    assert!(prompt.contains("a.txt"));
+}
+
+#[test]
+fn ask_about_file_prompt_is_none_with_no_file_open() {
+    let state = State::default();
+    assert_eq!(ask_about_file_prompt(&state), None);
+}
+
+#[test]
+fn fix_bug_prompt_prefers_the_selection_over_the_whole_file() {
+    let files = TempFiles::new("fix-bug-selection");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let editor = find_editor_mut(&mut state, &files.a).unwrap();
+    editor.click(0, 0, false);
+    editor.click(0, 1, true);
+
+    let prompt = fix_bug_prompt(&state);
+    assert!(prompt.contains("```"), "a selection should be folded in as a fenced code block");
+}
+
+#[test]
+fn fix_bug_prompt_falls_back_to_the_file_then_the_project() {
+    let files = TempFiles::new("fix-bug-file");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    assert!(fix_bug_prompt(&state).contains("a.txt"), "no selection, so it should fall back to the whole file");
+
+    let empty_state = State::default();
+    assert_eq!(fix_bug_prompt(&empty_state), "Help me find and fix a bug in this project.");
+}
+
+#[test]
+fn chat_toggle_actions_flips_the_field() {
+    let mut state = State { chat_mode: ChatMode::Docked, ..State::default() };
     assert!(!state.chat_actions_open);
     let _ = update(&mut state, Message::ChatToggleActions);
     assert!(state.chat_actions_open);
+    let _ = update(&mut state, Message::ChatToggleActions);
+    assert!(!state.chat_actions_open);
+}
+
+#[test]
+fn chat_toggle_actions_is_a_no_op_while_the_panel_is_not_active() {
+    // `⇧⌘U`'s global shortcut fires this message with no way to know
+    // whether the panel is even on screen — it must not flip the flag
+    // while inactive, or the popup would pop open unprompted the next time
+    // the panel does open.
+    let mut state = State::default();
+    assert!(!crate::state::chat_is_active(&state));
     let _ = update(&mut state, Message::ChatToggleActions);
     assert!(!state.chat_actions_open);
 }

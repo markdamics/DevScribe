@@ -6,11 +6,13 @@
 //!
 //! Resolution order in `resolve_binary`:
 //! 1. System PATH — user's own install always wins.
-//! 2. DevScribe-managed dir (under `~/.local/share/devscribe/`).
+//! 2. DevScribe-managed dir (under `~/.local/share/devscribe/`), or rustup's
+//!    own `~/.cargo/bin` for rust-analyzer specifically.
 //!
 //! Managed install locations vary by method to avoid root-permission issues:
-//! - Pip  → `venvs/<package>/bin/<binary>` (dedicated venv, avoids PEP 668)
-//! - Npm  → `servers/npm/bin/<binary>`     (`--prefix`, avoids /usr/lib)
+//! - Pip    → `venvs/<package>/bin/<binary>` (dedicated venv, avoids PEP 668)
+//! - Npm    → `servers/npm/bin/<binary>`     (`--prefix`, avoids /usr/lib)
+//! - Rustup → `~/.cargo/bin/<binary>` (rustup's own, not DevScribe-managed)
 //! - Download → `servers/<binary>`
 
 use std::io::Read;
@@ -34,8 +36,13 @@ pub enum InstallMethod {
         /// Pinned version string to use.
         version: &'static str,
     },
-    /// rust-analyzer is installed via rustup — we never install it ourselves.
-    RustupOnly,
+    /// Installs via `rustup component add rust-analyzer`. Rustup places a
+    /// proxy binary for the active toolchain at `~/.cargo/bin/rust-analyzer`,
+    /// which is typically already on PATH — so `resolve_binary`'s PATH check
+    /// finds it right after install without needing a managed copy, though
+    /// `managed_binary_path` also points there directly as a fallback for a
+    /// `~/.cargo/bin`-less PATH.
+    Rustup,
     /// Download a `.tar.gz` and unpack the entire archive into a managed
     /// subdirectory. `binary_relative` is the path to the executable within
     /// the unpacked tree (e.g. `"bin/jdtls"`).
@@ -60,7 +67,7 @@ pub fn spec_for(language: LspLanguage) -> ServerSpec {
         LspLanguage::Rust => ServerSpec {
             language,
             binary_name: "rust-analyzer",
-            method: InstallMethod::RustupOnly,
+            method: InstallMethod::Rustup,
         },
         LspLanguage::Java => ServerSpec {
             language,
@@ -101,32 +108,40 @@ pub fn spec_for(language: LspLanguage) -> ServerSpec {
 
 /// Returns the managed install path for `spec`, or `None` on platforms
 /// without a data directory. Paths differ per install method:
-/// - Pip  → `~/.local/share/devscribe/venvs/<package>/bin/<binary>`
-/// - Npm  → `~/.local/share/devscribe/servers/npm/bin/<binary>`
-/// - Download/RustupOnly → `~/.local/share/devscribe/servers/<binary>`
+/// - Pip    → `~/.local/share/devscribe/venvs/<package>/bin/<binary>`
+/// - Npm    → `~/.local/share/devscribe/servers/npm/bin/<binary>`
+/// - Rustup → `~/.cargo/bin/<binary>` (rustup's own proxy location, not a
+///   DevScribe-managed dir — there is nothing for us to manage, this is just
+///   where to look for what rustup already installed)
+/// - Download/Manual → `~/.local/share/devscribe/servers/<binary>`
 pub fn managed_binary_path(spec: &ServerSpec) -> Option<PathBuf> {
-    let base = dirs::data_dir()?.join("devscribe");
-    let path = match &spec.method {
-        InstallMethod::Pip { package } => base
-            .join("venvs")
-            .join(package)
-            .join("bin")
-            .join(spec.binary_name),
-        InstallMethod::Npm { .. } => base
-            .join("servers")
-            .join("npm")
-            .join("bin")
-            .join(spec.binary_name),
+    match &spec.method {
+        InstallMethod::Pip { package } => Some(
+            dirs::data_dir()?
+                .join("devscribe")
+                .join("venvs")
+                .join(package)
+                .join("bin")
+                .join(spec.binary_name),
+        ),
+        InstallMethod::Npm { .. } => Some(
+            dirs::data_dir()?
+                .join("devscribe")
+                .join("servers")
+                .join("npm")
+                .join("bin")
+                .join(spec.binary_name),
+        ),
+        InstallMethod::Rustup => Some(dirs::home_dir()?.join(".cargo").join("bin").join(spec.binary_name)),
         // The entire archive is extracted into this directory; lsp.rs receives
         // the directory path and builds the java -jar command from it.
         InstallMethod::TarGzDirectory { .. } => {
-            base.join("servers").join(spec.binary_name)
+            Some(dirs::data_dir()?.join("devscribe").join("servers").join(spec.binary_name))
         }
-        InstallMethod::GithubRelease { .. }
-        | InstallMethod::RustupOnly
-        | InstallMethod::Manual { .. } => base.join("servers").join(spec.binary_name),
-    };
-    Some(path)
+        InstallMethod::GithubRelease { .. } | InstallMethod::Manual { .. } => {
+            Some(dirs::data_dir()?.join("devscribe").join("servers").join(spec.binary_name))
+        }
+    }
 }
 
 /// Resolves the binary for `spec`: PATH first, then the managed dir.
@@ -156,9 +171,7 @@ pub fn which_binary(name: &str) -> bool {
 /// must be called from `iced_runtime::task::blocking`.
 pub fn install(spec: &ServerSpec) -> Result<(), String> {
     match &spec.method {
-        InstallMethod::RustupOnly => Err(
-            "rust-analyzer is installed via `rustup component add rust-analyzer`".into(),
-        ),
+        InstallMethod::Rustup => install_via_rustup(),
         InstallMethod::TarGzDirectory { url, binary_relative } => {
             install_tar_gz_directory(spec, url, binary_relative)
         }
@@ -206,6 +219,30 @@ fn install_via_pip(package: &str) -> Result<(), String> {
         .args(["install", package])
         .output()
         .map_err(|e| format!("failed to run venv pip: {e}"))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// Installs rust-analyzer as a rustup component for the active toolchain.
+/// Unlike the other methods, this doesn't unpack anything into a
+/// DevScribe-managed directory — rustup owns the install and drops its own
+/// proxy binary at `~/.cargo/bin/rust-analyzer` (see `managed_binary_path`),
+/// which is why `resolve_binary`'s plain PATH check picks it up right after
+/// this returns on any machine where `~/.cargo/bin` is on PATH, same as
+/// `cargo`/`rustc` themselves.
+fn install_via_rustup() -> Result<(), String> {
+    let rustup = find_on_path(&["rustup"]).ok_or_else(|| {
+        "rustup not found — install Rust via https://rustup.rs first".to_string()
+    })?;
+
+    let out = Command::new(&rustup)
+        .args(["component", "add", "rust-analyzer"])
+        .output()
+        .map_err(|e| format!("failed to run rustup: {e}"))?;
 
     if out.status.success() {
         Ok(())

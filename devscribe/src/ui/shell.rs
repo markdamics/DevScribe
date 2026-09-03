@@ -33,6 +33,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     let pending_revert_line = editor.pending_revert_line;
     let problem_lens_enabled = state.problem_lens_enabled;
     let show_line_numbers = state.show_line_numbers;
+    let word_wrap = state.word_wrap;
     let font_size = state.editor_font_size;
     let scroll_offset = editor.scroll_offset;
     let max_line_chars = editor.max_line_chars();
@@ -51,6 +52,19 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     // (rather than waiting for a scroll event to learn it), so the canvas
     // knows which lines are visible from the very first frame.
     let editor_pane = responsive(move |size| {
+        // Computed here (not on `EditorCanvas`) because it needs `document`
+        // and `size.width`, both of which only meet in this closure —
+        // `draw`/`hit_test` then reuse this same copy rather than each
+        // re-deriving their own. Left empty (and unused) when word wrap is
+        // off — see `wrap_row_offsets`'s own doc comment for the O(document
+        // length) cost this accepts whenever it's actually on.
+        let wrap_offsets = std::rc::Rc::new(if word_wrap {
+            let wrap_cols = editor_canvas::wrap_cols_for_pane(size.width, font_size);
+            editor_canvas::wrap_row_offsets(&document, wrap_cols)
+        } else {
+            Vec::new()
+        });
+
         let program = EditorCanvas {
             document: document.clone(),
             cursor,
@@ -63,6 +77,8 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             pending_revert_line,
             problem_lens_enabled,
             show_line_numbers,
+            word_wrap,
+            wrap_offsets: wrap_offsets.clone(),
             font_size,
             find_matches: find_matches.clone(),
             find_current,
@@ -71,23 +87,38 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             ghost_text: ghost_text.clone(),
         };
 
-        // At least the pane's own width (`size.width`, from `responsive`) so
-        // a short-lined file still fills the pane exactly like before; wider
-        // when the document's longest line needs more than that, which is
-        // what makes it something to scroll sideways *into*.
-        let canvas_width = editor_canvas::content_width(max_line_chars, font_size).max(size.width);
+        // Unwrapped: at least the pane's own width (`size.width`, from
+        // `responsive`) so a short-lined file still fills the pane exactly
+        // like before; wider when the document's longest line needs more
+        // than that, which is what makes it something to scroll sideways
+        // *into*. Wrapped: always exactly the pane's width — word wrap's
+        // whole point is that nothing needs scrolling sideways to be seen.
+        let canvas_width = if word_wrap {
+            size.width
+        } else {
+            editor_canvas::content_width(max_line_chars, font_size).max(size.width)
+        };
+        let content_rows = if word_wrap {
+            wrap_offsets.last().copied().unwrap_or(0) as usize
+        } else {
+            line_count
+        };
 
         let canvas_widget = canvas(program)
             .width(Length::Fixed(canvas_width))
             .height(Length::Fixed(editor_canvas::content_height(
-                line_count, font_size,
+                content_rows, font_size,
             )));
 
         scrollable(canvas_widget)
             .id(state::editor_scroll_id())
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
+            .direction(if word_wrap {
+                scrollable::Direction::Vertical(scrollable::Scrollbar::default())
+            } else {
+                scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                }
             })
             .on_scroll(|viewport| {
                 let offset = viewport.absolute_offset();

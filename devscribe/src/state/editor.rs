@@ -1758,6 +1758,7 @@ pub const CHAT_DEFAULT_WIDTH: f32 = 340.0;
 /// palette's `:N` syntax (`filtered_palette_entries`) and `Ctrl+G`'s job.
 pub fn goto_line(state: &mut State, line: usize) -> iced::Task<Message> {
     let font_size = state.editor_font_size;
+    let word_wrap = state.word_wrap;
     let Some(path) = active_file_path(state) else {
         return iced::Task::none();
     };
@@ -1767,7 +1768,7 @@ pub fn goto_line(state: &mut State, line: usize) -> iced::Task<Message> {
     let target = line.saturating_sub(1).min(editor.document.line_count().saturating_sub(1));
     editor.cursor = CursorPos { line: target, col: 0 };
     editor.selection_anchor = None;
-    center_line_in_viewport(editor, font_size, target)
+    center_line_in_viewport(editor, font_size, word_wrap, target)
 }
 
 /// `⌘S` / palette "Save File". An untitled buffer (`document.path()` still
@@ -1968,6 +1969,7 @@ pub fn find_step(state: &mut State, delta: i32) -> iced::Task<Message> {
         return iced::Task::none();
     };
     let font_size = state.editor_font_size;
+    let word_wrap = state.word_wrap;
     let Some(editor) = find_editor_mut(state, &path) else {
         return iced::Task::none();
     };
@@ -1983,7 +1985,7 @@ pub fn find_step(state: &mut State, delta: i32) -> iced::Task<Message> {
     let cursor: CursorPos = editor.document.line_col(target.start).into();
     editor.cursor = cursor;
     editor.selection_anchor = None;
-    center_line_in_viewport(editor, font_size, cursor.line)
+    center_line_in_viewport(editor, font_size, word_wrap, cursor.line)
 }
 
 /// The active file tab's "Replace" button: replaces the current find match,
@@ -1995,6 +1997,7 @@ pub fn replace_current_match(state: &mut State) -> iced::Task<Message> {
         return iced::Task::none();
     };
     let font_size = state.editor_font_size;
+    let word_wrap = state.word_wrap;
     let Some(editor) = find_editor_mut(state, &path) else {
         return iced::Task::none();
     };
@@ -2006,7 +2009,7 @@ pub fn replace_current_match(state: &mut State) -> iced::Task<Message> {
         return iced::Task::none();
     };
     let line = editor.document.line_col(target.start).0;
-    center_line_in_viewport(editor, font_size, line)
+    center_line_in_viewport(editor, font_size, word_wrap, line)
 }
 
 /// The active file tab's "Replace All" button.
@@ -2024,9 +2027,22 @@ pub fn replace_all_matches(state: &mut State) {
 /// already fully visible — shared by Find's "jump to next match" and Go to
 /// Line, which both want "leave it alone if visible, otherwise recenter"
 /// rather than `scroll_cursor_into_view`'s minimal nudge.
-pub fn center_line_in_viewport(editor: &mut EditorState, font_size: f32, line: usize) -> iced::Task<Message> {
+pub fn center_line_in_viewport(
+    editor: &mut EditorState,
+    font_size: f32,
+    word_wrap: bool,
+    line: usize,
+) -> iced::Task<Message> {
     let line_height = editor_canvas::line_height_px(font_size);
-    let line_top = editor_canvas::line_top(line, font_size);
+    let line_top = if word_wrap {
+        let wrap_cols = editor_canvas::wrap_cols_for_pane(
+            if editor.viewport_width > 0.0 { editor.viewport_width } else { ASSUMED_VIEWPORT_WIDTH },
+            font_size,
+        );
+        editor_canvas::row_top_wrapped(&editor.document, wrap_cols, line, 0, font_size)
+    } else {
+        editor_canvas::line_top(line, font_size)
+    };
     let line_bottom = line_top + line_height;
     let viewport_height = if editor.viewport_height > 0.0 {
         editor.viewport_height
@@ -2081,11 +2097,20 @@ pub fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
         return iced::Task::none();
     };
     let font_size = state.editor_font_size;
+    let word_wrap = state.word_wrap;
     let Some(editor) = find_editor_mut(state, &path) else {
         return iced::Task::none();
     };
 
-    let line_top = editor_canvas::line_top(editor.cursor.line, font_size);
+    let line_top = if word_wrap {
+        let wrap_cols = editor_canvas::wrap_cols_for_pane(
+            if editor.viewport_width > 0.0 { editor.viewport_width } else { ASSUMED_VIEWPORT_WIDTH },
+            font_size,
+        );
+        editor_canvas::row_top_wrapped(&editor.document, wrap_cols, editor.cursor.line, editor.cursor.col, font_size)
+    } else {
+        editor_canvas::line_top(editor.cursor.line, font_size)
+    };
     let line_bottom = line_top + editor_canvas::line_height_px(font_size);
     let viewport_height = if editor.viewport_height > 0.0 {
         editor.viewport_height
@@ -2102,25 +2127,34 @@ pub fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
         None
     };
 
-    // Treats the caret as one char wide rather than a zero-width point, so
-    // the char just typed at the far edge is fully in view, not just the
-    // caret's own leading pixel.
-    let char_width = editor_canvas::char_width_px(font_size);
-    let col_left = editor_canvas::col_left(editor.cursor.col, font_size);
-    let col_right = col_left + char_width;
-    let viewport_width = if editor.viewport_width > 0.0 {
-        editor.viewport_width
+    // Word wrap has no horizontal scroll at all (the canvas is exactly the
+    // pane's width — see `shell.rs`'s `code_area`), so there is nothing for
+    // this half to do: every column of a wrapped row is already on-screen
+    // by construction.
+    let (target_x, visible_left) = if word_wrap {
+        (None, 0.0)
     } else {
-        ASSUMED_VIEWPORT_WIDTH
-    };
-    let visible_left = editor.scroll_offset_x;
-    let visible_right = visible_left + viewport_width;
-    let target_x = if col_left < visible_left {
-        Some(col_left)
-    } else if col_right > visible_right {
-        Some(col_right - viewport_width)
-    } else {
-        None
+        // Treats the caret as one char wide rather than a zero-width point,
+        // so the char just typed at the far edge is fully in view, not just
+        // the caret's own leading pixel.
+        let char_width = editor_canvas::char_width_px(font_size);
+        let col_left = editor_canvas::col_left(editor.cursor.col, font_size);
+        let col_right = col_left + char_width;
+        let viewport_width = if editor.viewport_width > 0.0 {
+            editor.viewport_width
+        } else {
+            ASSUMED_VIEWPORT_WIDTH
+        };
+        let visible_left = editor.scroll_offset_x;
+        let visible_right = visible_left + viewport_width;
+        let target_x = if col_left < visible_left {
+            Some(col_left)
+        } else if col_right > visible_right {
+            Some(col_right - viewport_width)
+        } else {
+            None
+        };
+        (target_x, visible_left)
     };
 
     if target_y.is_none() && target_x.is_none() {
@@ -2135,7 +2169,7 @@ pub fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
     // is nothing useful *between* 0 and `text_x0` to reveal by stopping
     // short of it. Snap to 0 instead whenever the target would do that.
     let text_x0 = editor_canvas::col_left(0, font_size);
-    let target_x = if target_x <= text_x0 { 0.0 } else { target_x };
+    let target_x = if word_wrap || target_x <= text_x0 { 0.0 } else { target_x };
 
     // Updated by hand rather than waiting for the scrollable's `on_scroll` to
     // report back: the next keystroke of a held arrow key redoes this same

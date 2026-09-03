@@ -239,6 +239,22 @@ pub fn breadcrumbs_at(tree: &Tree, rope: &Rope, byte_offset: usize, language: La
     crumbs
 }
 
+/// The innermost crumb that names an actual definition (Module/Type/
+/// Function/Closure), rather than the innermost overall — a control-flow
+/// crumb (`for`/`if`/`match`, with no real name of its own) trailing after
+/// it doesn't count. Falls back to the last crumb overall so something is
+/// always picked out even when the cursor has no enclosing definition (a
+/// loop at a script's top level, say). Shared by `breadcrumb_bar` (which
+/// crumb to bold in the strip) and the chat panel's "active symbol" quick
+/// action (which crumb names the prompt context) — both want the same
+/// "what scope is this, really" answer.
+pub fn emphasized_index(crumbs: &[Crumb]) -> Option<usize> {
+    crumbs
+        .iter()
+        .rposition(|c| matches!(c.kind, CrumbKind::Module | CrumbKind::Type | CrumbKind::Function | CrumbKind::Closure))
+        .or(if crumbs.is_empty() { None } else { Some(crumbs.len() - 1) })
+}
+
 fn node_text(node: Node, rope: &Rope) -> Option<String> {
     rope.get_byte_slice(node.start_byte()..node.end_byte())
         .map(|s| s.to_string())

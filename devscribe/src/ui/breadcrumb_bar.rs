@@ -10,7 +10,7 @@
 //! Crumbs come from `EditorState::breadcrumbs()` — see
 //! `devscribe_core::outline` for how the scope stack is actually found.
 use devscribe_core::lsp::DiagnosticSeverity;
-use devscribe_core::outline::{Crumb, CrumbKind};
+use devscribe_core::outline::{self, Crumb, CrumbKind};
 use devscribe_core::theme::Palette;
 use iced::font::Weight;
 use iced::widget::{button, column, container, row, text};
@@ -37,22 +37,6 @@ fn glyph(kind: CrumbKind) -> &'static str {
         CrumbKind::Conditional => "?",
         CrumbKind::Match => "\u{2261}",      // ≡
     }
-}
-
-/// The mockup emphasizes exactly one crumb (`text-strong`; the rest sit at
-/// `text-muted`) — not the innermost overall, but the innermost *named*
-/// scope: in its own example, the enclosing function is bold while both
-/// the outer module and the trailing `for`-loop stay muted. Mirrors that:
-/// the last crumb that names an actual definition (Module/Type/Function/
-/// Closure) is emphasized; any control-flow crumbs after it, and everything
-/// before it, are not. Falls back to the last crumb overall so something is
-/// always emphasized even when the cursor has no enclosing definition (a
-/// loop at a script's top level, say).
-fn emphasized_index(crumbs: &[Crumb]) -> Option<usize> {
-    crumbs
-        .iter()
-        .rposition(|c| matches!(c.kind, CrumbKind::Module | CrumbKind::Type | CrumbKind::Function | CrumbKind::Closure))
-        .or(if crumbs.is_empty() { None } else { Some(crumbs.len() - 1) })
 }
 
 fn crumb_view(crumb: &Crumb, emphasized: bool, p: Palette) -> Element<'static, Message> {
@@ -112,7 +96,7 @@ fn chevron(p: Palette) -> Element<'static, Message> {
 /// cursor happens to sit.
 pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
     let crumbs = editor.breadcrumbs();
-    let emphasized = emphasized_index(&crumbs);
+    let emphasized = outline::emphasized_index(&crumbs);
 
     let mut path = Vec::with_capacity(crumbs.len() * 2);
     for (i, crumb) in crumbs.iter().enumerate() {

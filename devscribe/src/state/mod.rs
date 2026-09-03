@@ -198,8 +198,8 @@ pub struct State {
     /// `sidebar_resizing`.
     pub chat_resizing: bool,
     /// Bumped to force `subscription()` to tear down and respawn the chat
-    /// worker for the *same* session id — reserved for a future "retry
-    /// after the process died" action, not currently wired to any UI.
+    /// worker for the *same* session id — the empty thread's "Try again"
+    /// action (`Message::ChatRetryConnection`) after `ChatStatus::Unavailable`.
     /// Mirrors `lsp_restart_token`.
     pub chat_restart_token: u64,
     /// The session id `chat_worker` will spawn or resume next — never
@@ -230,6 +230,17 @@ pub struct State {
     /// backdrop-close popup convention as `chat_view_menu_open`; every
     /// action closes it on press.
     pub chat_actions_open: bool,
+    /// Whether the message list should keep following new output — `true`
+    /// (the default, and reset to `true` any time the transcript itself
+    /// resets: a new/resumed session, `ChatFullHistoryLoaded`) until
+    /// `ChatScrolled` reports the user isn't within `PIN_TO_BOTTOM_SLACK` of
+    /// the bottom, meaning they've scrolled up to read earlier output.
+    /// `handle_chat_event` only re-snaps the scroll position to the latest
+    /// message while this is `true` — the "stay pinned when reading fresh
+    /// output, preserve position when browsing older conversation" half of
+    /// the chat-panel UX pass (item 6). Scrolling back down within the
+    /// slack re-pins it, same as every chat client's own convention.
+    pub chat_pinned_to_bottom: bool,
     /// Local-only UI state for the Actions popup's "Thinking" toggle — not
     /// persisted (like `chat_permission_mode`, this only matters for the
     /// currently-running subprocess, if any), and not round-tripped from
@@ -437,6 +448,13 @@ pub struct State {
     /// `draw`) — the gutter itself (git-diff marks, revert clicks) stays
     /// regardless, since those aren't "line numbers".
     pub show_line_numbers: bool,
+    /// Off by default (matching `Settings::default()`). When on, a buffer
+    /// line wider than the editor pane renders as several visual rows
+    /// instead of scrolling sideways — see `editor_canvas::wrap_row_starts`
+    /// for the wrapping itself and `EditorCanvas::word_wrap`'s own doc
+    /// comment for why `draw`/`hit_test` share one code path with the
+    /// unwrapped case rather than branching throughout.
+    pub word_wrap: bool,
     pub toasts: Vec<Toast>,
     next_toast_id: u64,
     /// Non-`None` while the sidebar tree has an inline new-file/new-folder/
@@ -514,6 +532,7 @@ impl Default for State {
             chat_sessions_open: false,
             chat_view_menu_open: false,
             chat_actions_open: false,
+            chat_pinned_to_bottom: true,
             chat_thinking_enabled: false,
             chat_shell_access_enabled: false,
             // Matches the behavior this app has always had before mode
@@ -578,6 +597,7 @@ impl Default for State {
             ui_font_scale: settings.ui_font_scale,
             tab_size: settings.tab_size,
             show_line_numbers: settings.show_line_numbers,
+            word_wrap: settings.word_wrap,
             toasts: Vec::new(),
             next_toast_id: 0,
             draft: None,
@@ -626,6 +646,11 @@ pub enum Message {
     /// other way — mirrors the title-bar button's old `ToggleAssist`
     /// behavior, and the mockup's own `toggleChat`.
     ChatToggle,
+    /// `⇧⌘I` — opens the chat panel if it isn't active yet (same as
+    /// `ChatToggle`'s "closed" branch) and always focuses the composer,
+    /// unlike `ChatToggle` which closes an already-open panel instead.
+    /// "Focus chat" (chat-panel UX pass, item 6).
+    ChatFocus,
     /// Opens or closes the header's "View" popup — see
     /// `State::chat_view_menu_open`'s own doc comment.
     ChatToggleViewMenu,
@@ -644,10 +669,28 @@ pub enum Message {
     /// Enter (or the input bar's send action) — submits `state.chat.input`
     /// as a new turn and clears the draft.
     ChatSubmit,
+    /// Sends `String` as a complete new turn, bypassing the draft entirely —
+    /// the empty thread's starter prompts (`ask_about_file_prompt`,
+    /// `SUMMARIZE_PROJECT_PROMPT`, `fix_bug_prompt`) and the continuation
+    /// row's "Retry"/"Regenerate"/"Continue" (chat-panel UX pass, items 7
+    /// and 8). A no-op with no live session.
+    ChatSendPrompt(String),
+    /// "Try again" on the empty thread's failure state — bumps
+    /// `chat_restart_token` to force the worker to respawn (see its own doc
+    /// comment: reserved for exactly this since it was added).
+    ChatRetryConnection,
     /// An event from the running `claude` subprocess (see `chat_worker`).
     Chat(ClaudeEvent),
     ChatApprovePermission(String),
     ChatDenyPermission(String),
+    /// Expands/collapses a `permission_card`'s truncated diff preview — see
+    /// `ChatThread::expanded_tools`.
+    ChatToggleToolExpanded(String),
+    /// Copies a single message's raw text (an operator prompt or a settled
+    /// assistant reply — see `operator_row`/`assistant_row`'s own "Copy"
+    /// buttons) to the system clipboard. Same `push_flash` confirmation as
+    /// `CopyPath`.
+    ChatCopyText(String),
     /// Pressed the chat panel's edge resize handle.
     ChatResizeStarted,
     /// Cursor moved while resizing — carries the cursor's window-space X
@@ -655,6 +698,11 @@ pub enum Message {
     /// on the panel's *left* edge (the panel itself is docked to the right).
     ChatResizeDragged(f32),
     ChatResizeEnded,
+    /// The message list's own `on_scroll` — carries how many pixels the
+    /// viewport currently sits above the true bottom
+    /// (`Viewport::absolute_offset_reversed().y`, `0.0` exactly at the
+    /// bottom). Drives `State::chat_pinned_to_bottom`.
+    ChatScrolled(f32),
     /// Starts a genuinely fresh session (new random id — see
     /// `claude_agent::new_session_id`), replacing whatever session was
     /// active. The old one isn't lost: it's still on disk, and will show
@@ -701,6 +749,18 @@ pub enum Message {
     /// `ChatMentionFileDialog`) or by absolute path (`false`,
     /// `ChatAttachFileDialog`). `None` means the dialog was cancelled.
     ChatFileDialogResult(Option<PathBuf>, bool),
+    /// "Current file" quick action — mentions the active tab's file with no
+    /// file-picker round-trip. See `insert_current_file_context`.
+    ChatMentionCurrentFile,
+    /// "Selected text" quick action — folds the active editor's selection
+    /// into the draft as a fenced code block. See `insert_selection_context`.
+    ChatMentionSelection,
+    /// "Active symbol" quick action — names the innermost enclosing
+    /// function/type at the cursor. See `insert_active_symbol_context`.
+    ChatMentionActiveSymbol,
+    /// "Project root" quick action — names the open project. See
+    /// `insert_project_root_context`.
+    ChatMentionProjectRoot,
     /// "Switch model…" — sends `/model` (with no argument), which `claude`
     /// answers in place with the current model and how to change it,
     /// rather than DevScribe guessing at available model names itself.
@@ -874,6 +934,7 @@ pub enum Message {
     SetUiFontScale(f32),
     SetTabSize(u8),
     ToggleShowLineNumbers,
+    ToggleWordWrap,
     DismissToast(u64),
     PruneToasts,
     EditorSave,
@@ -1026,13 +1087,27 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::FocusSearchTab => focus_search(state),
         Message::ChatToggle => toggle_chat(state),
-        Message::ChatToggleViewMenu => state.chat_view_menu_open = !state.chat_view_menu_open,
+        Message::ChatFocus => {
+            if !chat_is_active(state) {
+                open_chat_as_tab(state);
+                persist_settings(state);
+                persist_session(state);
+            }
+            return focus_chat_input();
+        }
+        Message::ChatToggleViewMenu => {
+            state.chat_view_menu_open = !state.chat_view_menu_open;
+            if !state.chat_view_menu_open {
+                return focus_chat_input();
+            }
+        }
         Message::ChatDock => {
             leave_chat_tab(state);
             state.chat_mode = ChatMode::Docked;
             state.chat_view_menu_open = false;
             persist_settings(state);
             persist_session(state);
+            return focus_chat_input();
         }
         Message::ChatCollapse => {
             leave_chat_tab(state);
@@ -1048,6 +1123,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.chat_view_menu_open = false;
             persist_settings(state);
             persist_session(state);
+            return focus_chat_input();
         }
         Message::ChatDockFromTab => {
             leave_chat_tab(state);
@@ -1055,15 +1131,40 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.chat_view_menu_open = false;
             persist_settings(state);
             persist_session(state);
+            return focus_chat_input();
         }
         Message::ChatCloseTab => {
             leave_chat_tab(state);
             persist_session(state);
         }
         Message::ChatInputAction(action) => state.chat.input.perform(action),
-        Message::ChatSubmit => submit_chat_prompt(state),
-        Message::ChatSetPermissionMode(mode) => state.chat_permission_mode = mode,
-        Message::ChatSetProvider(provider) => state.chat_provider = provider,
+        Message::ChatSubmit => {
+            submit_chat_prompt(state);
+            // `submit_chat_prompt` (via `send_chat_text`) already re-pins
+            // `chat_pinned_to_bottom`, but the actual scroll only happens
+            // the next time `handle_chat_event` runs — batch an immediate
+            // snap here too so sending doesn't wait on the worker's next
+            // event to visibly jump to the bottom.
+            return iced::Task::batch([iced::widget::operation::snap_to_end(chat_scroll_id()), focus_chat_input()]);
+        }
+        Message::ChatSendPrompt(text) => {
+            if state.chat.sender.is_some() {
+                send_chat_text(state, text);
+            }
+            return iced::Task::batch([iced::widget::operation::snap_to_end(chat_scroll_id()), focus_chat_input()]);
+        }
+        Message::ChatRetryConnection => {
+            state.chat_restart_token += 1;
+            state.chat.status = ChatStatus::Starting;
+        }
+        Message::ChatSetPermissionMode(mode) => {
+            state.chat_permission_mode = mode;
+            return focus_chat_input();
+        }
+        Message::ChatSetProvider(provider) => {
+            state.chat_provider = provider;
+            return focus_chat_input();
+        }
         Message::ChatLaunchDesignLogin => {
             if launch_terminal_running_claude() {
                 push_toast(state, ToastKind::Success, "Opened a terminal \u{2014} run /design-login there, then retry here.");
@@ -1075,7 +1176,19 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 );
             }
         }
-        Message::ChatToggleActions => state.chat_actions_open = !state.chat_actions_open,
+        Message::ChatToggleActions => {
+            // Guarded on `chat_is_active` (rather than trusting every caller
+            // to check first) because `⇧⌘U`'s global shortcut has no way to
+            // know whether the panel is even on screen — without this, it'd
+            // flip the flag regardless, and the popup would then pop open
+            // unprompted the next time the panel *did* open.
+            if chat_is_active(state) {
+                state.chat_actions_open = !state.chat_actions_open;
+                if !state.chat_actions_open {
+                    return focus_chat_input();
+                }
+            }
+        }
         Message::ChatAttachFileDialog => {
             state.chat_actions_open = false;
             let dir = state.root.clone();
@@ -1090,18 +1203,41 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(path) = path {
                 insert_chat_mention(state, &path, relative_to_project);
             }
+            return focus_chat_input();
+        }
+        Message::ChatMentionCurrentFile => {
+            state.chat_actions_open = false;
+            insert_current_file_context(state);
+            return focus_chat_input();
+        }
+        Message::ChatMentionSelection => {
+            state.chat_actions_open = false;
+            insert_selection_context(state);
+            return focus_chat_input();
+        }
+        Message::ChatMentionActiveSymbol => {
+            state.chat_actions_open = false;
+            insert_active_symbol_context(state);
+            return focus_chat_input();
+        }
+        Message::ChatMentionProjectRoot => {
+            state.chat_actions_open = false;
+            insert_project_root_context(state);
+            return focus_chat_input();
         }
         Message::ChatShowModel => {
             state.chat_actions_open = false;
             if state.chat.sender.is_some() {
                 send_chat_text(state, "/model".to_string());
             }
+            return focus_chat_input();
         }
         Message::ChatShowUsage => {
             state.chat_actions_open = false;
             if state.chat.sender.is_some() {
                 send_chat_text(state, "/usage".to_string());
             }
+            return focus_chat_input();
         }
         Message::ChatToggleThinking => {
             state.chat_thinking_enabled = !state.chat_thinking_enabled;
@@ -1110,14 +1246,31 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 let cmd = if state.chat_thinking_enabled { "/effort high" } else { "/effort auto" };
                 send_chat_text(state, cmd.to_string());
             }
+            return focus_chat_input();
         }
         Message::ChatToggleShellAccess => {
             state.chat_shell_access_enabled = !state.chat_shell_access_enabled;
             state.chat_actions_open = false;
+            return focus_chat_input();
         }
         Message::Chat(event) => return handle_chat_event(state, event),
-        Message::ChatApprovePermission(id) => respond_permission(state, id, true, None),
-        Message::ChatDenyPermission(id) => respond_permission(state, id, false, Some("denied by user".to_string())),
+        Message::ChatApprovePermission(id) => {
+            respond_permission(state, id, true, None);
+            return focus_chat_input();
+        }
+        Message::ChatDenyPermission(id) => {
+            respond_permission(state, id, false, Some("denied by user".to_string()));
+            return focus_chat_input();
+        }
+        Message::ChatToggleToolExpanded(id) => {
+            if !state.chat.expanded_tools.remove(&id) {
+                state.chat.expanded_tools.insert(id);
+            }
+        }
+        Message::ChatCopyText(text) => {
+            push_flash(state, "COPIED TO CLIPBOARD");
+            return iced::clipboard::write(text);
+        }
         Message::ChatResizeStarted => state.chat_resizing = true,
         Message::ChatResizeDragged(x) => {
             if state.chat_resizing {
@@ -1128,22 +1281,35 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.chat_resizing = false;
             persist_settings(state);
         }
+        Message::ChatScrolled(distance_from_bottom) => {
+            state.chat_pinned_to_bottom = distance_from_bottom <= CHAT_SCROLL_PIN_SLACK;
+        }
         Message::ChatNewSession => {
+            if !chat_is_active(state) {
+                open_chat_as_tab(state);
+                persist_settings(state);
+                persist_session(state);
+            }
             state.chat_session_id = claude_agent::new_session_id();
             state.chat = ChatThread::default();
+            state.chat_pinned_to_bottom = true;
             state.chat_sessions_open = false;
             state.chat_actions_open = false;
+            return focus_chat_input();
         }
         Message::ChatResumeSession(id) => {
             state.chat_session_id = id;
             state.chat = ChatThread::default();
+            state.chat_pinned_to_bottom = true;
             state.chat_sessions_open = false;
+            return focus_chat_input();
         }
         Message::ChatToggleSessions => {
             state.chat_sessions_open = !state.chat_sessions_open;
             if state.chat_sessions_open {
                 return start_loading_chat_sessions(state);
             }
+            return focus_chat_input();
         }
         Message::ChatSessionsLoaded(sessions) => state.chat_sessions = sessions,
         Message::LoadEarlierChatHistory => return load_earlier_chat_history(state),
@@ -1156,6 +1322,13 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             // separate reducer that operates on a detached list first.
             state.chat.messages.clear();
             state.chat.history_truncated = false;
+            // "Load earlier messages" is itself a "let me read from the
+            // start" action — unpin first so none of the replayed events
+            // below (each routed through the same `handle_chat_event` a
+            // live turn uses) snap the now much longer transcript back down
+            // to the end before the user has seen any of what they asked to
+            // load.
+            state.chat_pinned_to_bottom = false;
             for event in events {
                 let _ = handle_chat_event(state, event);
             }
@@ -1863,6 +2036,10 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             state.show_line_numbers = !state.show_line_numbers;
             persist_settings(state);
         }
+        Message::ToggleWordWrap => {
+            state.word_wrap = !state.word_wrap;
+            persist_settings(state);
+        }
         Message::DismissToast(id) => state.toasts.retain(|t| t.id != id),
         Message::PruneToasts => {
             state.toasts.retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
@@ -2380,6 +2557,7 @@ fn persist_settings(state: &State) {
         chat_panel_width: state.chat_panel_width,
         tab_size: state.tab_size,
         show_line_numbers: state.show_line_numbers,
+        word_wrap: state.word_wrap,
     });
 }
 
@@ -2724,10 +2902,16 @@ fn global_keys(event: keyboard::Event) -> Message {
                 return Message::ViewWorkingTreeDiff;
             }
             if c.eq_ignore_ascii_case("i") {
-                return Message::ChatToggle;
+                return if modifiers.shift() {
+                    Message::ChatFocus
+                } else if modifiers.alt() {
+                    Message::ChatNewSession
+                } else {
+                    Message::ChatToggle
+                };
             }
             if c.eq_ignore_ascii_case("u") {
-                return Message::ChatAttachFileDialog;
+                return if modifiers.shift() { Message::ChatToggleActions } else { Message::ChatAttachFileDialog };
             }
             if c.eq_ignore_ascii_case("g") {
                 return Message::OpenGoToLine;

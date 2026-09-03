@@ -30,13 +30,16 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
     let (pos, hover_text) = editor.hover.clone()?;
     let font_size = state.editor_font_size;
 
-    let (x, y) = editor_canvas::cursor_pixel_pos(
+    let (x, y) = editor_canvas::cursor_pixel_pos_wrapped(
+        &editor.document,
+        state.word_wrap,
         pos.line,
         pos.col,
         font_size,
         editor.scroll_offset,
         editor.scroll_offset_x,
         HEADER_HEIGHT,
+        if editor.viewport_width > 0.0 { editor.viewport_width } else { crate::state::ASSUMED_VIEWPORT_WIDTH },
     );
 
     let body = scrollable(

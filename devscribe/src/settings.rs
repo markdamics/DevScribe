@@ -1,7 +1,7 @@
 //! Persisted app-level settings: every value the Settings panel exposes —
 //! theme mode + accent, chrome density, UI/editor font size, tab size,
-//! line-number visibility, and the Explorer/Editor/Toolchains toggles — in
-//! one JSON file under
+//! line-number visibility, word wrap, and the Explorer/Editor/Toolchains
+//! toggles — in one JSON file under
 //! `~/.config/devscribe/`, loaded once at startup, best-effort on write (a
 //! failure here is never a hard error — the app just falls back to
 //! defaults). `state.rs`'s `persist_settings` is the single place any of
@@ -33,6 +33,7 @@ pub struct Settings {
     pub chat_panel_width: f32,
     pub tab_size: u8,
     pub show_line_numbers: bool,
+    pub word_wrap: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +66,7 @@ impl Default for Settings {
             chat_panel_width: crate::state::CHAT_DEFAULT_WIDTH,
             tab_size: crate::state::TAB_SIZE_DEFAULT,
             show_line_numbers: true,
+            word_wrap: false,
         }
     }
 }
@@ -110,6 +112,8 @@ struct SettingsFile {
     tab_size: u8,
     #[serde(default = "default_true")]
     show_line_numbers: bool,
+    #[serde(default)]
+    word_wrap: bool,
 }
 
 fn default_true() -> bool {
@@ -221,6 +225,7 @@ fn load_from(path: &Path) -> Option<Settings> {
         chat_panel_width: file.chat_panel_width,
         tab_size: file.tab_size,
         show_line_numbers: file.show_line_numbers,
+        word_wrap: file.word_wrap,
     })
 }
 
@@ -256,6 +261,7 @@ fn save_to(path: &Path, settings: &Settings) {
         chat_panel_width: settings.chat_panel_width,
         tab_size: settings.tab_size,
         show_line_numbers: settings.show_line_numbers,
+        word_wrap: settings.word_wrap,
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(path, json);

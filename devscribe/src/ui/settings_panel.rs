@@ -448,6 +448,17 @@ fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
         ]
         .spacing(8.0),
         column![
+            section_label("WRAPPING", p),
+            toggle_row(
+                "Word wrap",
+                "Wrap long lines to the pane width instead of scrolling sideways",
+                state.word_wrap,
+                Message::ToggleWordWrap,
+                p,
+            ),
+        ]
+        .spacing(8.0),
+        column![
             section_label("DIAGNOSTICS", p),
             toggle_row(
                 "Inline problem lens",
@@ -604,8 +615,20 @@ fn shortcuts_content(p: Palette) -> Element<'static, Message> {
             column![
                 shortcut_row("Command palette", "\u{2318}K", p),
                 shortcut_row("Keyboard shortcuts", "\u{2318}/", p),
-                shortcut_row("Toggle assist", "\u{2318}I", p),
                 shortcut_row("Escape / close", "esc", p),
+            ]
+        ]
+        .spacing(8.0),
+        column![
+            section_label("AI CHAT ASSIST", p),
+            column![
+                shortcut_row("Toggle chat", "\u{2318}I", p),
+                shortcut_row("Focus chat", "\u{21e7}\u{2318}I", p),
+                shortcut_row("New session", "\u{2325}\u{2318}I", p),
+                shortcut_row("Open actions menu", "\u{21e7}\u{2318}U", p),
+                shortcut_row("Attach file", "\u{2318}U", p),
+                shortcut_row("Send message", "Enter", p),
+                shortcut_row("New line", "\u{21e7}Enter", p),
             ]
         ]
         .spacing(8.0),

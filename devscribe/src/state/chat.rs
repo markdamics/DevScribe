@@ -152,6 +152,20 @@ pub struct ChatThread {
     /// `Message::ChatFullHistoryLoaded` replaces `messages` with the
     /// complete replay.
     pub history_truncated: bool,
+    /// `true` from the moment `submit_chat_prompt`/`send_chat_text` forwards
+    /// a turn to the worker until the first sign of life comes back — drives
+    /// the composer's "Sending…" status. Cleared on whatever arrives first
+    /// (a streamed delta, a tool call, a permission request, or
+    /// `Unavailable`), not tied to `TurnResult` alone: a tool-heavy turn can
+    /// run for a while before `claude` says anything back in words, and the
+    /// point of this flag is just "is the input still in flight," not
+    /// "has the whole turn finished."
+    pub sending: bool,
+    /// Tool ids whose `permission_card` diff preview has been expanded past
+    /// its truncated default — see `chat_panel::permission_card`. Keyed by
+    /// id rather than a bool on `ToolActivity` itself since this is pure
+    /// presentation state, not something the wire protocol ever reports.
+    pub expanded_tools: std::collections::HashSet<String>,
 }
 
 impl ChatThread {
@@ -174,6 +188,29 @@ pub fn chat_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("chat-scroll-area")
 }
 
+/// How close to the bottom (in pixels) the message list's `on_scroll` still
+/// counts as "at the bottom" for `State::chat_pinned_to_bottom` — a little
+/// slack so settling exactly on the last pixel isn't required to stay
+/// pinned, and so scrolling back down within a few dozen pixels of the
+/// bottom re-pins it, same as every other chat client's own convention.
+pub const CHAT_SCROLL_PIN_SLACK: f32 = 48.0;
+
+/// A stable id for the composer's `text_editor`, so `update()` can return
+/// focus to it after a transient UI element that briefly stole it (the
+/// Actions/View popups, the sessions picker, a permission decision, a
+/// provider/mode switch, a file-mention dialog) closes — see
+/// `focus_chat_input`. Same one-global-id reasoning as `chat_scroll_id`:
+/// Docked and Tab presentation are mutually exclusive.
+pub fn chat_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("chat-input")
+}
+
+/// Returns focus to the composer — see `chat_input_id`'s own doc comment
+/// for when this is called.
+pub fn focus_chat_input() -> iced::Task<Message> {
+    iced::widget::operation::focus(chat_input_id())
+}
+
 /// Shared by the title-bar button, `⌘I`, and the command palette entry.
 /// Turns the panel fully off (both the docked/collapsed presentation *and*
 /// tab presentation — see `chat_is_active`) if it's on in any form, else
@@ -184,12 +221,24 @@ pub fn toggle_chat(state: &mut State) {
         state.chat_mode = ChatMode::Closed;
         state.chat_tab_open = false;
     } else {
-        state.chat_tab_open = true;
-        state.chat_mode = ChatMode::Closed;
-        state.active_tab = Some(TabKey::Chat);
+        open_chat_as_tab(state);
     }
     persist_settings(state);
     persist_session(state);
+}
+
+/// Opens the chat panel as a tab — the default presentation for a freshly
+/// opened session (see `toggle_chat`'s own doc comment) — without touching
+/// anything about *which* session or clearing the transcript. Shared by
+/// `toggle_chat`'s own "currently closed" branch and by
+/// `Message::ChatFocus`/`Message::ChatNewSession`, both of which need the
+/// panel open before they can do anything else (focus the composer, start a
+/// fresh session) and shouldn't require it to already be open first —
+/// that's the whole point of a keyboard shortcut for either.
+pub fn open_chat_as_tab(state: &mut State) {
+    state.chat_tab_open = true;
+    state.chat_mode = ChatMode::Closed;
+    state.active_tab = Some(TabKey::Chat);
 }
 
 /// Clears `chat_tab_open` and, if the chat tab was the active one,
@@ -233,8 +282,12 @@ pub fn submit_chat_prompt(state: &mut State) {
 /// check first) simply shouldn't call this — there's nothing to forward to.
 pub fn send_chat_text(state: &mut State, text: String) {
     state.chat.messages.push(ChatMessage::Operator(text.clone()));
+    // Sending is always an explicit "take me to the bottom" action, the same
+    // convention every other chat client follows, regardless of whether the
+    // user had scrolled up to reread something first.
+    state.chat_pinned_to_bottom = true;
     if let Some(sender) = state.chat.sender.as_mut() {
-        let _ = sender.try_send(ClaudeCommand::SendPrompt(text));
+        state.chat.sending = sender.try_send(ClaudeCommand::SendPrompt(text)).is_ok();
     }
 }
 
@@ -242,32 +295,153 @@ pub async fn pick_chat_mention_file(dir: PathBuf) -> Option<PathBuf> {
     rfd::AsyncFileDialog::new().set_directory(dir).pick_file().await.map(|handle| handle.path().to_path_buf())
 }
 
-/// Appends `@<path>` to the chat draft (with a leading space if the draft
-/// isn't already empty/whitespace-terminated) — `@`-prefixed paths are
-/// `claude`'s own built-in file-reference syntax, confirmed against the
-/// real CLI: a prompt containing `@some/file` gets that file's content
-/// folded into context automatically, no `Read` tool call needed.
-/// `relative_to_project` writes `path` relative to `state.root` when it
-/// actually is inside the project (falling back to the absolute path
-/// otherwise, e.g. a file `ChatAttachFileDialog` picked from elsewhere on
-/// disk).
-pub fn insert_chat_mention(state: &mut State, path: &Path, relative_to_project: bool) {
-    let shown = if relative_to_project {
-        path.strip_prefix(&state.root).unwrap_or(path).to_string_lossy().into_owned()
-    } else {
-        path.to_string_lossy().into_owned()
-    };
+/// Appends `text` to the chat draft, moving to the document's end first and
+/// inserting a separating space if the draft isn't already
+/// empty/whitespace-terminated — shared plumbing so `insert_chat_mention`
+/// (an `@path` token) and the composer's other quick actions (a fenced
+/// selection, a named symbol, the project name — see `insert_*_context`
+/// below) never run two tokens together, whether the draft already had text
+/// or a previous quick action just landed one.
+fn append_to_chat_draft(state: &mut State, text: &str) {
     let existing = state.chat.input.text();
     let needs_space = !existing.is_empty() && !existing.ends_with(char::is_whitespace);
     let mut insertion = String::new();
     if needs_space {
         insertion.push(' ');
     }
-    insertion.push('@');
-    insertion.push_str(&shown);
-    insertion.push(' ');
+    insertion.push_str(text);
     state.chat.input.perform(iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd));
     state.chat.input.perform(iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(insertion))));
+}
+
+/// `path` written relative to `state.root` when it actually is inside the
+/// project, falling back to the absolute path otherwise (e.g. a file
+/// `ChatAttachFileDialog` picked from elsewhere on disk).
+fn path_relative_to_root(state: &State, path: &Path) -> String {
+    path.strip_prefix(&state.root).unwrap_or(path).to_string_lossy().into_owned()
+}
+
+/// Appends `@<path>` to the chat draft — `@`-prefixed paths are `claude`'s
+/// own built-in file-reference syntax, confirmed against the real CLI: a
+/// prompt containing `@some/file` gets that file's content folded into
+/// context automatically, no `Read` tool call needed. `relative_to_project`
+/// writes `path` relative to `state.root` when it actually is inside the
+/// project (falling back to the absolute path otherwise, e.g. a file
+/// `ChatAttachFileDialog` picked from elsewhere on disk).
+pub fn insert_chat_mention(state: &mut State, path: &Path, relative_to_project: bool) {
+    let shown = if relative_to_project { path_relative_to_root(state, path) } else { path.to_string_lossy().into_owned() };
+    append_to_chat_draft(state, &format!("@{shown} "));
+}
+
+/// The composer's "Current file" quick action — mentions the active tab's
+/// file exactly like "Mention file from this project…" does, just without
+/// the file-picker round-trip since there's nothing to pick: the file is
+/// already on screen. A no-op with no file open.
+pub fn insert_current_file_context(state: &mut State) {
+    if let Some(path) = active_file_path(state) {
+        insert_chat_mention(state, &path, true);
+    }
+}
+
+/// The composer's "Selected text" quick action — folds the active editor's
+/// current selection straight into the draft as a fenced code block. Unlike
+/// a whole file, there's no `claude`-recognized mention syntax for a byte
+/// range within one, so the text itself is the only way to hand over
+/// exactly what's highlighted rather than the whole file it lives in. A
+/// no-op with no active editor or no selection.
+pub fn insert_selection_context(state: &mut State) {
+    let Some(path) = active_file_path(state) else { return };
+    let Some(editor) = find_editor(state, &path) else { return };
+    let Some(selected) = editor.selected_text() else { return };
+    let lang_tag = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    append_to_chat_draft(state, &format!("```{lang_tag}\n{selected}\n```\n"));
+}
+
+/// The composer's "Active symbol" quick action — names the innermost named
+/// scope enclosing the cursor (the same landmark `breadcrumb_bar` bolds in
+/// its own strip, see `outline::emphasized_index`), paired with an
+/// `@`-mention of the file itself so `claude` has the real source to go
+/// with the name rather than just a bare identifier. A no-op with no active
+/// editor or no enclosing named scope (e.g. the cursor sits at a script's
+/// top level, or the language has no landmark table at all).
+pub fn insert_active_symbol_context(state: &mut State) {
+    let Some(path) = active_file_path(state) else { return };
+    let Some(editor) = find_editor(state, &path) else { return };
+    let crumbs = editor.breadcrumbs();
+    let Some(index) = outline::emphasized_index(&crumbs) else { return };
+    let label = crumbs[index].label.clone();
+    let shown = path_relative_to_root(state, &path);
+    append_to_chat_draft(state, &format!("`{label}` (@{shown}) "));
+}
+
+/// The composer's "Project root" quick action — `claude` already runs with
+/// `state.root` as its own working directory (see `chat_worker`), so this
+/// doesn't need `@`-mention machinery the way a specific file does; it just
+/// names the project so a root-scoped question ("what's this project's
+/// build system") reads naturally instead of starting mid-thought.
+pub fn insert_project_root_context(state: &mut State) {
+    let name = state.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "this project".to_string());
+    append_to_chat_draft(state, &format!("(project: {name}) "));
+}
+
+/// The empty thread's "Summarize this project" starter prompt — the one
+/// suggestion with no dependency on an open file, so it's always offered
+/// (chat-panel UX pass, item 7).
+pub const SUMMARIZE_PROJECT_PROMPT: &str = "Summarize this project: what it does, how it's structured, and where to start reading.";
+
+/// The empty thread's "Ask about this file" starter prompt — `None` with no
+/// file open, since there's nothing yet to ask about. Sent as a complete
+/// prompt (see `Message::ChatSendPrompt`), not inserted into the draft like
+/// the Actions popup's own "Current file" quick action (`insert_current_file_context`):
+/// an empty-state suggestion is meant to be a one-click start to the
+/// conversation, not a fragment to keep typing around.
+pub fn ask_about_file_prompt(state: &State) -> Option<String> {
+    let path = active_file_path(state)?;
+    let shown = path_relative_to_root(state, &path);
+    Some(format!("What does @{shown} do?"))
+}
+
+/// The empty thread's "Fix this bug" starter prompt — folds in the active
+/// selection when there is one (the same fenced-block convention
+/// `insert_selection_context` uses), else just the open file, else falls
+/// back to a project-wide ask with no file open at all. Each rung points
+/// `claude` at the most specific thing actually on screen rather than
+/// making the very first prompt of a session ask it to guess.
+pub fn fix_bug_prompt(state: &State) -> String {
+    let Some(path) = active_file_path(state) else {
+        return "Help me find and fix a bug in this project.".to_string();
+    };
+    let shown = path_relative_to_root(state, &path);
+    match find_editor(state, &path).and_then(|e| e.selected_text()) {
+        Some(selected) => {
+            let lang_tag = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            format!("Find and fix the bug in this code from @{shown}:\n```{lang_tag}\n{selected}\n```")
+        }
+        None => format!("Find and fix any bugs in @{shown}."),
+    }
+}
+
+/// "Regenerate" — the closest a `claude` CLI session (which manages its own
+/// conversation context, not something DevScribe can rewind a turn within)
+/// can come to actually discarding the last answer and trying again: just
+/// ask for it in plain language, the same way `/model`/`/effort` are just
+/// prompts `claude` recognizes and answers itself (see `send_chat_text`'s
+/// own doc comment).
+pub const REGENERATE_PROMPT: &str = "Please regenerate your previous response — try a different approach.";
+
+/// "Continue" — for a response that trailed off or only covered part of
+/// what was asked.
+pub const CONTINUE_PROMPT: &str = "Please continue from where you left off.";
+
+/// The most recent thing the human actually said — the "Retry last
+/// request" continuation affordance's own prompt text, found by walking
+/// back past whatever assistant text/tool activity followed it. `None` with
+/// no operator message yet (a brand-new thread).
+pub fn last_operator_text(messages: &[ChatMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|m| match m {
+        ChatMessage::Operator(text) => Some(text.clone()),
+        _ => None,
+    })
 }
 
 /// Records the human's decision on `state.chat`'s transcript and forwards
@@ -292,6 +466,18 @@ pub fn respond_permission(state: &mut State, id: String, approve: bool, reason: 
 /// process has no memory of. Leaving them on screen would be misleading,
 /// not just stale.
 pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Message> {
+    // Any sign of life from the running turn clears the composer's
+    // "Sending…" state — see `ChatThread::sending`'s own doc comment on why
+    // this isn't tied to `TurnResult` alone. `SessionStarting`/`Ready`/
+    // `SessionInit`/`HistoryTruncated` are session-lifecycle events, not
+    // turn progress, so they're excluded: a subprocess (re)spawn on its own
+    // says nothing about whether an in-flight prompt has been picked up yet.
+    if !matches!(
+        event,
+        ClaudeEvent::SessionStarting | ClaudeEvent::Ready(_) | ClaudeEvent::SessionInit { .. } | ClaudeEvent::HistoryTruncated
+    ) {
+        state.chat.sending = false;
+    }
     match event {
         // Always the first event from a freshly (re)spawned worker — see
         // its own doc comment. Clearing here, rather than on `Ready`,
@@ -299,15 +485,19 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
         // *before* `Ready` (the worker only sends `Ready` once the live
         // process is actually up), so clearing on `Ready` would wipe out
         // the very history it just replayed.
-        ClaudeEvent::SessionStarting => state.chat = ChatThread::default(),
+        ClaudeEvent::SessionStarting => {
+            state.chat = ChatThread::default();
+            state.chat_pinned_to_bottom = true;
+        }
         ClaudeEvent::Ready(sender) => {
             state.chat.sender = Some(sender);
             state.chat.status = ChatStatus::Ready;
             // Whatever just got replayed (a resumed session's full saved
             // history) or didn't (a brand-new, still-empty one) is now all
-            // in `state.chat.messages` — jump to the latest message rather
-            // than leaving a resumed conversation scrolled to its start.
-            return iced::widget::operation::snap_to_end(chat_scroll_id());
+            // in `state.chat.messages` — pin back to the bottom so the tail
+            // logic below jumps to the latest message rather than leaving a
+            // resumed conversation scrolled to its start.
+            state.chat_pinned_to_bottom = true;
         }
         ClaudeEvent::SessionInit { session_id, model } => {
             state.chat.session_id = Some(session_id);
@@ -365,7 +555,16 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
         }
         ClaudeEvent::HistoryTruncated => state.chat.history_truncated = true,
     }
-    iced::Task::none()
+    // Follow new output only while the user hasn't scrolled away from the
+    // bottom to read earlier messages — see `State::chat_pinned_to_bottom`'s
+    // own doc comment. Re-snapping unconditionally here would yank the view
+    // out from under anyone mid-scroll every time a background tool call
+    // (or even just a `TurnResult` with nothing to show) landed.
+    if state.chat_pinned_to_bottom {
+        iced::widget::operation::snap_to_end(chat_scroll_id())
+    } else {
+        iced::Task::none()
+    }
 }
 
 /// Scans `~/.claude/projects/...` for this project's past sessions on its

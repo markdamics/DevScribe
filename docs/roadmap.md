@@ -20,7 +20,7 @@
 - Why: Users need control over editor behavior (tab size, word wrap, line numbers density, etc.)
 - Scope: Serialize keyword settings to JSON config file (already using serde), add UI form inputs, and reload on change
 
-### 7. Breadth of Language Server Coverage
+### 7. Breadth of Language Server Coverage - done
 - server_install.rs auto-downloads clangd; add Pylance, rust-analyzer, ts-ls auto-install
 - Why: Users expect their language of choice "just works"
 - Scope: Extend the auto-install matrix; consider using the LSP registry or a manifest file

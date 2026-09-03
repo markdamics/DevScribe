@@ -82,6 +82,7 @@ fn sample_settings() -> Settings {
         chat_panel_width: 420.0,
         tab_size: 2,
         show_line_numbers: false,
+        word_wrap: true,
     }
 }
 
