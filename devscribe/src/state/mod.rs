@@ -4,6 +4,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent, PermissionMode};
+use devscribe_core::copilot_agent;
+use devscribe_core::copilot_completion::{self, CopilotCompletionCommand, CopilotCompletionEvent};
 use devscribe_core::diff::{DiffLine, DiffLineKind, GutterMark, Hunk};
 use devscribe_core::git::{ChangeKind, Repo};
 use devscribe_core::lsp::{self, CompletionItem, LspCommand, LspEvent, LspLanguage};
@@ -255,6 +257,12 @@ pub struct State {
     /// spawn-time flag, can't change on a running process), resuming the
     /// same session id under the new mode rather than losing the thread.
     pub chat_permission_mode: PermissionMode,
+    /// Which backend the panel talks to — see `ChatProvider`. Not persisted,
+    /// same as `chat_permission_mode`/`chat_shell_access_enabled`: always
+    /// starts back at `Claude` each launch. Part of `chat_worker`'s
+    /// subscription key, same reason as those two — picking a different
+    /// provider is a spawn-time decision, so it respawns the subprocess.
+    pub chat_provider: ChatProvider,
     pub chat: ChatThread,
     /// Current window width in logical pixels — tracked only for the chat
     /// panel's right-edge resize math (`window_width - cursor_x`, since
@@ -315,6 +323,18 @@ pub struct State {
     /// Without this, the subscription key `(root, language)` hasn't changed
     /// so iced wouldn't restart the worker automatically.
     lsp_restart_token: u64,
+    pub copilot_completion_status: CopilotCompletionStatus,
+    copilot_completion_sender: Option<mpsc::Sender<CopilotCompletionCommand>>,
+    /// Off switches the `copilot_completion_worker` subscription off
+    /// entirely, same convention as `lsp_enabled` — no
+    /// `copilot-language-server` process gets spawned at all while this is
+    /// `false`. Off by default: unlike LSP (core to the editor), inline
+    /// completions need an external binary plus a signed-in GitHub Copilot
+    /// account, so this is opt-in rather than assumed.
+    pub copilot_inline_enabled: bool,
+    /// Mirrors `lsp_restart_token` — reserved for a future "retry after the
+    /// process died" action, not currently wired to any UI.
+    copilot_completion_restart_token: u64,
     /// `None` when `root` isn't a git repository — an expected, common case.
     pub repo: Option<Repo>,
     /// The sidebar's "CHANGES" panel contents — every file that differs from
@@ -502,6 +522,7 @@ impl Default for State {
             // that stays the default rather than silently becoming more
             // permissive under this change.
             chat_permission_mode: PermissionMode::Manual,
+            chat_provider: ChatProvider::Claude,
             chat: ChatThread::default(),
             window_width: 1280.0,
             projects_open: false,
@@ -521,6 +542,10 @@ impl Default for State {
             lsp_sender: None,
             lsp_enabled: settings.lsp_enabled,
             lsp_restart_token: 0,
+            copilot_completion_status: CopilotCompletionStatus::default(),
+            copilot_completion_sender: None,
+            copilot_inline_enabled: settings.copilot_inline_enabled,
+            copilot_completion_restart_token: 0,
             repo,
             changed_files: snapshot.changed_files,
             ahead_behind: snapshot.ahead_behind,
@@ -651,6 +676,10 @@ pub enum Message {
     /// the worker (see `State::chat_permission_mode`'s own doc comment),
     /// resuming the same session under the new mode.
     ChatSetPermissionMode(PermissionMode),
+    /// Switches which backend the panel talks to (see `ChatProvider`) —
+    /// respawns the worker under the new provider, same as
+    /// `ChatSetPermissionMode`.
+    ChatSetProvider(ChatProvider),
     /// Opens a real terminal running `claude` so the human can complete
     /// `/design-login` (or anything else that genuinely needs an
     /// interactive TTY) — nothing headless, this session included, can do
@@ -759,6 +788,16 @@ pub enum Message {
     /// once the buffer has been still for `EDIT_SETTLE`.
     EditSettleTick,
     Lsp(LspEvent),
+    CopilotCompletion(CopilotCompletionEvent),
+    /// `Tab` while a ghost-text suggestion is showing — checked before both
+    /// the LSP completion-popup intercept and a real indent, in
+    /// `Message::EditorIndent`'s own handler.
+    AcceptGhostCompletion,
+    /// `Escape` while a ghost-text suggestion is showing — see
+    /// `editor_canvas.rs`'s own `handle_key`, the only place this is sent
+    /// from (guarded there so a plain Escape with nothing showing still
+    /// falls through to the app-wide Escape handling, same as before).
+    DismissGhostCompletion,
     /// A debounced batch of on-disk changes from `file_watcher` — an edit
     /// made outside DevScribe (another terminal, `git checkout`, and later
     /// the AI Chat Assist panel's own file edits).
@@ -806,6 +845,10 @@ pub enum Message {
     /// `kill_on_drop`) and clears every open editor's diagnostics; switching
     /// back on spawns a fresh one for the current project root.
     ToggleLspEnabled,
+    /// Turns the `copilot_completion_worker` subscription on/off — same
+    /// shape as `ToggleLspEnabled`, for GitHub Copilot inline suggestions
+    /// rather than language servers.
+    ToggleCopilotInline,
     /// The window lost focus — saves every dirty open file if
     /// `save_on_focus_loss` is on, else a no-op. Fired from
     /// `iced::window::events()`, not a keybinding.
@@ -1020,6 +1063,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ChatInputAction(action) => state.chat.input.perform(action),
         Message::ChatSubmit => submit_chat_prompt(state),
         Message::ChatSetPermissionMode(mode) => state.chat_permission_mode = mode,
+        Message::ChatSetProvider(provider) => state.chat_provider = provider,
         Message::ChatLaunchDesignLogin => {
             if launch_terminal_running_claude() {
                 push_toast(state, ToastKind::Success, "Opened a terminal \u{2014} run /design-login there, then retry here.");
@@ -1256,6 +1300,16 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::EditorIndent => {
             if let Some(path) = active_file_path(state) {
+                // A ghost-text suggestion, if showing, wins over both the LSP
+                // popup and a real indent — same precedence VS Code gives its
+                // own inline suggestions over other Tab behavior. The two
+                // can't both be showing at once in practice (see
+                // `GhostCompletion`'s own doc comment), but check this first
+                // regardless, same as the completions check right below it.
+                let ghost_showing = find_editor(state, &path).is_some_and(|e| e.ghost_completion.as_ref().is_some_and(|g| g.at == e.cursor));
+                if ghost_showing {
+                    return update(state, Message::AcceptGhostCompletion);
+                }
                 // Same completion-popup intercept `EditorInsertText` gives
                 // Enter — Tab with the popup open selects the highlighted
                 // item rather than indenting.
@@ -1436,6 +1490,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::EditSettleTick => {
             if state.edit_settled_at.is_some_and(|at| at.elapsed() >= EDIT_SETTLE) {
                 flush_pending_edits(state);
+                maybe_trigger_ghost_completion(state);
             }
         }
         Message::Lsp(event) => match event {
@@ -1510,6 +1565,67 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 push_toast(state, ToastKind::Warning, format!("{name} unavailable: {reason}"));
             }
         },
+        Message::CopilotCompletion(event) => match event {
+            CopilotCompletionEvent::Ready(sender) => {
+                state.copilot_completion_status = CopilotCompletionStatus::Ready;
+                state.copilot_completion_sender = Some(sender);
+                for path in open_file_paths(state) {
+                    send_copilot_did_open_for(state, &path);
+                }
+            }
+            CopilotCompletionEvent::Suggestion { uri, line, character, item } => {
+                if let Some(path) = uri.to_file_path().ok()
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    // Discard stale results: only apply if the cursor is
+                    // still exactly where this request was sent for — see
+                    // `GhostCompletion`'s own doc comment.
+                    let cursor = editor.cursor;
+                    if cursor.line == line as usize {
+                        let line_text = editor.document.line_text(cursor.line);
+                        if char_col_to_utf16_col(&line_text, cursor.col) == character {
+                            editor.ghost_completion = item.and_then(|item| {
+                                let insert_text = item.get("insertText").and_then(|v| v.as_str())?.to_string();
+                                if insert_text.is_empty() {
+                                    return None;
+                                }
+                                Some(GhostCompletion { at: cursor, insert_text, item })
+                            });
+                        }
+                    }
+                }
+            }
+            CopilotCompletionEvent::Unavailable(reason) => {
+                state.copilot_completion_status = CopilotCompletionStatus::Unavailable(reason);
+                state.copilot_completion_sender = None;
+            }
+        },
+        Message::AcceptGhostCompletion => {
+            if let Some(path) = active_file_path(state) {
+                let ghost = find_editor(state, &path).and_then(|editor| {
+                    let ghost = editor.ghost_completion.as_ref()?;
+                    (ghost.at == editor.cursor).then(|| ghost.clone())
+                });
+                if let Some(ghost) = ghost {
+                    if let Some(editor) = find_editor_mut(state, &path) {
+                        editor.close_ghost_completion();
+                        editor.insert_text(&ghost.insert_text);
+                    }
+                    mark_edited(state, &path);
+                    if let Some(sender) = state.copilot_completion_sender.as_mut() {
+                        let _ = sender.try_send(CopilotCompletionCommand::Accepted { item: ghost.item });
+                    }
+                    return scroll_cursor_into_view(state);
+                }
+            }
+        }
+        Message::DismissGhostCompletion => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.close_ghost_completion();
+            }
+        }
         Message::FilesChanged(events) => {
             refresh_tree(state);
             refresh_changed_files(state);
@@ -1686,6 +1802,21 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 for tab in &mut state.open_tabs {
                     if let OpenTab::File(editor) = tab {
                         editor.diagnostics = Rc::new(Vec::new());
+                    }
+                }
+            }
+        }
+        Message::ToggleCopilotInline => {
+            state.copilot_inline_enabled = !state.copilot_inline_enabled;
+            persist_settings(state);
+            if state.copilot_inline_enabled {
+                state.copilot_completion_status = CopilotCompletionStatus::Starting;
+            } else {
+                state.copilot_completion_sender = None;
+                state.copilot_completion_status = CopilotCompletionStatus::Disabled;
+                for tab in &mut state.open_tabs {
+                    if let OpenTab::File(editor) = tab {
+                        editor.close_ghost_completion();
                     }
                 }
             }
@@ -2244,6 +2375,7 @@ fn persist_settings(state: &State) {
         problem_lens_enabled: state.problem_lens_enabled,
         save_on_focus_loss: state.save_on_focus_loss,
         lsp_enabled: state.lsp_enabled,
+        copilot_inline_enabled: state.copilot_inline_enabled,
         chat_mode: state.chat_mode,
         chat_panel_width: state.chat_panel_width,
         tab_size: state.tab_size,
@@ -2651,6 +2783,12 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
             subs.push(iced::Subscription::run_with(key, lsp_worker).map(Message::Lsp));
         }
     }
+    // No inline-completion worker with no project open, or while the
+    // settings toggle is off — see `copilot_completion_worker`.
+    if !state.welcome_open && state.copilot_inline_enabled {
+        let key = (state.root.clone(), state.copilot_completion_restart_token);
+        subs.push(iced::Subscription::run_with(key, copilot_completion_worker).map(Message::CopilotCompletion));
+    }
     // No file watcher with no project open — keyed on `root` so switching
     // projects tears down and respawns it on the new one (see `file_watcher`).
     if !state.welcome_open {
@@ -2665,6 +2803,7 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
         let key = (
             state.root.clone(),
             state.chat_session_id.clone(),
+            state.chat_provider,
             state.chat_permission_mode,
             state.chat_shell_access_enabled,
             state.chat_restart_token,

@@ -36,6 +36,16 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
     let font_size = state.editor_font_size;
     let scroll_offset = editor.scroll_offset;
     let max_line_chars = editor.max_line_chars();
+    // Position-checked here (not trusted from storage) — see
+    // `GhostCompletion`'s own doc comment. Only the suggestion's first line
+    // is shown; see `EditorCanvas::ghost_text`'s own doc comment for why.
+    let ghost_text = editor
+        .ghost_completion
+        .as_ref()
+        .filter(|g| g.at == editor.cursor)
+        .and_then(|g| g.insert_text.lines().next())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string);
 
     // `responsive` hands us the pane's actual available height up front
     // (rather than waiting for a scroll event to learn it), so the canvas
@@ -58,6 +68,7 @@ fn code_area(editor: &EditorState, state: &State, p: Palette) -> Element<'static
             find_current,
             scroll_offset,
             viewport_height: size.height,
+            ghost_text: ghost_text.clone(),
         };
 
         // At least the pane's own width (`size.width`, from `responsive`) so

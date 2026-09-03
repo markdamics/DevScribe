@@ -28,6 +28,7 @@ pub struct Settings {
     pub problem_lens_enabled: bool,
     pub save_on_focus_loss: bool,
     pub lsp_enabled: bool,
+    pub copilot_inline_enabled: bool,
     pub chat_mode: ChatMode,
     pub chat_panel_width: f32,
     pub tab_size: u8,
@@ -50,6 +51,11 @@ impl Default for Settings {
             problem_lens_enabled: true,
             save_on_focus_loss: false,
             lsp_enabled: true,
+            // Off by default, unlike `lsp_enabled`: inline completions need
+            // an external binary plus a signed-in GitHub Copilot account, so
+            // this is opt-in rather than assumed — see
+            // `State::copilot_inline_enabled`'s own doc comment.
+            copilot_inline_enabled: false,
             // Not `Docked`: a freshly opened session's default presentation
             // is now the tab view (see `state.rs`'s `toggle_chat`), which
             // `ChatMode` can't represent on its own (see `chat_tab_open`) —
@@ -94,6 +100,8 @@ struct SettingsFile {
     save_on_focus_loss: bool,
     #[serde(default = "default_true")]
     lsp_enabled: bool,
+    #[serde(default)]
+    copilot_inline_enabled: bool,
     #[serde(default)]
     chat_mode: String,
     #[serde(default = "default_chat_panel_width")]
@@ -208,6 +216,7 @@ fn load_from(path: &Path) -> Option<Settings> {
         problem_lens_enabled: file.problem_lens_enabled,
         save_on_focus_loss: file.save_on_focus_loss,
         lsp_enabled: file.lsp_enabled,
+        copilot_inline_enabled: file.copilot_inline_enabled,
         chat_mode: chat_mode_from_key(&file.chat_mode).unwrap_or(defaults.chat_mode),
         chat_panel_width: file.chat_panel_width,
         tab_size: file.tab_size,
@@ -242,6 +251,7 @@ fn save_to(path: &Path, settings: &Settings) {
         problem_lens_enabled: settings.problem_lens_enabled,
         save_on_focus_loss: settings.save_on_focus_loss,
         lsp_enabled: settings.lsp_enabled,
+        copilot_inline_enabled: settings.copilot_inline_enabled,
         chat_mode: chat_mode_key(settings.chat_mode).to_string(),
         chat_panel_width: settings.chat_panel_width,
         tab_size: settings.tab_size,

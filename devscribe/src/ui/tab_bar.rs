@@ -320,9 +320,7 @@ pub fn overflow_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
 
     let menu = container(
         column![
-            overflow_row("Close others", "\u{2325}\u{2318}W", Message::CloseOtherTabs, p),
-            overflow_row("Reveal in tree", "\u{21e7}\u{2318}E", Message::RevealActiveInTree, p),
-            overflow_row("Reopen closed tab", "\u{21e7}\u{2318}T", Message::ReopenClosedTab, p),
+            overflow_row("Close all other tabs", "\u{2325}\u{2318}W", Message::CloseOtherTabs, p),
         ]
         .spacing(2.0)
         .padding(6.0),

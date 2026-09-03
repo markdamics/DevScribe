@@ -3,7 +3,7 @@ resolver = "2"
 members = ["devscribe", "devscribe-core"]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.8.1"
 edition = "2024"
 
 [workspace.dependencies]

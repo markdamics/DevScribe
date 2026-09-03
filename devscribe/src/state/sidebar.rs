@@ -383,11 +383,15 @@ pub fn rename_open_tab(state: &mut State, old_path: &Path, new_path: &Path) {
     if let Some(sender) = state.lsp_sender.as_mut() {
         send_did_close(sender, old_path);
     }
+    if let Some(sender) = state.copilot_completion_sender.as_mut() {
+        send_copilot_did_close(sender, old_path);
+    }
     if let Some(editor) = find_editor_mut(state, old_path) {
         editor.document.set_path(new_path.to_path_buf());
         editor.path = new_path.to_path_buf();
     }
     send_did_open_for(state, new_path);
+    send_copilot_did_open_for(state, new_path);
 
     let old_diff_key = TabKey::Diff(old_path.to_path_buf());
     let new_diff_key = TabKey::Diff(new_path.to_path_buf());
@@ -721,6 +725,10 @@ pub fn reset_project_scoped_state(state: &mut State) {
     // to `Starting` for a worker that `subscription` won't actually spawn.
     state.lsp_sender = None;
     state.lsp_status = if state.lsp_enabled { LspStatus::default() } else { LspStatus::Disabled };
+    // Same idea, for `copilot_completion_worker` — also keyed on `state.root`.
+    state.copilot_completion_sender = None;
+    state.copilot_completion_status =
+        if state.copilot_inline_enabled { CopilotCompletionStatus::default() } else { CopilotCompletionStatus::Disabled };
     // Same idea as the LSP worker above: `chat_worker` is keyed on
     // `(root, chat_session_id, ..)`, so a fresh id here (rather than
     // reusing whatever the previous project was on) is what actually

@@ -1,4 +1,6 @@
 pub mod claude_agent;
+pub mod copilot_agent;
+pub mod copilot_completion;
 pub mod diff;
 pub mod document;
 pub mod git;

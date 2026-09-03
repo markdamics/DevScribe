@@ -547,14 +547,27 @@ fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
     for row in rows {
         col = col.push(row);
     }
-    col.push(toggle_row(
+    col = col.push(toggle_row(
         "Install toolchains automatically",
         "Fetch syntax and language servers on first open",
         state.lsp_enabled,
         Message::ToggleLspEnabled,
         p,
+    ));
+
+    col = col.push(section_label("AI COMPLETIONS", p));
+    if state.copilot_inline_enabled {
+        let (dot_color, label) = state.copilot_completion_status.describe(p);
+        col = col.push(status_row("GITHUB COPILOT", color(dot_color), label, p));
+    }
+    col.push(toggle_row(
+        "Inline suggestions",
+        "GitHub Copilot ghost-text completions as you type — requires copilot-language-server on PATH and a signed-in account",
+        state.copilot_inline_enabled,
+        Message::ToggleCopilotInline,
+        p,
     ))
-        .into()
+    .into()
 }
 
 fn shortcut_row(label: &'static str, keys: &'static str, p: Palette) -> Element<'static, Message> {

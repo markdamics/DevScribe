@@ -87,6 +87,58 @@ impl LspStatus {
     }
 }
 
+/// Mirrors `LspStatus`'s own shape for `copilot_completion_worker` — no
+/// `Installing` variant, since inline completions have no auto-install path
+/// (the binary just has to already be on PATH).
+#[derive(Debug, Clone, Default)]
+pub enum CopilotCompletionStatus {
+    #[default]
+    Starting,
+    Ready,
+    Unavailable(String),
+    /// Turned off via the settings panel's toggle — see `LspStatus::Disabled`'s
+    /// own doc comment for why this is distinct from `Unavailable`.
+    Disabled,
+}
+
+impl CopilotCompletionStatus {
+    /// (status-dot color, label) — see `LspStatus::describe`.
+    pub fn describe(&self, p: devscribe_core::theme::Palette) -> (devscribe_core::theme::Rgba, String) {
+        match self {
+            CopilotCompletionStatus::Starting => (p.text_muted, "starting\u{2026}".to_string()),
+            CopilotCompletionStatus::Ready => (p.status_success, "ready".to_string()),
+            CopilotCompletionStatus::Unavailable(reason) => (p.status_warning, format!("unavailable ({reason})")),
+            CopilotCompletionStatus::Disabled => (p.text_muted, "disabled".to_string()),
+        }
+    }
+}
+
+/// One GitHub Copilot inline ("ghost text") suggestion, shown after the
+/// cursor at `at`. Unlike the LSP dot-completion popup's
+/// `completions`/`completions_all` pair, this deliberately does *not* try to
+/// locally re-narrow itself as the user keeps typing a matching prefix —
+/// every qualifying edit or cursor move instead just invalidates it (see
+/// `mark_edited`) and a fresh suggestion is requested once typing settles
+/// (`maybe_trigger_ghost_completion`, called from the existing
+/// `EditSettleTick` debounce). `at` is checked again at every read site
+/// (rendering, Tab-to-accept) rather than trusted, the same defensive
+/// pattern `LspEvent::Completions` already uses against `completion_anchor`
+/// — belt and suspenders against a suggestion for a position the cursor has
+/// since left.
+#[derive(Debug, Clone)]
+pub struct GhostCompletion {
+    pub at: CursorPos,
+    /// The literal text to insert at `at` if accepted — never assumed to
+    /// share a prefix with anything already on screen.
+    pub insert_text: String,
+    /// The raw `InlineCompletionItem` `copilot_completion` returned, kept
+    /// verbatim so accepting it can hand the *exact same* value back via
+    /// `CopilotCompletionCommand::Accepted` — the server's own acceptance
+    /// telemetry replays whatever `command` came attached to that specific
+    /// item, not a value reconstructed from just `insert_text`.
+    pub item: serde_json::Value,
+}
+
 /// The diff panel's state for the current file, distinguishing the reasons
 /// a diff can be empty (worth showing differently) from an actual diff.
 #[derive(Debug, Clone, Default)]
@@ -269,6 +321,14 @@ pub struct EditorState {
     /// stale responses that arrive after the cursor moved elsewhere, and as
     /// the start of the prefix `refilter_completions` matches against.
     pub completion_anchor: CursorPos,
+    /// The current GitHub Copilot inline ("ghost text") suggestion, if any —
+    /// independent of `completions`/`completions_all` above (that's the LSP
+    /// dot-completion popup; this is `copilot_completion`'s single always-
+    /// as-you-type suggestion, and the two can't both be showing at once in
+    /// practice since either one dismisses the other on the same triggers).
+    /// See `GhostCompletion`'s own doc comment for why this doesn't attempt
+    /// local prefix-narrowing the way `completions`/`completions_all` do.
+    pub ghost_completion: Option<GhostCompletion>,
     /// `Tab`-to-next-placeholder state for a snippet completion still being
     /// filled in — see `begin_snippet`/`advance_snippet`. `None` once every
     /// stop has been visited, or the moment any non-typing action (a click,
@@ -438,6 +498,7 @@ impl EditorState {
             completions_all: None,
             completion_selected: 0,
             completion_anchor: CursorPos::default(),
+            ghost_completion: None,
             active_snippet: None,
             hover_pending: None,
             hover_requested_for: None,
@@ -1410,6 +1471,13 @@ impl EditorState {
         self.completion_selected = 0;
     }
 
+    /// Dismisses the current ghost-text suggestion, if any — called
+    /// unconditionally from `mark_edited` (any edit invalidates it) and from
+    /// `Message::DismissGhostCompletion` (Escape, while one is showing).
+    pub fn close_ghost_completion(&mut self) {
+        self.ghost_completion = None;
+    }
+
     /// Stores a freshly arrived LSP completion response and immediately
     /// filters it against whatever's already been typed since the anchor —
     /// a slow response can land after the user kept typing past the
@@ -2204,6 +2272,7 @@ pub fn open_or_focus_file(state: &mut State, path: PathBuf) {
         state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(document, path.clone()))));
         state.active_tab = Some(key);
         send_did_open_for(state, &path);
+        send_copilot_did_open_for(state, &path);
         recompute_diff_for(state, &path);
         persist_session(state);
     }
@@ -2293,6 +2362,9 @@ pub fn close_tab(state: &mut State, key: &TabKey) {
         if let Some(sender) = state.lsp_sender.as_mut() {
             send_did_close(sender, &editor.path);
         }
+        if let Some(sender) = state.copilot_completion_sender.as_mut() {
+            send_copilot_did_close(sender, &editor.path);
+        }
         let diff_key = TabKey::Diff(editor.path.clone());
         state.open_tabs.retain(|t| t.key() != diff_key);
     }
@@ -2333,6 +2405,16 @@ pub fn mark_edited(state: &mut State, path: &Path) {
     if !state.pending_edits.iter().any(|p| p == path) {
         state.pending_edits.push(path.to_path_buf());
     }
+    // Any edit invalidates whatever ghost-text suggestion was showing —
+    // it described text to insert at a position that no longer reflects
+    // what's actually in the buffer. A fresh one is requested once typing
+    // settles (`maybe_trigger_ghost_completion`, called alongside
+    // `flush_pending_edits` from the same `EditSettleTick` debounce this
+    // function already arms), not immediately — see `GhostCompletion`'s own
+    // doc comment on why this doesn't attempt to locally re-narrow instead.
+    if let Some(editor) = find_editor_mut(state, path) {
+        editor.close_ghost_completion();
+    }
 }
 
 /// Runs the deferred per-edit work now, for every buffer waiting on it.
@@ -2348,6 +2430,7 @@ pub fn flush_pending_edits(state: &mut State) {
             editor.reparse_now();
         }
         send_did_change_for(state, &path);
+        send_copilot_did_change_for(state, &path);
         recompute_diff_for(state, &path);
     }
 }
@@ -2422,6 +2505,73 @@ pub fn send_did_open_for(state: &mut State, path: &Path) {
     };
     if let Some(sender) = state.lsp_sender.as_mut() {
         let _ = sender.try_send(LspCommand::DidOpen { uri, text });
+    }
+}
+
+/// `copilot_completion`'s own document sync — deliberately not gated by
+/// `is_lsp_language` the way `send_did_open_for` is: Copilot suggests for
+/// any text file, not just the handful of languages this app has a
+/// `LspLanguage`/language-server mapping for.
+pub fn send_copilot_did_open_for(state: &mut State, path: &Path) {
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    let Some(text) = find_editor(state, path).map(|e| e.document.text().to_string()) else {
+        return;
+    };
+    if let Some(sender) = state.copilot_completion_sender.as_mut() {
+        let _ = sender.try_send(CopilotCompletionCommand::DidOpen { uri, text });
+    }
+}
+
+pub fn send_copilot_did_change_for(state: &mut State, path: &Path) {
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    let Some(text) = find_editor(state, path).map(|e| e.document.text().to_string()) else {
+        return;
+    };
+    if let Some(sender) = state.copilot_completion_sender.as_mut() {
+        let _ = sender.try_send(CopilotCompletionCommand::DidChange { uri, text });
+    }
+}
+
+pub fn send_copilot_did_close(sender: &mut mpsc::Sender<CopilotCompletionCommand>, path: &Path) {
+    if let Some(uri) = lsp_uri(path) {
+        let _ = sender.try_send(CopilotCompletionCommand::DidClose { uri });
+    }
+}
+
+/// Fires the inline-completion request once typing settles — called from
+/// `Message::EditSettleTick` right after `flush_pending_edits`, reusing that
+/// same debounce rather than a second timer (see `GhostCompletion`'s own
+/// doc comment for why "wait for a pause" is the right trigger shape here).
+/// Only ever requests for the *active* file: ghost text is a single-cursor,
+/// single-view concept, unlike `flush_pending_edits`'s own per-buffer
+/// `didChange`/reparse/diff work, which runs for every buffer that changed.
+/// Skipped outright while the LSP dot-completion popup is open — showing
+/// both at once would visually conflict, and `Tab` can only accept one.
+pub fn maybe_trigger_ghost_completion(state: &mut State) {
+    if !state.copilot_inline_enabled {
+        return;
+    }
+    let Some(path) = active_file_path(state) else {
+        return;
+    };
+    let Some(editor) = find_editor(state, &path) else {
+        return;
+    };
+    if editor.completions.is_some() {
+        return;
+    }
+    let cursor = editor.cursor;
+    let line_text = editor.document.line_text(cursor.line);
+    let utf16_char = char_col_to_utf16_col(&line_text, cursor.col);
+    let Some(uri) = lsp_uri(&path) else {
+        return;
+    };
+    if let Some(sender) = state.copilot_completion_sender.as_mut() {
+        let _ = sender.try_send(CopilotCompletionCommand::Suggest { uri, line: cursor.line as u32, character: utf16_char });
     }
 }
 
@@ -2651,5 +2801,33 @@ pub fn lsp_worker((root, language, _token): &(PathBuf, LspLanguage, u64)) -> imp
             Some(binary) => lsp::run(root, language, binary, output).await,
             None => { let _ = output.send(LspEvent::NeedsInstall).await; }
         }
+    })
+}
+
+/// One project-wide `copilot-language-server` connection dedicated to inline
+/// completions — independent of the AI Chat Assist panel's own Copilot
+/// connection (`copilot_agent`/`chat_worker`), same reasoning as
+/// `devscribe_core::copilot_completion`'s own doc comment: inline
+/// completions are useful regardless of which chat provider (or whether the
+/// chat panel is even open) is active. Keyed on `(root, restart_token)` —
+/// no per-language keying the way `lsp_worker` has, since one server serves
+/// every open file. No auto-install path (unlike `lsp_worker`): if
+/// `copilot-language-server` isn't on PATH, this reports `Unavailable`
+/// directly rather than trying to fetch it.
+pub fn copilot_completion_worker(
+    (root, _token): &(PathBuf, u64),
+) -> impl iced::futures::Stream<Item = CopilotCompletionEvent> + use<> {
+    let root = root.clone();
+    iced::stream::channel(32, async move |mut output| {
+        use iced::futures::SinkExt as _;
+        if !crate::server_install::which_binary("copilot-language-server") {
+            let _ = output
+                .send(CopilotCompletionEvent::Unavailable(
+                    "copilot-language-server not found on PATH — install: npm install -g @github/copilot-language-server".to_string(),
+                ))
+                .await;
+            return;
+        }
+        copilot_completion::run(root, PathBuf::from("copilot-language-server"), output).await;
     })
 }

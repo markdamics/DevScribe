@@ -27,6 +27,7 @@ const GUTTER_WIDTH: f32 = 52.0;
 const TEXT_INSET: f32 = 4.0;
 const TOP_PAD: f32 = 12.0;
 
+
 pub struct EditorCanvas {
     pub document: Document,
     pub cursor: CursorPos,
@@ -61,6 +62,13 @@ pub struct EditorCanvas {
     pub find_current: usize,
     pub scroll_offset: f32,
     pub viewport_height: f32,
+    /// The active GitHub Copilot inline suggestion's first line, already
+    /// position-validated against the current cursor by the caller (`None`
+    /// whenever `editor.ghost_completion` doesn't match `editor.cursor`) —
+    /// see `EditorState::ghost_completion`'s own doc comment for why only
+    /// the first line is shown even for a multi-line suggestion (accepting
+    /// still inserts the whole thing; this is a rendering-only limitation).
+    pub ghost_text: Option<String>,
 }
 
 /// Purely local interaction state — never synced back into `State` directly.
@@ -173,6 +181,12 @@ impl EditorCanvas {
                     dir: Direction::LineEnd,
                     extend,
                 }),
+                // Only captured while a ghost-text suggestion is actually
+                // showing — an unguarded arm here would swallow Escape even
+                // with nothing to dismiss, keeping it from ever reaching the
+                // app-wide Escape handling (`iced::keyboard::listen()` only
+                // sees events no focused widget captured).
+                Named::Escape if self.ghost_text.is_some() => publish(Message::DismissGhostCompletion),
                 // Same VS Code bindings: `F12` "Go to Definition", `Shift+F12`
                 // "Find All References" — both act on the cursor's current
                 // position rather than needing a fresh click.
@@ -754,6 +768,26 @@ impl canvas::Program<Message> for EditorCanvas {
                         &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
                         color(p.accent_solid),
                     );
+                }
+            }
+            // Ghost text steadily shown (not gated on `caret_visible`) —
+            // VS Code's own inline suggestions don't blink either, only the
+            // caret drawn in front of them does.
+            if is_cursor_line
+                && let Some(ghost) = &self.ghost_text
+            {
+                let x = text_x0 + self.cursor.col as f32 * char_width;
+                if x <= bounds.width {
+                    frame.fill_text(Text {
+                        content: ghost.clone(),
+                        position: Point::new(x, y),
+                        color: tint(p.text_muted, 0.6),
+                        size: Pixels(font_size),
+                        line_height: LineHeight::Absolute(Pixels(line_height)),
+                        font: mono,
+                        align_y: Vertical::Top,
+                        ..Text::default()
+                    });
                 }
             }
         }

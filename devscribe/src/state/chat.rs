@@ -5,6 +5,41 @@
 
 use super::*;
 
+/// Which backend `chat_worker` spawns for the AI Chat Assist panel. `Claude`
+/// embeds the `claude` CLI (see `devscribe_core::claude_agent`); `Copilot`
+/// embeds `copilot-language-server` (see `devscribe_core::copilot_agent`) —
+/// both report `ClaudeEvent::Unavailable` themselves if their binary isn't on
+/// PATH, same convention as the LSP servers `lsp_worker` spawns. See
+/// docs/roadmap.md #11 for the rest of the plan (more providers, then inline
+/// ghost-text completion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChatProvider {
+    Claude,
+    Copilot,
+}
+
+impl ChatProvider {
+    pub const ALL: [ChatProvider; 2] = [ChatProvider::Claude, ChatProvider::Copilot];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChatProvider::Claude => "Claude",
+            ChatProvider::Copilot => "Copilot",
+        }
+    }
+
+    /// Whether this provider is backed by the `claude` CLI, and so supports
+    /// the Claude-specific affordances the panel offers on top of plain
+    /// chat: saved session transcripts ("THREADS"), `@`-path file mentions,
+    /// and the `/model`, `/effort`, `/usage` slash commands the Actions
+    /// popup sends as prompts. `copilot_agent` implements none of these —
+    /// see its own doc comment on scope — so surfacing them under Copilot
+    /// would be UI that looks functional but silently does nothing.
+    pub fn is_claude_cli(self) -> bool {
+        matches!(self, ChatProvider::Claude)
+    }
+}
+
 /// How the AI Chat Assist panel is currently presented. Replaces the old
 /// bare `assist_on: bool` placeholder — there was no panel behind that
 /// toggle at all before this.
@@ -390,26 +425,23 @@ pub fn launch_terminal_running_claude() -> bool {
     CANDIDATES.iter().any(|(terminal, args)| std::process::Command::new(terminal).args(*args).spawn().is_ok())
 }
 
-/// Keyed on `(root, chat_restart_token)`, mirroring `lsp_worker`'s
-/// `(root, language, lsp_restart_token)` keying: a project switch tears
-/// down and respawns the session automatically, and bumping the restart
-/// token (not currently wired to any UI — reserved for a future "new
-/// thread" action) forces a respawn on the same project. Binary resolution
-/// and `devscribe_exe` (needed so the generated permission hook re-invokes
-/// *this* binary) happen inside the async body, same as `lsp_worker` does
-/// for its own binary, so the main thread never blocks either.
-/// Keyed on `(root, session_id, permission_mode, allow_bash,
+/// Keyed on `(root, session_id, provider, permission_mode, allow_bash,
 /// chat_restart_token)`: a project switch, picking a different session
-/// (`Message::ChatNewSession`/`ChatResumeSession`), switching modes
+/// (`Message::ChatNewSession`/`ChatResumeSession`), switching providers
+/// (`Message::ChatSetProvider`), switching modes
 /// (`Message::ChatSetPermissionMode`), or flipping shell access
 /// (`Message::ChatToggleShellAccess`) all change the key, so
 /// `subscription()` tears down and respawns automatically, same as
-/// `lsp_worker`.
+/// `lsp_worker`. Binary resolution and `devscribe_exe` (needed so the
+/// generated permission hook re-invokes *this* binary) happen inside the
+/// async body, same as `lsp_worker` does for its own binary, so the main
+/// thread never blocks either.
 pub fn chat_worker(
-    (root, session_id, mode, allow_bash, _token): &(PathBuf, String, PermissionMode, bool, u64),
+    (root, session_id, provider, mode, allow_bash, _token): &(PathBuf, String, ChatProvider, PermissionMode, bool, u64),
 ) -> impl iced::futures::Stream<Item = ClaudeEvent> + use<> {
     let root = root.clone();
     let session_id = session_id.clone();
+    let provider = *provider;
     let mode = *mode;
     let allow_bash = *allow_bash;
     iced::stream::channel(32, async move |mut output| {
@@ -417,41 +449,60 @@ pub fn chat_worker(
         // First, always — see `ClaudeEvent::SessionStarting`'s own doc.
         let _ = output.send(ClaudeEvent::SessionStarting).await;
 
-        if !crate::server_install::which_binary("claude") {
-            let _ = output
-                .send(ClaudeEvent::Unavailable(
-                    "claude CLI not found on PATH — install: https://claude.ai/download".to_string(),
-                ))
-                .await;
-            return;
-        }
-        let devscribe_exe = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(err) => {
-                let _ = output.send(ClaudeEvent::Unavailable(format!("couldn't resolve devscribe's own path: {err}"))).await;
-                return;
-            }
-        };
-
-        // Whether this id already has a transcript is the sole signal for
-        // new-vs-resume (see `claude_agent::session_exists`) — so e.g.
-        // reopening the panel after closing it (same id, no explicit
-        // "new"/"resume" click in between) naturally becomes a resume, with
-        // nothing else needing to track that it should.
-        let resume = claude_agent::session_exists(&root, &session_id);
-        if resume {
-            let history = claude_agent::load_session_history(&root, &session_id);
-            if history.truncated && output.send(ClaudeEvent::HistoryTruncated).await.is_err() {
-                return;
-            }
-            for event in history.events {
-                if output.send(event).await.is_err() {
+        match provider {
+            ChatProvider::Claude => {
+                if !crate::server_install::which_binary("claude") {
+                    let _ = output
+                        .send(ClaudeEvent::Unavailable(
+                            "claude CLI not found on PATH — install: https://claude.ai/download".to_string(),
+                        ))
+                        .await;
                     return;
                 }
+                let devscribe_exe = match std::env::current_exe() {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let _ = output.send(ClaudeEvent::Unavailable(format!("couldn't resolve devscribe's own path: {err}"))).await;
+                        return;
+                    }
+                };
+
+                // Whether this id already has a transcript is the sole signal
+                // for new-vs-resume (see `claude_agent::session_exists`) — so
+                // e.g. reopening the panel after closing it (same id, no
+                // explicit "new"/"resume" click in between) naturally becomes
+                // a resume, with nothing else needing to track that it
+                // should.
+                let resume = claude_agent::session_exists(&root, &session_id);
+                if resume {
+                    let history = claude_agent::load_session_history(&root, &session_id);
+                    if history.truncated && output.send(ClaudeEvent::HistoryTruncated).await.is_err() {
+                        return;
+                    }
+                    for event in history.events {
+                        if output.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let options = claude_agent::SessionOptions { session_id, resume, mode, allow_bash };
+                claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, options, output).await;
+            }
+            ChatProvider::Copilot => {
+                // `mode`/`allow_bash`/`session_id` don't apply — see
+                // `copilot_agent::run`'s own doc comment on scope (no
+                // permission modes, no resume-across-restarts yet).
+                if !crate::server_install::which_binary("copilot-language-server") {
+                    let _ = output
+                        .send(ClaudeEvent::Unavailable(
+                            "copilot-language-server not found on PATH — install: npm install -g @github/copilot-language-server".to_string(),
+                        ))
+                        .await;
+                    return;
+                }
+                copilot_agent::run(root, PathBuf::from("copilot-language-server"), output).await;
             }
         }
-        let options = claude_agent::SessionOptions { session_id, resume, mode, allow_bash };
-        claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, options, output).await;
     })
 }
 

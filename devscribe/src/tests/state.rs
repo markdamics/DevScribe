@@ -1516,6 +1516,30 @@ fn chat_set_permission_mode_updates_the_field() {
 }
 
 #[test]
+fn chat_set_provider_updates_the_field() {
+    let mut state = State::default();
+    assert_eq!(state.chat_provider, crate::state::ChatProvider::Claude, "sanity: the documented default");
+
+    let _ = update(&mut state, Message::ChatSetProvider(crate::state::ChatProvider::Copilot));
+
+    assert_eq!(state.chat_provider, crate::state::ChatProvider::Copilot);
+}
+
+#[test]
+fn toggle_copilot_inline_flips_the_field_and_resets_status() {
+    let mut state = State::default();
+    assert!(!state.copilot_inline_enabled, "sanity: off by default — see Settings::default's own doc comment");
+
+    let _ = update(&mut state, Message::ToggleCopilotInline);
+    assert!(state.copilot_inline_enabled);
+    assert!(matches!(state.copilot_completion_status, CopilotCompletionStatus::Starting));
+
+    let _ = update(&mut state, Message::ToggleCopilotInline);
+    assert!(!state.copilot_inline_enabled);
+    assert!(matches!(state.copilot_completion_status, CopilotCompletionStatus::Disabled));
+}
+
+#[test]
 fn chat_input_action_edits_the_draft_content() {
     use iced::widget::text_editor;
 
@@ -2876,6 +2900,130 @@ fn completion_select_expands_a_snippet_with_no_literal_dollar_syntax_left_in_the
     let editor = find_editor(&state, &path).unwrap();
     assert!(editor.selection().is_none(), "$0 is a bare cursor position, not a selection");
     assert!(!editor.snippet_active(), "the walk must end once $0 (the last stop) is reached");
+}
+
+fn ghost_item(insert_text: &str) -> serde_json::Value {
+    serde_json::json!({"insertText": insert_text})
+}
+
+#[test]
+fn accept_ghost_completion_inserts_text_and_notifies_the_worker() {
+    let files = TempFiles::new("ghost-accept");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+    let (tx, mut rx) = iced::futures::channel::mpsc::channel::<CopilotCompletionCommand>(8);
+    state.copilot_completion_sender = Some(tx);
+
+    let cursor = find_editor(&state, &path).unwrap().cursor;
+    {
+        let editor = find_editor_mut(&mut state, &path).unwrap();
+        editor.ghost_completion = Some(GhostCompletion { at: cursor, insert_text: "bc".to_string(), item: ghost_item("bc") });
+    }
+
+    let _ = update(&mut state, Message::AcceptGhostCompletion);
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert_eq!(editor.document.text().to_string(), "bca", "'bc' inserted before the file's own initial 'a'");
+    assert!(editor.ghost_completion.is_none(), "accepting must clear it, same as `close_ghost_completion`");
+    assert!(
+        matches!(rx.try_next(), Ok(Some(CopilotCompletionCommand::Accepted { .. }))),
+        "acceptance telemetry must be sent to the worker"
+    );
+}
+
+#[test]
+fn accept_ghost_completion_is_a_noop_once_the_cursor_has_moved_off_it() {
+    let files = TempFiles::new("ghost-stale-accept");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+
+    {
+        let editor = find_editor_mut(&mut state, &path).unwrap();
+        // A position the cursor is *not* currently at.
+        editor.ghost_completion =
+            Some(GhostCompletion { at: CursorPos { line: 0, col: 99 }, insert_text: "bc".to_string(), item: ghost_item("bc") });
+    }
+
+    let _ = update(&mut state, Message::AcceptGhostCompletion);
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert_eq!(editor.document.text().to_string(), "a", "nothing must be inserted for a suggestion at a stale position");
+}
+
+#[test]
+fn dismiss_ghost_completion_clears_it_without_touching_the_buffer() {
+    let files = TempFiles::new("ghost-dismiss");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+    let cursor = find_editor(&state, &path).unwrap().cursor;
+    {
+        let editor = find_editor_mut(&mut state, &path).unwrap();
+        editor.ghost_completion = Some(GhostCompletion { at: cursor, insert_text: "bc".to_string(), item: ghost_item("bc") });
+    }
+
+    let _ = update(&mut state, Message::DismissGhostCompletion);
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert!(editor.ghost_completion.is_none());
+    assert_eq!(editor.document.text().to_string(), "a");
+}
+
+#[test]
+fn editor_indent_accepts_a_showing_ghost_completion_instead_of_indenting() {
+    let files = TempFiles::new("ghost-tab-precedence");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+    let cursor = find_editor(&state, &path).unwrap().cursor;
+    {
+        let editor = find_editor_mut(&mut state, &path).unwrap();
+        editor.ghost_completion = Some(GhostCompletion { at: cursor, insert_text: "bc".to_string(), item: ghost_item("bc") });
+    }
+
+    let _ = update(&mut state, Message::EditorIndent);
+
+    let editor = find_editor(&state, &path).unwrap();
+    assert_eq!(editor.document.text().to_string(), "bca", "Tab must accept the suggestion, not insert a real indent");
+    assert!(editor.ghost_completion.is_none());
+}
+
+#[test]
+fn copilot_completion_suggestion_event_is_applied_only_at_the_matching_cursor() {
+    let files = TempFiles::new("ghost-suggestion-event");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let path = files.a.clone();
+    let uri = lsp_uri(&path).unwrap();
+    let cursor = find_editor(&state, &path).unwrap().cursor;
+
+    // Stale: for a position the cursor has since moved away from.
+    let _ = update(
+        &mut state,
+        Message::CopilotCompletion(CopilotCompletionEvent::Suggestion {
+            uri: uri.clone(),
+            line: cursor.line as u32,
+            character: cursor.col as u32 + 5,
+            item: Some(ghost_item("stale")),
+        }),
+    );
+    assert!(find_editor(&state, &path).unwrap().ghost_completion.is_none(), "a stale-position response must be dropped");
+
+    // Matching: applied.
+    let _ = update(
+        &mut state,
+        Message::CopilotCompletion(CopilotCompletionEvent::Suggestion {
+            uri,
+            line: cursor.line as u32,
+            character: cursor.col as u32,
+            item: Some(ghost_item("bc")),
+        }),
+    );
+    let editor = find_editor(&state, &path).unwrap();
+    assert_eq!(editor.ghost_completion.as_ref().map(|g| g.insert_text.as_str()), Some("bc"));
+    assert_eq!(editor.ghost_completion.as_ref().map(|g| g.at), Some(cursor));
 }
 
 #[test]

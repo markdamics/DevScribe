@@ -27,7 +27,7 @@ use std::time::SystemTime;
 use crate::color::color;
 use crate::fonts;
 use crate::recent_projects;
-use crate::state::{ChatMessage, ChatMode, ChatStatus, Message, PermissionState, State, TabKey, ToolActivity};
+use crate::state::{chat_is_active, ChatMessage, ChatMode, ChatProvider, ChatStatus, Message, PermissionState, State, TabKey, ToolActivity};
 use crate::ui::status_bar;
 use crate::widgets;
 
@@ -146,10 +146,10 @@ fn operator_row(text_content: &str, p: Palette) -> Element<'static, Message> {
 /// `caret_visible` (state.rs's existing ~530ms blink tick) only ever
 /// applies while `streaming` is true — a finalized bubble never shows the
 /// live-typing caret, matching VS Code's own streaming indicator.
-fn assistant_row(text_content: &str, streaming: bool, caret_visible: bool, p: Palette) -> Element<'static, Message> {
+fn assistant_row(text_content: &str, streaming: bool, caret_visible: bool, provider: ChatProvider, p: Palette) -> Element<'static, Message> {
     let shown = if streaming && caret_visible { format!("{text_content}\u{258c}") } else { text_content.to_string() };
     column![
-        row![widgets::dot(color(p.accent_solid), 5.0), widgets::micro("CLAUDE CODE", color(p.text_muted))]
+        row![widgets::dot(color(p.accent_solid), 5.0), widgets::micro(provider.label(), color(p.text_muted))]
             .spacing(7.0)
             .align_y(Alignment::Center),
         text(shown).size(crate::text_scale::px(15.0)).color(color(p.text_body)),
@@ -266,10 +266,10 @@ fn tool_activity_row(tool: &ToolActivity, caret_visible: bool, p: Palette) -> El
     content.into()
 }
 
-fn message_row(msg: &ChatMessage, caret_visible: bool, p: Palette) -> Element<'static, Message> {
+fn message_row(msg: &ChatMessage, caret_visible: bool, provider: ChatProvider, p: Palette) -> Element<'static, Message> {
     match msg {
         ChatMessage::Operator(text_content) => operator_row(text_content, p),
-        ChatMessage::Assistant { text, streaming } => assistant_row(text, *streaming, caret_visible, p),
+        ChatMessage::Assistant { text, streaming } => assistant_row(text, *streaming, caret_visible, provider, p),
         ChatMessage::Tool(tool) if tool.permission == Some(PermissionState::Pending) => permission_card(tool, p),
         ChatMessage::Tool(tool) => tool_activity_row(tool, caret_visible, p),
     }
@@ -277,10 +277,11 @@ fn message_row(msg: &ChatMessage, caret_visible: bool, p: Palette) -> Element<'s
 
 fn status_line(state: &State, p: Palette) -> Element<'static, Message> {
     let label = match &state.chat.status {
-        ChatStatus::Starting => "STARTING CLAUDE CODE\u{2026}".to_string(),
+        ChatStatus::Starting => format!("STARTING {}\u{2026}", state.chat_provider.label().to_uppercase()),
         ChatStatus::Unavailable(reason) => format!("UNAVAILABLE \u{2014} {reason}"),
         ChatStatus::Ready => {
-            let model = state.chat.model.as_deref().unwrap_or("claude");
+            let fallback = state.chat_provider.label().to_lowercase();
+            let model = state.chat.model.as_deref().unwrap_or(&fallback);
             format!(
                 "{model} \u{2014} {}+{} TOK",
                 state.chat.input_tokens, state.chat.output_tokens
@@ -424,6 +425,50 @@ fn current_presentation(state: &State) -> Option<ChatPresentation> {
     }
 }
 
+/// The Actions popup's rows, which depend on the active provider: almost
+/// everything the popup offers is `claude`-CLI-specific machinery rather
+/// than generic chat. "Attach file…"/"Mention file…" insert an `@path`,
+/// which is `claude`'s own file-reference syntax (see `insert_chat_mention`)
+/// and reaches Copilot as nothing but literal text — Copilot takes file
+/// context through `conversation/*`'s own `references` parameter instead,
+/// which `copilot_agent` doesn't send yet. "Switch model…", "Thinking" and
+/// "Account & usage" are all just `/model`, `/effort` and `/usage` sent as
+/// prompts, which only `claude` answers itself. "Shell Access" maps to
+/// `SessionOptions::allow_bash`, which `copilot_agent` ignores outright.
+///
+/// So under Copilot the popup honestly reduces to "Clear conversation" —
+/// which does work there (a new session id re-keys `chat_worker`'s
+/// subscription, so the worker respawns onto a fresh conversation). A real
+/// Copilot model picker belongs here eventually — `copilot_agent` already
+/// fetches the account's model list to choose a default — but wiring the
+/// choice back through the subscription key is its own change, and a
+/// non-functional row in the meantime is exactly what this avoids.
+fn actions_menu_items(state: &State, p: Palette) -> Vec<Element<'static, Message>> {
+    if !state.chat_provider.is_claude_cli() {
+        return vec![
+            actions_section_label("SESSION", p),
+            action_row("Clear conversation", None, Message::ChatNewSession, p),
+        ];
+    }
+
+    let model = state.chat.model.clone().unwrap_or_else(|| "\u{2014}".to_string());
+    vec![
+        actions_section_label("CONTEXT", p),
+        action_row("Attach file\u{2026}", Some("\u{2318}U".to_string()), Message::ChatAttachFileDialog, p),
+        action_row("Mention file from this project\u{2026}", Some("@".to_string()), Message::ChatMentionFileDialog, p),
+        action_row("Clear conversation", None, Message::ChatNewSession, p),
+        widgets::hline(color(p.border_hairline)),
+        actions_section_label("MODEL", p),
+        action_row("Switch model\u{2026}", Some(model), Message::ChatShowModel, p),
+        action_toggle_row("Thinking", state.chat_thinking_enabled, Message::ChatToggleThinking, p),
+        widgets::hline(color(p.border_hairline)),
+        actions_section_label("PERMISSIONS", p),
+        action_toggle_row("Shell Access", state.chat_shell_access_enabled, Message::ChatToggleShellAccess, p),
+        widgets::hline(color(p.border_hairline)),
+        action_row("Account & usage\u{2026}", None, Message::ChatShowUsage, p),
+    ]
+}
+
 /// The input bar's "+" Actions popup, as a `shell.rs` top-level layer (see
 /// `shell::view`'s `layers.extend(chat_panel::actions_menu(...))`) —
 /// *not* stacked locally inside `input_bar`'s own element the way a first
@@ -459,26 +504,7 @@ pub fn actions_menu(state: &State, p: Palette) -> Option<Element<'static, Messag
     };
     let bottom = state.density.status_bar_h() + if state.problems_panel_open { status_bar::PROBLEMS_PANEL_H } else { 0.0 };
 
-    let model = state.chat.model.clone().unwrap_or_else(|| "\u{2014}".to_string());
-    let menu = container(
-        column![
-            actions_section_label("CONTEXT", p),
-            action_row("Attach file\u{2026}", Some("\u{2318}U".to_string()), Message::ChatAttachFileDialog, p),
-            action_row("Mention file from this project\u{2026}", Some("@".to_string()), Message::ChatMentionFileDialog, p),
-            action_row("Clear conversation", None, Message::ChatNewSession, p),
-            widgets::hline(color(p.border_hairline)),
-            actions_section_label("MODEL", p),
-            action_row("Switch model\u{2026}", Some(model), Message::ChatShowModel, p),
-            action_toggle_row("Thinking", state.chat_thinking_enabled, Message::ChatToggleThinking, p),
-            widgets::hline(color(p.border_hairline)),
-            actions_section_label("PERMISSIONS", p),
-            action_toggle_row("Shell Access", state.chat_shell_access_enabled, Message::ChatToggleShellAccess, p),
-            widgets::hline(color(p.border_hairline)),
-            action_row("Account & usage\u{2026}", None, Message::ChatShowUsage, p),
-        ]
-        .spacing(2.0)
-        .padding(6.0),
-    )
+    let menu = container(column(actions_menu_items(state, p)).spacing(2.0).padding(6.0))
     .width(Length::Fixed(280.0))
     .style(move |_theme| container::Style {
         background: Some(color(p.surface_raised).into()),
@@ -524,7 +550,11 @@ fn hint_row(p: Palette) -> Element<'static, Message> {
 /// which reproduces the widget's own normal behavior unchanged.
 fn input_bar(state: &State, p: Palette) -> Element<'_, Message> {
     let enabled = state.chat.sender.is_some();
-    let placeholder = if enabled { "Ask about this project\u{2026} (Shift+Enter for a new line)" } else { "Waiting for Claude Code to start\u{2026}" };
+    let placeholder = if enabled {
+        "Ask about this project\u{2026} (Shift+Enter for a new line)".to_string()
+    } else {
+        format!("Waiting for {} to start\u{2026}", state.chat_provider.label())
+    };
 
     let mut input = text_editor(&state.chat.input)
         .placeholder(placeholder)
@@ -555,7 +585,22 @@ fn input_bar(state: &State, p: Palette) -> Element<'_, Message> {
     }
 
     let input_row = row![actions_menu_button(state.chat_actions_open, p), input].spacing(8.0).align_y(Alignment::Center);
-    column![mode_selector(state, p), input_row, hint_row(p), status_line(state, p)].spacing(6.0).into()
+
+    // The permission-mode row (Manual/Auto-Edit/Plan/Auto) and "Design
+    // Login…" are both `claude`-specific — `copilot_agent::run` ignores
+    // `chat_permission_mode` entirely (see its own doc comment), and
+    // "Design Login…" launches a terminal running `claude` by name. Showing
+    // either under Copilot would be the same kind of "looks like it should
+    // do something but doesn't" trap the hardcoded Claude-branded
+    // placeholder text used to be.
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+    if state.chat_provider.is_claude_cli() {
+        items.push(mode_selector(state, p));
+    }
+    items.push(input_row.into());
+    items.push(hint_row(p));
+    items.push(status_line(state, p));
+    column(items).spacing(6.0).into()
 }
 
 /// The message list's top row while `state.chat.history_truncated` — a
@@ -666,13 +711,24 @@ pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
     }
 
     let mut rows: Vec<Element<'static, Message>> =
-        state.chat.messages.iter().map(|m| message_row(m, state.caret_visible, p)).collect();
+        state.chat.messages.iter().map(|m| message_row(m, state.caret_visible, state.chat_provider, p)).collect();
     if state.chat.history_truncated {
         rows.insert(0, load_earlier_row(p));
     }
 
     let list: Element<'static, Message> = if rows.is_empty() {
-        widgets::placeholder("Ask Claude Code about this project to get started", p)
+        // An `Unavailable` reason (binary missing, spawn failure, ...) is
+        // otherwise only visible in `status_line`'s small, muted text at the
+        // very bottom of the panel — easy to miss, especially right after
+        // switching providers when the *previous* provider's messages just
+        // disappeared and this empty state is the only other thing on
+        // screen. Surface it here too, the same prominent way VS Code shows
+        // "Copilot isn't signed in" inline in the chat pane rather than only
+        // in a status bar.
+        match &state.chat.status {
+            ChatStatus::Unavailable(reason) => widgets::placeholder(reason.clone(), p),
+            _ => widgets::placeholder(format!("Ask {} about this project to get started", state.chat_provider.label()), p),
+        }
     } else {
         scrollable(column(rows).spacing(16.0).padding(16.0).width(Length::Fill))
             .id(crate::state::chat_scroll_id())
@@ -694,8 +750,74 @@ pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
     .into()
 }
 
-fn panel_header(title: &'static str, p: Palette, buttons: Vec<Element<'static, Message>>) -> Element<'static, Message> {
-    let mut content = row![text(title).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(11.0)).color(color(p.accent_solid))]
+/// The header's trailing buttons, shared by both presentations.
+/// "THREADS" opens the saved-session picker, which reads `claude`'s own
+/// on-disk transcripts (`claude_agent::list_sessions`) — there are no such
+/// transcripts under Copilot, and `copilot_agent` doesn't resume sessions at
+/// all, so the button is Claude-only rather than an empty list to nowhere.
+fn header_buttons(state: &State, p: Palette) -> Vec<Element<'static, Message>> {
+    let mut buttons = Vec::new();
+    if state.chat_provider.is_claude_cli() {
+        buttons.push(header_button("THREADS", Message::ChatToggleSessions, p));
+    }
+    buttons.push(view_menu_button(state.chat_view_menu_open, p));
+    buttons
+}
+
+fn provider_button(provider: ChatProvider, active: ChatProvider, p: Palette) -> Element<'static, Message> {
+    let is_active = provider == active;
+    button(text(provider.label()).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(11.0)))
+        .padding(0.0)
+        .on_press(Message::ChatSetProvider(provider))
+        .style(move |_theme, status| button::Style {
+            text_color: if is_active {
+                color(p.accent_solid)
+            } else if status == button::Status::Hovered {
+                color(p.text_strong)
+            } else {
+                color(p.text_muted)
+            },
+            ..button::Style::default()
+        })
+        .into()
+}
+
+/// The panel header's own title slot, replaced by the AI switcher (a status
+/// dot plus one clickable label per provider) rather than a static
+/// "CLAUDE CODE"/"GITHUB COPILOT" string — this is the one place in the app
+/// a human is guaranteed to be looking at the chat panel itself, so it's a
+/// more natural home for "which backend am I talking to, and can I change
+/// it" than a strip that's hidden while the panel is actually open as a tab
+/// (`breadcrumb_bar` only renders for a code-file tab).
+///
+/// The dot reports the chat session's health, but only while a session
+/// should actually exist (`chat_is_active`); with the panel closed there's
+/// no worker running, so `state.chat.status` is just whatever the last one
+/// left behind and reporting it would be stale. In practice this function is
+/// only ever called while the panel *is* open (`docked_view`/`tab_view`), so
+/// the dot is never actually shown in that stale state — the check is
+/// defensive, matching `chat_is_active`'s own doc comment on why it's not
+/// simply `state.chat_mode != Closed`.
+fn ai_switcher(state: &State, p: Palette) -> Element<'static, Message> {
+    let dot_color = if !chat_is_active(state) {
+        p.text_muted
+    } else {
+        match state.chat.status {
+            ChatStatus::Ready => p.status_success,
+            ChatStatus::Starting => p.status_warning,
+            ChatStatus::Unavailable(_) => p.status_danger,
+        }
+    };
+
+    let mut content = row![widgets::dot(color(dot_color), 6.0)].spacing(7.0).align_y(Alignment::Center);
+    for provider in ChatProvider::ALL {
+        content = content.push(provider_button(provider, state.chat_provider, p));
+    }
+    content.into()
+}
+
+fn panel_header(switcher: Element<'static, Message>, p: Palette, buttons: Vec<Element<'static, Message>>) -> Element<'static, Message> {
+    let mut content = row![switcher]
         .spacing(10.0)
         .align_y(Alignment::Center);
     content = content.push(Space::new().width(Length::Fill));
@@ -818,11 +940,7 @@ pub fn view_menu(state: &State, p: Palette) -> Option<Element<'static, Message>>
 /// its own resize handle, same composition as `sidebar::view` +
 /// `sidebar::resize_handle`.
 pub fn docked_view(state: &State, p: Palette) -> Element<'_, Message> {
-    let header = panel_header(
-        "CLAUDE CODE",
-        p,
-        vec![header_button("THREADS", Message::ChatToggleSessions, p), view_menu_button(state.chat_view_menu_open, p)],
-    );
+    let header = panel_header(ai_switcher(state, p), p, header_buttons(state, p));
 
     let body = column![header, thread_view(state, p)].width(Length::Fill).height(Length::Fill);
 
@@ -875,10 +993,6 @@ pub fn collapsed_rail(p: Palette) -> Element<'static, Message> {
 /// `state.active_tab == Some(TabKey::Chat)`. The default presentation for a
 /// freshly opened session — see `toggle_chat`'s own doc comment.
 pub fn tab_view(state: &State, p: Palette) -> Element<'_, Message> {
-    let header = panel_header(
-        "CLAUDE CODE",
-        p,
-        vec![header_button("THREADS", Message::ChatToggleSessions, p), view_menu_button(state.chat_view_menu_open, p)],
-    );
+    let header = panel_header(ai_switcher(state, p), p, header_buttons(state, p));
     column![header, thread_view(state, p)].width(Length::Fill).height(Length::Fill).into()
 }
