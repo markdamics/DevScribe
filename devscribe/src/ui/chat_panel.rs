@@ -1253,9 +1253,9 @@ fn session_list_view(state: &State, p: Palette) -> Element<'static, Message> {
         });
 
     let list: Element<'static, Message> = if state.chat_sessions.is_empty() {
-        widgets::placeholder("No past sessions for this project yet", p)
+        widgets::placeholder("No past sessions for this project yet", p.bg_canvas, p)
     } else if filtered.is_empty() {
-        widgets::placeholder("No sessions match your search", p)
+        widgets::placeholder("No sessions match your search", p.bg_canvas, p)
     } else {
         let rows: Vec<Element<'static, Message>> = filtered.into_iter().map(|s| session_row(s, p)).collect();
         scrollable(column(rows).spacing(2.0).padding([4.0, 8.0]).width(Length::Fill)).width(Length::Fill).height(Length::Fill).into()

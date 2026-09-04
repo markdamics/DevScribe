@@ -72,7 +72,7 @@ fn search_icon_tab(active: bool, p: Palette, density: Density) -> Element<'stati
             let hovered = status == button::Status::Hovered;
             button::Style {
                 background: if active {
-                    Some(color(p.bg_canvas).into())
+                    Some(color(p.editor_canvas).into())
                 } else if hovered {
                     Some(color(p.surface_hover).into())
                 } else {
@@ -162,7 +162,7 @@ fn tab_shell(
     let inner = container(row![select, close].align_y(Alignment::Center))
         .height(Length::Fixed(tab_h))
         .style(move |_theme| container::Style {
-            background: active.then(|| color(p.bg_canvas).into()),
+            background: active.then(|| color(p.editor_canvas).into()),
             ..container::Style::default()
         });
 

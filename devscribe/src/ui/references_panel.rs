@@ -72,7 +72,7 @@ pub fn dock_panel(state: &State, p: Palette) -> Element<'static, Message> {
 
     let root = state.root.clone();
     let list: Element<'static, Message> = if state.references_results.is_empty() {
-        widgets::placeholder("No locations to show", p)
+        widgets::placeholder("No locations to show", p.bg_base, p)
     } else {
         let rows: Vec<Element<'static, Message>> =
             state.references_results.iter().map(|entry| location_row(entry, &root, p)).collect();

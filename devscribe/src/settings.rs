@@ -24,6 +24,19 @@ pub struct Settings {
     /// RGB color (roadmap item 11's color picker) — `None` uses `accent`'s
     /// preset ramp as before. See `theme::palette_custom`.
     pub custom_accent: Option<(u8, u8, u8)>,
+    /// Overrides the resolved palette's `bg_canvas` ("Background" — the
+    /// app's general chrome background: title bar, welcome screen, backdrop
+    /// scrims) with a custom RGB color directly — no ramp involved, unlike
+    /// `custom_accent`. `None` uses whichever value `theme_mode`/`accent`
+    /// would otherwise resolve to. See `theme::palette_custom`.
+    pub custom_background: Option<(u8, u8, u8)>,
+    /// Overrides the resolved palette's `editor_canvas` ("Editor Canvas" —
+    /// the primary content pane's own background: the code editor and every
+    /// view that takes its place there) with a custom RGB color directly —
+    /// a distinct `Palette` field from `bg_canvas` precisely so this and
+    /// `custom_background` stay independent of each other. See
+    /// `theme::palette_custom`.
+    pub custom_editor_canvas: Option<(u8, u8, u8)>,
     /// The "High Contrast" toggle (roadmap item 11) — see
     /// `theme::apply_high_contrast`.
     pub high_contrast: bool,
@@ -52,6 +65,8 @@ impl Default for Settings {
             theme_mode: ThemeMode::default(),
             accent: Accent::default(),
             custom_accent: None,
+            custom_background: None,
+            custom_editor_canvas: None,
             high_contrast: false,
             density: Density::default(),
             ui_font_scale: crate::state::UI_FONT_SCALE_DEFAULT,
@@ -97,6 +112,10 @@ struct SettingsFile {
     accent: String,
     #[serde(default)]
     custom_accent: Option<(u8, u8, u8)>,
+    #[serde(default)]
+    custom_background: Option<(u8, u8, u8)>,
+    #[serde(default)]
+    custom_editor_canvas: Option<(u8, u8, u8)>,
     #[serde(default)]
     high_contrast: bool,
     #[serde(default)]
@@ -226,6 +245,8 @@ fn load_from(path: &Path) -> Option<Settings> {
         theme_mode: mode_from_key(&file.theme_mode).unwrap_or(defaults.theme_mode),
         accent: accent_from_key(&file.accent).unwrap_or(defaults.accent),
         custom_accent: file.custom_accent,
+        custom_background: file.custom_background,
+        custom_editor_canvas: file.custom_editor_canvas,
         high_contrast: file.high_contrast,
         density: density_from_key(&file.density).unwrap_or(defaults.density),
         ui_font_scale: file.ui_font_scale,
@@ -264,6 +285,8 @@ fn save_to(path: &Path, settings: &Settings) {
         theme_mode: mode_key(settings.theme_mode).to_string(),
         accent: accent_key(settings.accent).to_string(),
         custom_accent: settings.custom_accent,
+        custom_background: settings.custom_background,
+        custom_editor_canvas: settings.custom_editor_canvas,
         high_contrast: settings.high_contrast,
         density: density_key(settings.density).to_string(),
         ui_font_scale: settings.ui_font_scale,

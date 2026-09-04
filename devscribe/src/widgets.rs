@@ -98,9 +98,17 @@ pub fn vline<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
 }
 
 /// A muted, centered message filling its panel — "nothing to show here" for
-/// any tab (no file open, not JSON, no diff, empty search).
+/// any tab (no file open, not JSON, no diff, empty search) or chrome list
+/// (no problems, no past sessions, ...). `bg` is passed explicitly rather
+/// than hardcoded to one `Palette` field because callers span both the
+/// primary content pane (which should track `p.editor_canvas`) and plain
+/// chrome panels (which should track `p.bg_canvas`) — see the custom
+/// "Background"/"Editor Canvas" color pickers (roadmap item 11), which only
+/// stay independent of each other if this helper doesn't quietly conflate
+/// the two.
 pub fn placeholder<'a, Message: 'a>(
     label: impl text::IntoFragment<'a>,
+    bg: devscribe_core::theme::Rgba,
     p: Palette,
 ) -> Element<'a, Message> {
     container(
@@ -113,7 +121,7 @@ pub fn placeholder<'a, Message: 'a>(
     .height(Length::Fill)
     .center(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(color(p.bg_canvas).into()),
+        background: Some(color(bg).into()),
         ..container::Style::default()
     })
     .into()

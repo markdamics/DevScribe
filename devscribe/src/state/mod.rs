@@ -223,6 +223,8 @@ pub struct ThemePreview {
     pub theme_mode: ThemeMode,
     pub accent: Accent,
     pub custom_accent: Option<(u8, u8, u8)>,
+    pub custom_background: Option<(u8, u8, u8)>,
+    pub custom_editor_canvas: Option<(u8, u8, u8)>,
     pub high_contrast: bool,
 }
 
@@ -240,11 +242,22 @@ pub struct State {
     /// reflects it live; nothing here becomes real until "Apply" sends
     /// `Message::SetCustomAccent` with these same values.
     pub custom_accent_draft: (u8, u8, u8),
+    /// See `settings::Settings::custom_background`'s own doc comment —
+    /// overrides `bg_canvas` directly, no ramp involved (unlike `custom_accent`).
+    pub custom_background: Option<(u8, u8, u8)>,
+    /// Mirrors `custom_accent_draft`, but for `custom_background`.
+    pub custom_background_draft: (u8, u8, u8),
+    /// See `settings::Settings::custom_editor_canvas`'s own doc comment —
+    /// overrides `editor_canvas` directly, no ramp involved (unlike `custom_accent`).
+    pub custom_editor_canvas: Option<(u8, u8, u8)>,
+    /// Mirrors `custom_accent_draft`, but for `custom_editor_canvas`.
+    pub custom_editor_canvas_draft: (u8, u8, u8),
     /// A theme change the settings panel is showing a live preview of —
     /// hovering a theme-mode/accent-preset/custom-color swatch, or dragging
     /// its RGB sliders, sets this without touching the committed
-    /// `theme_mode`/`accent`/`custom_accent`/`high_contrast` fields above,
-    /// so the whole app (not just the settings panel itself) reflects the
+    /// `theme_mode`/`accent`/`custom_accent`/`custom_background`/
+    /// `custom_editor_canvas`/`high_contrast` fields above, so the whole app
+    /// (not just the settings panel itself) reflects the
     /// hovered choice everywhere `active_theme`/`active_palette` is read —
     /// then reverts the instant the preview ends (mouse leaves the swatch,
     /// or the panel closes) with nothing to undo, since nothing was ever
@@ -713,6 +726,10 @@ impl Default for State {
             custom_accent: settings.custom_accent,
             high_contrast: settings.high_contrast,
             custom_accent_draft: settings.custom_accent.unwrap_or((124, 156, 224)),
+            custom_background: settings.custom_background,
+            custom_background_draft: settings.custom_background.unwrap_or((7, 10, 15)),
+            custom_editor_canvas: settings.custom_editor_canvas,
+            custom_editor_canvas_draft: settings.custom_editor_canvas.unwrap_or((4, 6, 10)),
             theme_preview: None,
             open_tabs: Vec::new(),
             active_tab: None,
@@ -842,6 +859,20 @@ pub enum Message {
     /// `custom_accent_draft` and live-previews it (`theme_preview`),
     /// without committing (see `custom_accent_draft`'s own doc comment).
     AdjustCustomAccentDraft(u8, u8, u8),
+    /// Mirrors `SetCustomAccent`, but overrides `bg_canvas` ("Background")
+    /// directly instead of deriving a ramp.
+    SetCustomBackground(u8, u8, u8),
+    /// Mirrors `ClearCustomAccent`, but for `custom_background`.
+    ClearCustomBackground,
+    /// Mirrors `AdjustCustomAccentDraft`, but for `custom_background_draft`.
+    AdjustCustomBackgroundDraft(u8, u8, u8),
+    /// Mirrors `SetCustomAccent`, but overrides `editor_canvas` ("Editor
+    /// Canvas") directly instead of deriving a ramp.
+    SetCustomEditorCanvas(u8, u8, u8),
+    /// Mirrors `ClearCustomAccent`, but for `custom_editor_canvas`.
+    ClearCustomEditorCanvas,
+    /// Mirrors `AdjustCustomAccentDraft`, but for `custom_editor_canvas_draft`.
+    AdjustCustomEditorCanvasDraft(u8, u8, u8),
     ToggleHighContrast,
     /// Hovering a theme-mode/accent-preset/custom-color swatch in the
     /// settings panel, or dragging its RGB sliders — live-previews that
@@ -1453,6 +1484,50 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 theme_mode: state.theme_mode,
                 accent: state.accent,
                 custom_accent: Some((r, g, b)),
+                custom_background: state.custom_background,
+                custom_editor_canvas: state.custom_editor_canvas,
+                high_contrast: state.high_contrast,
+            });
+        }
+        Message::SetCustomBackground(r, g, b) => {
+            state.custom_background = Some((r, g, b));
+            state.custom_background_draft = (r, g, b);
+            state.theme_preview = None;
+            persist_settings(state);
+        }
+        Message::ClearCustomBackground => {
+            state.custom_background = None;
+            persist_settings(state);
+        }
+        Message::AdjustCustomBackgroundDraft(r, g, b) => {
+            state.custom_background_draft = (r, g, b);
+            state.theme_preview = Some(ThemePreview {
+                theme_mode: state.theme_mode,
+                accent: state.accent,
+                custom_accent: state.custom_accent,
+                custom_background: Some((r, g, b)),
+                custom_editor_canvas: state.custom_editor_canvas,
+                high_contrast: state.high_contrast,
+            });
+        }
+        Message::SetCustomEditorCanvas(r, g, b) => {
+            state.custom_editor_canvas = Some((r, g, b));
+            state.custom_editor_canvas_draft = (r, g, b);
+            state.theme_preview = None;
+            persist_settings(state);
+        }
+        Message::ClearCustomEditorCanvas => {
+            state.custom_editor_canvas = None;
+            persist_settings(state);
+        }
+        Message::AdjustCustomEditorCanvasDraft(r, g, b) => {
+            state.custom_editor_canvas_draft = (r, g, b);
+            state.theme_preview = Some(ThemePreview {
+                theme_mode: state.theme_mode,
+                accent: state.accent,
+                custom_accent: state.custom_accent,
+                custom_background: state.custom_background,
+                custom_editor_canvas: Some((r, g, b)),
                 high_contrast: state.high_contrast,
             });
         }
@@ -3258,6 +3333,8 @@ fn persist_settings(state: &State) {
         theme_mode: state.theme_mode,
         accent: state.accent,
         custom_accent: state.custom_accent,
+        custom_background: state.custom_background,
+        custom_editor_canvas: state.custom_editor_canvas,
         high_contrast: state.high_contrast,
         density: state.density,
         ui_font_scale: state.ui_font_scale,

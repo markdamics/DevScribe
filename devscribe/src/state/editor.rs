@@ -2607,15 +2607,32 @@ pub fn active_editor(state: &State) -> Option<&EditorState> {
     find_editor(state, &active_file_path(state)?)
 }
 
-/// `(theme_mode, accent, custom_accent, high_contrast)` — `state.theme_preview`
-/// when the settings panel is live-previewing a change, else the committed
-/// settings. The single source every `active_palette` call (and so every
-/// `view()` in the app) reads, so a hovered swatch previews everywhere at
-/// once rather than just inside the settings panel itself (roadmap item 11).
-pub fn active_theme(state: &State) -> (ThemeMode, Accent, Option<(u8, u8, u8)>, bool) {
+/// `(theme_mode, accent, custom_accent, custom_background,
+/// custom_editor_canvas, high_contrast)` — `state.theme_preview` when the
+/// settings panel is live-previewing a change, else the committed settings.
+/// The single source every `active_palette` call (and so every `view()` in
+/// the app) reads, so a hovered swatch previews everywhere at once rather
+/// than just inside the settings panel itself (roadmap item 11).
+pub fn active_theme(
+    state: &State,
+) -> (ThemeMode, Accent, Option<(u8, u8, u8)>, Option<(u8, u8, u8)>, Option<(u8, u8, u8)>, bool) {
     match state.theme_preview {
-        Some(preview) => (preview.theme_mode, preview.accent, preview.custom_accent, preview.high_contrast),
-        None => (state.theme_mode, state.accent, state.custom_accent, state.high_contrast),
+        Some(preview) => (
+            preview.theme_mode,
+            preview.accent,
+            preview.custom_accent,
+            preview.custom_background,
+            preview.custom_editor_canvas,
+            preview.high_contrast,
+        ),
+        None => (
+            state.theme_mode,
+            state.accent,
+            state.custom_accent,
+            state.custom_background,
+            state.custom_editor_canvas,
+            state.high_contrast,
+        ),
     }
 }
 
@@ -2624,8 +2641,8 @@ pub fn active_theme(state: &State) -> (ThemeMode, Accent, Option<(u8, u8, u8)>, 
 /// `devscribe_core::theme::palette(state.theme_mode, state.accent)`
 /// directly, or it won't pick up a live preview (roadmap item 11).
 pub fn active_palette(state: &State) -> theme::Palette {
-    let (mode, accent, custom, high_contrast) = active_theme(state);
-    let p = theme::palette_custom(mode, accent, custom);
+    let (mode, accent, custom_accent, custom_background, custom_editor_canvas, high_contrast) = active_theme(state);
+    let p = theme::palette_custom(mode, accent, custom_accent, custom_background, custom_editor_canvas);
     if high_contrast { theme::apply_high_contrast(p) } else { p }
 }
 

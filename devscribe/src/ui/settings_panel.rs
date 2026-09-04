@@ -141,6 +141,8 @@ fn theme_mode_row(state: &State, p: Palette) -> Element<'static, Message> {
                 theme_mode: mode,
                 accent: state.accent,
                 custom_accent: state.custom_accent,
+                custom_background: state.custom_background,
+                custom_editor_canvas: state.custom_editor_canvas,
                 high_contrast: state.high_contrast,
             };
             let btn = button(
@@ -192,6 +194,8 @@ fn accent_row(state: &State, p: Palette) -> Element<'static, Message> {
                         theme_mode: state.theme_mode,
                         accent,
                         custom_accent: None,
+                        custom_background: state.custom_background,
+                        custom_editor_canvas: state.custom_editor_canvas,
                         high_contrast: state.high_contrast,
                     };
                     let btn = button(
@@ -237,10 +241,17 @@ fn accent_row(state: &State, p: Palette) -> Element<'static, Message> {
 }
 
 /// One RGB channel's labeled slider (0..=255) — dragging it fires
-/// `Message::AdjustCustomAccentDraft` with the other two channels held at
-/// their current draft value, live-previewing app-wide as it moves
-/// (roadmap item 11).
-fn rgb_slider_row(label: &'static str, draft: (u8, u8, u8), channel: u8, p: Palette) -> Element<'static, Message> {
+/// `make_adjust` with the other two channels held at their current draft
+/// value, live-previewing app-wide as it moves (roadmap item 11). Shared by
+/// every custom color picker (`custom_color_picker`) — `make_adjust` is the
+/// picker's own `Message::AdjustCustom*Draft` variant constructor.
+fn rgb_slider_row(
+    label: &'static str,
+    draft: (u8, u8, u8),
+    channel: u8,
+    make_adjust: fn(u8, u8, u8) -> Message,
+    p: Palette,
+) -> Element<'static, Message> {
     let value = match channel {
         0 => draft.0,
         1 => draft.1,
@@ -254,7 +265,7 @@ fn rgb_slider_row(label: &'static str, draft: (u8, u8, u8), channel: u8, p: Pale
                 1 => (draft.0, v, draft.2),
                 _ => (draft.0, draft.1, v),
             };
-            Message::AdjustCustomAccentDraft(next.0, next.1, next.2)
+            make_adjust(next.0, next.1, next.2)
         })
         .width(Length::Fill)
         .style(move |_theme, _status| iced::widget::slider::Style {
@@ -277,13 +288,21 @@ fn rgb_slider_row(label: &'static str, draft: (u8, u8, u8), channel: u8, p: Pale
     .into()
 }
 
-/// The custom accent color picker (roadmap item 11) — three RGB sliders
-/// live-previewing app-wide as they're dragged, a swatch showing the
-/// draft color, and "Apply"/"Reset to preset" actions. Distinct from
-/// `accent_row`'s fixed presets above it — this is the "not just presets"
-/// half of the item.
-fn custom_accent_picker(state: &State, p: Palette) -> Element<'static, Message> {
-    let draft = state.custom_accent_draft;
+/// A custom RGB color picker (roadmap item 11) — three RGB sliders
+/// live-previewing app-wide as they're dragged, a swatch showing the draft
+/// color, and "Apply"/`reset_label` actions. Shared by the accent, background,
+/// and editor canvas pickers — each just supplies its own draft value,
+/// active flag, and `Message` variant constructors, since the three work
+/// identically apart from which `Palette` field they end up overriding.
+fn custom_color_picker(
+    draft: (u8, u8, u8),
+    active: bool,
+    reset_label: &'static str,
+    make_adjust: fn(u8, u8, u8) -> Message,
+    make_apply: fn(u8, u8, u8) -> Message,
+    clear_message: Message,
+    p: Palette,
+) -> Element<'static, Message> {
     let swatch_color = Rgba::from_rgb8(draft.0, draft.1, draft.2);
 
     let swatch = container(Space::new().width(Length::Fixed(28.0)).height(Length::Fixed(28.0)))
@@ -293,19 +312,18 @@ fn custom_accent_picker(state: &State, p: Palette) -> Element<'static, Message> 
             ..container::Style::default()
         });
 
-    let active = state.custom_accent.is_some();
     let apply = button(text("Apply").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.bg_base)))
         .padding([5.0, 12.0])
-        .on_press(Message::SetCustomAccent(draft.0, draft.1, draft.2))
+        .on_press(make_apply(draft.0, draft.1, draft.2))
         .style(move |_theme, _status| button::Style {
             background: Some(color(p.accent_solid).into()),
             border: Border { radius: 3.0.into(), ..Border::default() },
             ..button::Style::default()
         });
 
-    let reset = button(text("Reset to preset").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.text_muted)))
+    let reset = button(text(reset_label).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.text_muted)))
         .padding([5.0, 12.0])
-        .on_press_maybe(active.then_some(Message::ClearCustomAccent))
+        .on_press_maybe(active.then_some(clear_message))
         .style(move |_theme, status| {
             let hovered = status == button::Status::Hovered;
             button::Style {
@@ -319,9 +337,9 @@ fn custom_accent_picker(state: &State, p: Palette) -> Element<'static, Message> 
         row![
             swatch,
             column![
-                rgb_slider_row("R", draft, 0, p),
-                rgb_slider_row("G", draft, 1, p),
-                rgb_slider_row("B", draft, 2, p),
+                rgb_slider_row("R", draft, 0, make_adjust, p),
+                rgb_slider_row("G", draft, 1, make_adjust, p),
+                rgb_slider_row("B", draft, 2, make_adjust, p),
             ]
             .spacing(4.0)
             .width(Length::Fill),
@@ -496,7 +514,45 @@ fn explorer_content(state: &State, p: Palette) -> Element<'static, Message> {
     column![
         column![section_label("THEME", p), theme_mode_row(state, p)].spacing(8.0),
         column![section_label("ACCENT", p), accent_row(state, p)].spacing(8.0),
-        column![section_label("CUSTOM ACCENT", p), custom_accent_picker(state, p)].spacing(8.0),
+        column![
+            section_label("CUSTOM ACCENT", p),
+            custom_color_picker(
+                state.custom_accent_draft,
+                state.custom_accent.is_some(),
+                "Reset to preset",
+                Message::AdjustCustomAccentDraft,
+                Message::SetCustomAccent,
+                Message::ClearCustomAccent,
+                p,
+            ),
+        ]
+        .spacing(8.0),
+        column![
+            section_label("CUSTOM BACKGROUND", p),
+            custom_color_picker(
+                state.custom_background_draft,
+                state.custom_background.is_some(),
+                "Reset to default",
+                Message::AdjustCustomBackgroundDraft,
+                Message::SetCustomBackground,
+                Message::ClearCustomBackground,
+                p,
+            ),
+        ]
+        .spacing(8.0),
+        column![
+            section_label("CUSTOM EDITOR CANVAS", p),
+            custom_color_picker(
+                state.custom_editor_canvas_draft,
+                state.custom_editor_canvas.is_some(),
+                "Reset to default",
+                Message::AdjustCustomEditorCanvasDraft,
+                Message::SetCustomEditorCanvas,
+                Message::ClearCustomEditorCanvas,
+                p,
+            ),
+        ]
+        .spacing(8.0),
         column![
             section_label("ACCESSIBILITY", p),
             toggle_row(

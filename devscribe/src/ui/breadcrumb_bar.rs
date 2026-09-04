@@ -204,7 +204,7 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
         .padding([0.0, 16.0])
         .align_y(Alignment::Center)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
+            background: Some(color(p.editor_canvas).into()),
             ..container::Style::default()
         });
 

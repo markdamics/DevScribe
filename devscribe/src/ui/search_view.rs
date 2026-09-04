@@ -32,7 +32,7 @@ fn query_box(p: Palette, query: &str) -> Element<'static, Message> {
         .on_input(Message::SearchQueryChanged)
         .on_submit(Message::SearchSubmit)
         .style(move |_theme, status| text_input::Style {
-            background: color(p.bg_canvas).into(),
+            background: color(p.editor_canvas).into(),
             // Visible keyboard-focus indicator (accessibility pass, item 12).
             border: if matches!(status, text_input::Status::Focused { .. }) {
                 Border { color: color(p.border_focus), width: 1.5, radius: 3.0.into() }
@@ -234,15 +234,15 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     // matches" for a query that was never actually searched — both
     // actively misleading, not just stale.
     let body: Element<'static, Message> = if state.search_query.is_empty() {
-        widgets::placeholder("Type to search project files", p)
+        widgets::placeholder("Type to search project files", p.editor_canvas, p)
     } else if state.search_in_progress {
-        widgets::placeholder(format!("Searching for \u{201c}{}\u{201d}\u{2026}", state.search_query), p)
+        widgets::placeholder(format!("Searching for \u{201c}{}\u{201d}\u{2026}", state.search_query), p.editor_canvas, p)
     } else if state.search_query != state.search_last_query {
         // Typed, but the debounce window hasn't fired yet — Enter jumps
         // straight there instead of waiting it out.
-        widgets::placeholder(format!("Press Enter to search for \u{201c}{}\u{201d} now", state.search_query), p)
+        widgets::placeholder(format!("Press Enter to search for \u{201c}{}\u{201d} now", state.search_query), p.editor_canvas, p)
     } else if state.search_results.is_empty() {
-        widgets::placeholder(format!("No matches for \u{201c}{}\u{201d}", state.search_query), p)
+        widgets::placeholder(format!("No matches for \u{201c}{}\u{201d}", state.search_query), p.editor_canvas, p)
     } else {
         let mut sections: Vec<Element<'static, Message>> = vec![stats_row(state, p)];
         for (path, results) in group_by_file(&state.search_results) {
@@ -265,7 +265,7 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
+            background: Some(color(p.editor_canvas).into()),
             ..container::Style::default()
         })
         .into()

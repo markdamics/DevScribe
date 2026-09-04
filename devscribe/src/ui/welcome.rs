@@ -162,7 +162,7 @@ fn recent_list(state: &State, p: Palette) -> Element<'static, Message> {
     });
 
     let body: Element<'static, Message> = if state.welcome_rows.is_empty() {
-        widgets::placeholder("No recent projects \u{2014} open a folder to get started", p)
+        widgets::placeholder("No recent projects \u{2014} open a folder to get started", p.bg_base, p)
     } else {
         column(state.welcome_rows.iter().map(|row_data| recent_row(row_data, p)).collect::<Vec<_>>()).into()
     };

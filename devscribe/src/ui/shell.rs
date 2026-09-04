@@ -144,7 +144,7 @@ fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Ele
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
+            background: Some(color(p.editor_canvas).into()),
             ..container::Style::default()
         });
 
@@ -218,7 +218,7 @@ fn no_buffer_state(p: Palette) -> Element<'static, Message> {
         .height(Length::Fill)
         .center(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
+            background: Some(color(p.editor_canvas).into()),
             ..container::Style::default()
         })
         .into()
@@ -231,7 +231,7 @@ fn primary_content(state: &State, p: Palette) -> Element<'_, Message> {
     match key {
         TabKey::File(path) => {
             let Some(editor) = state::find_editor(state, path) else {
-                return widgets::placeholder("No file open \u{2014} pick one from the sidebar", p);
+                return widgets::placeholder("No file open \u{2014} pick one from the sidebar", p.editor_canvas, p);
             };
             if editor.json.is_some() && !editor.json_text_mode {
                 json_view::view(editor, p)

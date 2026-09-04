@@ -310,7 +310,7 @@ pub fn dock_panel(state: &State, p: Palette) -> Element<'static, Message> {
 
     let root = state.root.clone();
     let list: Element<'static, Message> = if diagnostics.is_empty() {
-        widgets::placeholder("No problems in any open file", p)
+        widgets::placeholder("No problems in any open file", p.bg_base, p)
     } else {
         let rows: Vec<Element<'static, Message>> =
             diagnostics.iter().map(|(path, d)| diagnostic_row(path, &root, d, p)).collect();

@@ -76,7 +76,7 @@ fn style(p: Palette) -> markdown::Style {
 /// builds is already an owned `String` underneath.
 pub fn view(editor: &EditorState, p: Palette) -> Element<'_, Message> {
     let Some(content) = editor.markdown.as_ref() else {
-        return widgets::placeholder(format!("{} isn't a Markdown file", editor.path.display()), p);
+        return widgets::placeholder(format!("{} isn't a Markdown file", editor.path.display()), p.editor_canvas, p);
     };
 
     let badge = row![
@@ -102,7 +102,7 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
+            background: Some(color(p.editor_canvas).into()),
             ..container::Style::default()
         })
         .into()

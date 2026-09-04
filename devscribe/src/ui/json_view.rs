@@ -209,6 +209,7 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
     match &editor.json {
         None => widgets::placeholder(
             format!("{} isn't a .json file", editor.path.display()),
+            p.editor_canvas,
             p,
         ),
         Some(Err(parse_error)) => container(
@@ -235,7 +236,7 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
+            background: Some(color(p.editor_canvas).into()),
             ..container::Style::default()
         })
         .into(),
@@ -264,7 +265,7 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |_theme| container::Style {
-                    background: Some(color(p.bg_canvas).into()),
+                    background: Some(color(p.editor_canvas).into()),
                     ..container::Style::default()
                 })
                 .into()

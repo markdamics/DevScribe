@@ -189,6 +189,16 @@ fn ramp_from_rgb(rgb: (u8, u8, u8)) -> Ramp {
 pub struct Palette {
     pub bg_canvas: Rgba,
     pub bg_base: Rgba,
+    /// The primary content pane's own background — the code editor, and
+    /// every view that takes its place there (JSON/Markdown/diff/search
+    /// views, tab strip's active-tab fill, the breadcrumb bar). Distinct
+    /// from `bg_canvas` (the app's general chrome background — title bar,
+    /// welcome screen, backdrop scrims) purely so the custom "Editor
+    /// Canvas" color picker (roadmap item 11) can override just this pane
+    /// without recoloring the rest of the app's background too. Equal to
+    /// `bg_canvas` in every built-in preset — the two only diverge once a
+    /// custom override picks one but not the other.
+    pub editor_canvas: Rgba,
 
     pub surface_card: Rgba,
     pub surface_raised: Rgba,
@@ -243,17 +253,37 @@ pub const fn palette(mode: ThemeMode, accent: Accent) -> Palette {
     palette_from_ramp(mode, ramp(accent))
 }
 
-/// `palette`, but for a custom accent color (roadmap item 11) instead of a
-/// built-in `Accent` preset — `custom` overrides `accent` entirely when
-/// `Some`, same "the override wins outright, not blended with the preset"
-/// relationship `EditorState::set_language`'s override has with a file's
-/// real extension.
-pub fn palette_custom(mode: ThemeMode, accent: Accent, custom: Option<(u8, u8, u8)>) -> Palette {
-    let r = match custom {
+/// `palette`, but for custom color overrides (roadmap item 11) instead of
+/// built-in presets — `custom_accent` overrides `accent`'s ramp,
+/// `custom_background` overwrites the resolved `bg_canvas` (the app's
+/// general chrome background) outright, and `custom_editor_canvas`
+/// overwrites `editor_canvas` (the content pane's own background) outright
+/// — each independently when `Some`, and deliberately two *different*
+/// `Palette` fields so setting one can never bleed into the other (the bug
+/// this split fixes: `editor_canvas` used to just be `bg_canvas` reused,
+/// so overriding "the editor canvas" silently recolored the title bar,
+/// welcome screen, and every backdrop too). Same "the override wins
+/// outright, not blended with the preset" relationship
+/// `EditorState::set_language`'s override has with a file's real extension.
+pub fn palette_custom(
+    mode: ThemeMode,
+    accent: Accent,
+    custom_accent: Option<(u8, u8, u8)>,
+    custom_background: Option<(u8, u8, u8)>,
+    custom_editor_canvas: Option<(u8, u8, u8)>,
+) -> Palette {
+    let r = match custom_accent {
         Some(rgb) => ramp_from_rgb(rgb),
         None => ramp(accent),
     };
-    palette_from_ramp(mode, r)
+    let mut p = palette_from_ramp(mode, r);
+    if let Some(rgb) = custom_background {
+        p.bg_canvas = Rgba::from_rgb8(rgb.0, rgb.1, rgb.2);
+    }
+    if let Some(rgb) = custom_editor_canvas {
+        p.editor_canvas = Rgba::from_rgb8(rgb.0, rgb.1, rgb.2);
+    }
+    p
 }
 
 /// Boosts `p`'s text/border contrast (roadmap item 11's "High Contrast"
@@ -280,6 +310,7 @@ const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
         ThemeMode::Dark => Palette {
             bg_canvas: Rgba::hex(0x04060A),
             bg_base: Rgba::hex(0x070A0F),
+            editor_canvas: Rgba::hex(0x04060A),
 
             surface_card: Rgba::hex(0x0B1017),
             surface_raised: Rgba::hex(0x111823),
@@ -326,6 +357,7 @@ const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
         ThemeMode::Light => Palette {
             bg_canvas: Rgba::hex(0xE9EDF3),
             bg_base: Rgba::hex(0xF5F7FA),
+            editor_canvas: Rgba::hex(0xE9EDF3),
 
             surface_card: Rgba::hex(0xFFFFFF),
             surface_raised: Rgba::hex(0xFFFFFF),

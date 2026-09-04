@@ -593,15 +593,15 @@ fn toolbar(path: &Path, selected_count: usize, pending: bool, ignore_whitespace:
 /// alongside one (see `state::open_or_focus_diff`).
 pub fn view(state: &State, path: &Path, p: Palette) -> Element<'static, Message> {
     let Some(editor) = state::find_editor(state, path) else {
-        return widgets::placeholder("No file open \u{2014} pick one from the sidebar", p);
+        return widgets::placeholder("No file open \u{2014} pick one from the sidebar", p.editor_canvas, p);
     };
 
     match &editor.diff {
-        DiffStatus::NoRepo => widgets::placeholder("Not inside a git repository", p),
+        DiffStatus::NoRepo => widgets::placeholder("Not inside a git repository", p.editor_canvas, p),
         DiffStatus::Untracked => {
-            widgets::placeholder("New file \u{2014} no HEAD version to diff against", p)
+            widgets::placeholder("New file \u{2014} no HEAD version to diff against", p.editor_canvas, p)
         }
-        DiffStatus::UpToDate => widgets::placeholder("No changes since HEAD", p),
+        DiffStatus::UpToDate => widgets::placeholder("No changes since HEAD", p.editor_canvas, p),
         DiffStatus::Changed(lines) => {
             let plan = plan_rows(lines, &editor.hunks, &editor.diff_selected_hunks);
             let rows = match state.diff_view_mode {
@@ -621,7 +621,7 @@ pub fn view(state: &State, path: &Path, p: Palette) -> Element<'static, Message>
             .width(Length::Fill)
             .height(Length::Fill)
             .style(move |_theme| container::Style {
-                background: Some(color(p.bg_canvas).into()),
+                background: Some(color(p.editor_canvas).into()),
                 ..container::Style::default()
             })
             .into()
