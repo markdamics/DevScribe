@@ -50,6 +50,18 @@ pub enum TabKey {
     Chat,
 }
 
+/// Which editor pane a mouse/keyboard-originated `Message` came from — the
+/// primary pane (`state.active_tab`, unchanged single-pane behavior) or the
+/// secondary split pane (`state.split_tab`). Every `EditorCanvas` instance
+/// is tagged with one at construction (`shell.rs`'s `code_area`) and stamps
+/// it onto the messages it publishes, so `update()` mutates the buffer the
+/// keystroke/click actually happened in rather than always the primary one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Primary,
+    Split,
+}
+
 /// One entry in `State::open_tabs`. Search isn't one of these — it's a
 /// fixed, always-visible icon in the tab bar rather than something that
 /// gets opened/closed; see `TabKey::Search` and `tab_bar.rs`.
@@ -166,12 +178,40 @@ pub enum PaletteAction {
     /// The palette's `:N` syntax — see `filtered_palette_entries`. `N` is
     /// 1-based, matching the gutter's own line numbers.
     GoToLine(usize),
+    /// Opens (or closes) the secondary split pane — see `State::split_tab`.
+    ToggleSplitView,
+    /// Shows `path` in the split pane, opening it first if it isn't already
+    /// an open tab. A no-op if `path` is already the primary pane's file —
+    /// see `open_or_focus_file_in_split`.
+    OpenFileInSplit(PathBuf),
+    /// The palette's `#query` syntax (workspace symbol search) — jumps to
+    /// one `SymbolEntry` result, same "open (or focus), place the cursor,
+    /// scroll it into view" shape as `Message::JumpToLocation`. Kept as a
+    /// palette action rather than reusing that message directly since the
+    /// palette's own entries are all `PaletteAction`, not `Message`.
+    JumpToSymbolLocation { path: PathBuf, line: usize, col: usize },
 }
 
 #[derive(Debug, Clone)]
 pub struct PaletteEntry {
     pub label: String,
     pub action: PaletteAction,
+}
+
+/// The keybinding shown next to a palette entry, if the action has one
+/// wired in `global_keys` — mirrors `settings_panel.rs`'s `shortcuts_content`
+/// reference table. `None` for actions only reachable through the palette
+/// itself (theme/accent pickers, file opens, ...).
+pub fn palette_shortcut(action: &PaletteAction) -> Option<&'static str> {
+    match action {
+        PaletteAction::CloseActiveTab => Some("\u{2318}W"),
+        PaletteAction::ChatToggle => Some("\u{2318}I"),
+        PaletteAction::ViewWorkingTreeDiff => Some("\u{21e7}\u{2318}D"),
+        PaletteAction::SaveFile => Some("\u{2318}S"),
+        PaletteAction::FocusSearchTab => Some("\u{21e7}\u{2318}F"),
+        PaletteAction::ToggleSplitView => Some("\u{2318}\\"),
+        _ => None,
+    }
 }
 
 /// A theme change being previewed, not yet committed — see
@@ -214,6 +254,16 @@ pub struct State {
     pub open_tabs: Vec<OpenTab>,
     /// `None` only when `open_tabs` is empty.
     pub active_tab: Option<TabKey>,
+    /// The secondary split pane's file tab (roadmap "Split Editor Panes"),
+    /// rendered side-by-side with the primary pane — see `Pane`. Always
+    /// `Some(TabKey::File(_))` or `None`; `Diff`/`Search`/`Chat` tabs never
+    /// go here, and it's kept from ever equalling `active_tab` (both panes
+    /// showing the same file would mean fighting over one shared
+    /// `EditorState`'s scroll/cursor) by `update()`'s post-message
+    /// normalization, which also clears it if the file it points at gets
+    /// closed. Not restored across sessions — only `open_tabs`/`active_tab`
+    /// are.
+    pub split_tab: Option<TabKey>,
     /// `true` only while `restore_session` is re-opening tabs from a
     /// persisted session — suppresses `persist_session`'s writes for that
     /// duration so restoring a session doesn't immediately re-save a
@@ -319,6 +369,18 @@ pub struct State {
     /// isn't the width). Updated from `iced::window::Event::Opened`/
     /// `Resized`; starts at `main.rs`'s initial `window_size` request.
     pub window_width: f32,
+    /// Current window height in logical pixels — tracked so the right-click
+    /// context menus (`ui::context_menu`) can clamp themselves to the
+    /// bottom edge instead of opening partly (or entirely) off-screen.
+    /// Updated alongside `window_width`; starts at `main.rs`'s initial
+    /// `window_size` request.
+    pub window_height: f32,
+    /// The most recent cursor position in window space, kept up to date by
+    /// a window-wide `mouse_area` in `shell.rs`. `mouse_area::on_right_press`
+    /// itself carries no position, so this is how the sidebar tree's
+    /// context menu (`ctx_menu`) learns where the right-click that opened
+    /// it actually landed, in order to open there instead of a fixed spot.
+    pub mouse_pos: iced::Point,
     pub projects_open: bool,
     pub overflow_open: bool,
     /// `true` collapses the sidebar to a narrow icon rail (project glyph +
@@ -481,10 +543,36 @@ pub struct State {
     pub palette_open: bool,
     pub palette_query: String,
     pub palette_selected: usize,
+    /// The `#query` text a `LspCommand::WorkspaceSymbol` request was last
+    /// sent for — compared against `palette_query`'s own `#`-stripped
+    /// suffix both to dedupe (typing the same text back doesn't re-request)
+    /// and, in `LspEvent::WorkspaceSymbols`' handler, to drop a stale
+    /// response for a query the user has since changed. Same "last query
+    /// actually reflected" role `search_last_query` plays for the sidebar's
+    /// own search-as-you-type.
+    pub workspace_symbol_query: String,
+    /// The results `filtered_palette_entries` turns into `#query` mode's
+    /// palette rows — see `workspace_symbol_query`.
+    pub workspace_symbol_results: Vec<lsp::SymbolEntry>,
     pub settings_open: bool,
     pub settings_category: SettingsCategory,
     pub density: Density,
     pub problem_lens_enabled: bool,
+    /// Whitespace-only line changes count as `Equal` (git `-w` semantics)
+    /// rather than `Modified`/`Added`/`Removed` when set — see
+    /// `recompute_diff_for`. A global diff-computation setting, not just a
+    /// diff-view rendering toggle: turning it on also clears the editor
+    /// gutter's whitespace-only revert markers for every open file, not
+    /// just whichever one's `Diff` tab happens to be open. Not persisted —
+    /// always starts back at `false` (exact whitespace), same as
+    /// `word_wrap`'s sibling toggles below.
+    pub diff_ignore_whitespace: bool,
+    /// Unified (default) or side-by-side — `diff_view.rs`'s own toolbar
+    /// toggle. Global rather than per-tab: flipping it while looking at one
+    /// file's diff should show every other diff the same way without
+    /// having to flip it again. Not persisted, same as
+    /// `diff_ignore_whitespace`.
+    pub diff_view_mode: DiffViewMode,
     /// Gates the file tree's per-file `ChangeKind` badges (`sidebar.rs`).
     /// Doesn't affect the separate "CHANGES" panel, which has its own
     /// collapse toggle.
@@ -525,6 +613,19 @@ pub struct State {
     pub draft: Option<Draft>,
     /// Non-`None` while the tree's right-click context menu is open.
     pub ctx_menu: Option<ContextMenu>,
+    /// Non-`None` while the editor canvas's right-click code-actions menu
+    /// (Rename Symbol, Go to Definition, Find All References, Search
+    /// Symbol in Project) is open — distinct from `ctx_menu`, the sidebar
+    /// tree's own. Primary-pane-only, like the LSP-assisted interactions it
+    /// exposes (see `Pane`'s own doc comment) — `editor_canvas.rs` only
+    /// ever opens this from a right-click on that pane.
+    pub editor_ctx_menu: Option<EditorContextMenu>,
+    /// Non-`None` while the "Rename Symbol" prompt is open — a small
+    /// floating `text_input`, not a full modal, seeded with
+    /// `EditorState::word_at` so renaming a symbol doesn't require
+    /// retyping its whole name for the common case of only changing part
+    /// of it.
+    pub rename_prompt: Option<RenamePrompt>,
     /// The single current "flash" confirmation pill, if any. See `Flash`.
     pub flash: Option<Flash>,
     /// LIFO stack of tabs closed via `Message::CloseTab`/`CloseActiveTab`/
@@ -615,6 +716,7 @@ impl Default for State {
             theme_preview: None,
             open_tabs: Vec::new(),
             active_tab: None,
+            split_tab: None,
             restoring_session: false,
             chat_mode: settings.chat_mode,
             chat_tab_open: false,
@@ -639,6 +741,8 @@ impl Default for State {
             chat_provider: ChatProvider::Claude,
             chat: ChatThread::default(),
             window_width: 1280.0,
+            window_height: 800.0,
+            mouse_pos: iced::Point::ORIGIN,
             projects_open: false,
             overflow_open: false,
             sidebar_collapsed: false,
@@ -686,6 +790,8 @@ impl Default for State {
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            workspace_symbol_query: String::new(),
+            workspace_symbol_results: Vec::new(),
             settings_open: false,
             settings_category: SettingsCategory::default(),
             git_status_in_tree: settings.git_status_in_tree,
@@ -693,6 +799,8 @@ impl Default for State {
             save_on_focus_loss: settings.save_on_focus_loss,
             density: settings.density,
             problem_lens_enabled: settings.problem_lens_enabled,
+            diff_ignore_whitespace: false,
+            diff_view_mode: DiffViewMode::default(),
             editor_font_size: settings.editor_font_size,
             ui_font_scale: settings.ui_font_scale,
             tab_size: settings.tab_size,
@@ -702,6 +810,8 @@ impl Default for State {
             next_toast_id: 0,
             draft: None,
             ctx_menu: None,
+            editor_ctx_menu: None,
+            rename_prompt: None,
             flash: None,
             closed_tabs: Vec::new(),
             next_untitled_id: 0,
@@ -934,48 +1044,51 @@ pub enum Message {
     /// shares a handler with.
     ViewWorkingTreeDiff,
     SelectFile(PathBuf),
-    EditorInsertText(String),
+    /// Every field below tagged `pane: Pane` is published by an
+    /// `EditorCanvas` instance (`shell.rs`'s `code_area`, one per pane) —
+    /// see `Pane`'s own doc comment for why the tag exists at all.
+    EditorInsertText { text: String, pane: Pane },
     /// A single physical keystroke's character, routed separately from
     /// `EditorInsertText` so auto-pairing (`EditorState::type_char`) only
     /// ever sees live typing — paste (`EditorPasteWithText`) and generated
     /// text (Enter's `"\n"`, Tab-as-indent's four spaces) go through
     /// `EditorInsertText` instead and are never candidates for pairing.
-    EditorTypeChar(char),
-    EditorBackspace,
-    EditorDelete,
+    EditorTypeChar { ch: char, pane: Pane },
+    EditorBackspace { pane: Pane },
+    EditorDelete { pane: Pane },
     /// `Tab` — block-indents a multi-line selection, else inserts four
     /// spaces at the cursor. See `EditorState::indent`.
-    EditorIndent,
+    EditorIndent { pane: Pane },
     /// `Shift+Tab` — see `EditorState::dedent`.
-    EditorDedent,
+    EditorDedent { pane: Pane },
     /// `Ctrl+/` — see `EditorState::toggle_comment`.
-    EditorToggleComment,
-    EditorMove { dir: Direction, extend: bool },
+    EditorToggleComment { pane: Pane },
+    EditorMove { dir: Direction, extend: bool, pane: Pane },
     /// A left-button press or drag-move over the canvas — also the plain
     /// (non-double/triple) click path. `extend: true` both for shift-click
     /// and for every drag-move after the initial press, so a mouse drag
     /// just keeps calling `EditorState::click`, which is exactly
     /// `extend`'s existing shift-click behavior (see `EditorCanvas::update`).
-    EditorClick { line: usize, col: usize, extend: bool },
+    EditorClick { line: usize, col: usize, extend: bool, pane: Pane },
     /// Double-click — selects the word (or punctuation/whitespace run) under
     /// the click.
-    EditorSelectWord { line: usize, col: usize },
+    EditorSelectWord { line: usize, col: usize, pane: Pane },
     /// Triple-click — selects the whole line.
-    EditorSelectLine { line: usize },
+    EditorSelectLine { line: usize, pane: Pane },
     /// `Ctrl+A`.
-    EditorSelectAll,
+    EditorSelectAll { pane: Pane },
     /// `Ctrl+Z`.
-    EditorUndo,
+    EditorUndo { pane: Pane },
     /// `Ctrl+Shift+Z` / `Ctrl+Y`.
-    EditorRedo,
+    EditorRedo { pane: Pane },
     /// `Ctrl+C`.
-    EditorCopy,
+    EditorCopy { pane: Pane },
     /// `Ctrl+X`.
-    EditorCut,
+    EditorCut { pane: Pane },
     /// `Ctrl+V` — kicks off an async clipboard read; the actual insert
     /// happens in `EditorPasteWithText` once it resolves.
-    EditorPaste,
-    EditorPasteWithText(Option<String>),
+    EditorPaste { pane: Pane },
+    EditorPasteWithText { text: Option<String>, pane: Pane },
     /// The editor's `scrollable` reported a new offset (and viewport size),
     /// in both axes now that the canvas scrolls horizontally too — stored so
     /// `EditorCanvas::draw` can skip lines outside the visible range, and so
@@ -985,6 +1098,7 @@ pub enum Message {
         offset: f32,
         viewport_height: f32,
         offset_x: f32,
+        pane: Pane,
         viewport_width: f32,
     },
     CaretTick,
@@ -1068,9 +1182,14 @@ pub enum Message {
     /// happened, so it's a cheap, natural point to catch up. A no-op before
     /// a project is open, same guard the watcher subscription itself uses.
     WindowFocused,
-    /// The window was opened or resized — tracked only for the chat
-    /// panel's right-edge resize math; see `State::window_width`.
-    WindowResized(f32),
+    /// The window was opened or resized — tracked for the chat panel's
+    /// right-edge resize math and for clamping context menus on-screen;
+    /// see `State::window_width`/`window_height`.
+    WindowResized(f32, f32),
+    /// The cursor moved anywhere in the window — tracked only so a
+    /// right-click's position is known when the message it fires
+    /// (`OpenTreeContext`) can't carry one itself; see `State::mouse_pos`.
+    MouseMoved(iced::Point),
     /// Global `⌘/` — opens Settings straight to the Shortcuts category, in
     /// one step rather than `ToggleSettings` + `SetSettingsCategory`.
     OpenShortcutsHelp,
@@ -1114,6 +1233,13 @@ pub enum Message {
     CloseTabSwitcher,
     DismissToast(u64),
     PruneToasts,
+    /// `⌘\` — see `toggle_split_view`. The palette's own "Split
+    /// Editor"/"Close Split Editor" entry shares this handler via
+    /// `PaletteAction::ToggleSplitView`, same pattern as `ViewWorkingTreeDiff`.
+    /// Choosing *which* file fills the split pane is palette-only (there's
+    /// no keybinding for it), so that's `PaletteAction::OpenFileInSplit`
+    /// alone — no `Message` counterpart needed.
+    ToggleSplitView,
     EditorSave,
     ToggleFind,
     CloseFind,
@@ -1193,6 +1319,14 @@ pub enum Message {
     /// Reverts every hunk checked in `path`'s diff view back to `HEAD`, as
     /// one undo step (see `EditorState::revert_lines`).
     ConfirmRevertSelectedHunks(PathBuf),
+    /// The diff view toolbar's "Ignore Whitespace" toggle — flips
+    /// `State::diff_ignore_whitespace` and recomputes every open file's
+    /// diff/gutter marks under the new mode.
+    ToggleDiffIgnoreWhitespace,
+    /// The diff view toolbar's "Unified"/"Side by side" switch — flips
+    /// `State::diff_view_mode`. Purely a rendering choice, so unlike
+    /// `ToggleDiffIgnoreWhitespace` this doesn't touch any diff data.
+    ToggleDiffViewMode,
     CloseOtherTabs,
     RevealActiveInTree,
     ReopenClosedTab,
@@ -1250,10 +1384,56 @@ pub enum Message {
     ToggleReferencesPanel,
     /// A row in the Locations dock panel was clicked.
     JumpToLocation(PathBuf, CursorPos),
+    /// A right-click on the primary pane's editor canvas — opens the
+    /// code-actions context menu at `(line, col)`/`(x, y)`. See
+    /// `EditorContextMenu`.
+    OpenEditorContext { line: usize, col: usize, x: f32, y: f32 },
+    CloseEditorContext,
+    /// The editor context menu's "Rename Symbol" — closes the menu and
+    /// opens `State::rename_prompt`, seeded with `EditorState::word_at`
+    /// wherever the menu was opened.
+    BeginRenameSymbol,
+    RenameQueryChanged(String),
+    CancelRenameSymbol,
+    /// Enter (or the prompt's own button) on a non-empty, actually-changed
+    /// query — fires `LspCommand::Rename`; see `LspEvent::RenameResult`'s
+    /// handler for how the result gets applied. A no-op (just closes the
+    /// prompt) for an empty or unchanged name, same "nothing to send"
+    /// guard `ConfirmRevertSelectedHunks`'s siblings use elsewhere.
+    ConfirmRenameSymbol,
+    /// The editor context menu's "Search Symbol in Project" — closes the
+    /// menu and opens the command palette pre-filled with `#`, the workspace-
+    /// symbol-search prefix `filtered_palette_entries` recognizes the same
+    /// way it already does `:` for Go to Line.
+    SearchSymbolInProject,
     Noop,
 }
 
+/// Runs `update_impl`, then re-establishes the split pane's invariants —
+/// centralized here rather than at each of `active_tab`'s many assignment
+/// sites (tab-open, tab-close, sidebar rename, chat-tab-focus, ...), since
+/// every one of them can indirectly make `split_tab` stale. Two rules:
+/// `split_tab` never equals `active_tab` (both panes would then share one
+/// `EditorState`'s scroll/cursor), and it never points at a tab that no
+/// longer exists (closed out from under the split pane). If `active_tab`
+/// itself was closed out while a split pane was still showing something,
+/// that something is promoted to primary rather than leaving an empty
+/// primary pane next to a lone split one.
 pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
+    let task = update_impl(state, message);
+    if state.active_tab.is_none() && state.split_tab.is_some() {
+        state.active_tab = state.split_tab.take();
+    } else if state.split_tab.is_some() && state.split_tab == state.active_tab {
+        state.split_tab = None;
+    } else if let Some(TabKey::File(path)) = state.split_tab.clone()
+        && find_editor(state, &path).is_none()
+    {
+        state.split_tab = None;
+    }
+    task
+}
+
+fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
     match message {
         Message::SetThemeMode(mode) => set_theme_mode(state, mode),
         Message::SetAccent(accent) => set_accent(state, accent),
@@ -1708,13 +1888,16 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::OpenMarkdownLink(url) => open_externally(&url),
-        Message::EditorInsertText(text) => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorInsertText { text, pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 // Intercept Enter when the completion popup is open — select
                 // the highlighted item instead of inserting a literal
                 // newline. Tab has the equivalent intercept in
                 // `Message::EditorIndent`, since it no longer routes through
-                // here (see `EditorState::indent`).
+                // here (see `EditorState::indent`). Completions only ever
+                // populate for `Pane::Primary` (see `maybe_trigger_completion`
+                // below), so this is naturally always `false` for the split
+                // pane.
                 let completions_open = find_editor(state, &path)
                     .is_some_and(|e| e.completions.is_some());
                 if completions_open && text == "\n" {
@@ -1738,13 +1921,17 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.refilter_completions();
                 }
                 mark_edited(state, &path);
-                maybe_trigger_completion(state, &path, &text);
-                maybe_trigger_signature_help(state, &path, &text);
-                return scroll_cursor_into_view(state);
+                // LSP-assisted completion/signature-help stays a primary-pane
+                // feature for now — see `Pane`'s own doc comment.
+                if pane == Pane::Primary {
+                    maybe_trigger_completion(state, &path, &text);
+                    maybe_trigger_signature_help(state, &path, &text);
+                }
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorTypeChar(ch) => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorTypeChar { ch, pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 if let Some(editor) = find_editor_mut(state, &path) {
                     // Same stale-popup-closing rule as `EditorInsertText`.
                     let text = ch.to_string();
@@ -1756,13 +1943,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.refilter_completions();
                 }
                 mark_edited(state, &path);
-                maybe_trigger_completion(state, &path, &ch.to_string());
-                maybe_trigger_signature_help(state, &path, &ch.to_string());
-                return scroll_cursor_into_view(state);
+                if pane == Pane::Primary {
+                    maybe_trigger_completion(state, &path, &ch.to_string());
+                    maybe_trigger_signature_help(state, &path, &ch.to_string());
+                }
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorBackspace => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorBackspace { pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 // A Backspace with nothing to delete changed nothing, so it
                 // must not arm the settle timer (and the reparse, git diff and
                 // LSP `didChange` behind it) either.
@@ -1778,11 +1967,11 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     editor.refilter_completions();
                 }
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorDelete => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorDelete { pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 // Forward-delete while a completion is open is an unusual
                 // enough combination (it deletes text *ahead* of the typed
                 // prefix, not part of it) that closing outright is simpler
@@ -1796,11 +1985,11 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     return iced::Task::none();
                 }
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorIndent => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorIndent { pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 // A ghost-text suggestion, if showing, wins over both the LSP
                 // popup and a real indent — same precedence VS Code gives its
                 // own inline suggestions over other Tab behavior. The two
@@ -1821,37 +2010,37 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 // Tab with a snippet expansion in progress jumps to the next
                 // placeholder instead of indenting — see `advance_snippet`.
                 if find_editor_mut(state, &path).is_some_and(|e| e.advance_snippet()) {
-                    return scroll_cursor_into_view(state);
+                    return scroll_cursor_into_view(state, pane);
                 }
                 let tab_size = state.tab_size;
                 if let Some(editor) = find_editor_mut(state, &path) {
                     editor.indent(tab_size);
                 }
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorDedent => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorDedent { pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 let tab_size = state.tab_size;
                 if !find_editor_mut(state, &path).is_some_and(|e| e.dedent(tab_size)) {
                     return iced::Task::none();
                 }
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorToggleComment => {
-            if let Some(path) = active_file_path(state) {
+        Message::EditorToggleComment { pane } => {
+            if let Some(path) = pane_file_path(state, pane) {
                 if !find_editor_mut(state, &path).is_some_and(|e| e.toggle_comment()) {
                     return iced::Task::none();
                 }
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorMove { dir, extend } => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorMove { dir, extend, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 // Up/Down navigate the completion popup when it's open and
@@ -1881,10 +2070,10 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.close_snippet();
                 editor.move_cursor(dir, extend);
             }
-            return scroll_cursor_into_view(state);
+            return scroll_cursor_into_view(state, pane);
         }
-        Message::EditorClick { line, col, extend } => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorClick { line, col, extend, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.close_completions();
@@ -1893,8 +2082,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.click(line, col, extend);
             }
         }
-        Message::EditorSelectWord { line, col } => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorSelectWord { line, col, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.close_completions();
@@ -1902,8 +2091,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.select_word_at(line, col);
             }
         }
-        Message::EditorSelectLine { line } => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorSelectLine { line, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.close_completions();
@@ -1911,8 +2100,8 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.select_line_at(line);
             }
         }
-        Message::EditorSelectAll => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorSelectAll { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.close_completions();
@@ -1920,28 +2109,28 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.select_all();
             }
         }
-        Message::EditorCopy => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorCopy { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor(state, &path)
                 && let Some(text) = editor.selected_text()
             {
                 return iced::clipboard::write(text);
             }
         }
-        Message::EditorCut => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorCut { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
                 && let Some(text) = editor.cut_selection()
             {
                 mark_edited(state, &path);
                 return iced::Task::batch([
                     iced::clipboard::write(text),
-                    scroll_cursor_into_view(state),
+                    scroll_cursor_into_view(state, pane),
                 ]);
             }
         }
-        Message::EditorUndo => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorUndo { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
                 && editor.undo()
             {
@@ -1950,35 +2139,37 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 mark_edited(state, &path);
                 // Undo can land the caret anywhere — including a screenful
                 // away from wherever the view currently sits.
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorRedo => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorRedo { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
                 && editor.redo()
             {
                 editor.close_completions();
                 editor.close_snippet();
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorPaste => return iced::clipboard::read().map(Message::EditorPasteWithText),
-        Message::EditorPasteWithText(text) => {
+        Message::EditorPaste { pane } => {
+            return iced::clipboard::read().map(move |text| Message::EditorPasteWithText { text, pane });
+        }
+        Message::EditorPasteWithText { text, pane } => {
             if let Some(text) = text
-                && let Some(path) = active_file_path(state)
+                && let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.close_completions();
                 editor.close_snippet();
                 editor.insert_text(&text);
                 mark_edited(state, &path);
-                return scroll_cursor_into_view(state);
+                return scroll_cursor_into_view(state, pane);
             }
         }
-        Message::EditorScrolled { offset, viewport_height, offset_x, viewport_width } => {
-            if let Some(path) = active_file_path(state)
+        Message::EditorScrolled { offset, viewport_height, offset_x, viewport_width, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.scroll_offset = offset;
@@ -2077,6 +2268,15 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             LspEvent::References { locations, .. } => {
                 return apply_locations(state, locations, "References");
             }
+            LspEvent::RenameResult { edits, .. } => apply_rename(state, edits),
+            LspEvent::WorkspaceSymbols { query, symbols } => {
+                // Drops a response for a query the user has since typed past
+                // — same staleness guard `SearchCompleted` uses for the
+                // sidebar's own search-as-you-type.
+                if query == state.workspace_symbol_query {
+                    state.workspace_symbol_results = symbols;
+                }
+            }
             LspEvent::NeedsInstall => {
                 // Binary not on PATH and not in the managed dir — kick off
                 // a background install and show progress in the status bar.
@@ -2146,7 +2346,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                     if let Some(sender) = state.copilot_completion_sender.as_mut() {
                         let _ = sender.try_send(CopilotCompletionCommand::Accepted { item: ghost.item });
                     }
-                    return scroll_cursor_into_view(state);
+                    return scroll_cursor_into_view(state, Pane::Primary);
                 }
             }
         }
@@ -2265,6 +2465,21 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::PaletteQueryChanged(query) => {
             state.palette_query = query;
             state.palette_selected = 0;
+            // Workspace symbol search — fired per-keystroke like completion/
+            // signature-help requests already are elsewhere, not debounced;
+            // deduped against `workspace_symbol_query` so retyping the same
+            // text (e.g. typing then backspacing back to it) doesn't
+            // re-request. `filtered_palette_entries` renders whatever's in
+            // `workspace_symbol_results` for as long as it's showing.
+            if let Some(rest) = state.palette_query.strip_prefix('#') {
+                let rest = rest.trim();
+                if !rest.is_empty() && rest != state.workspace_symbol_query && matches!(state.lsp_status, LspStatus::Ready) {
+                    state.workspace_symbol_query = rest.to_string();
+                    if let Some(sender) = state.lsp_sender.as_mut() {
+                        let _ = sender.try_send(LspCommand::WorkspaceSymbol { query: rest.to_string() });
+                    }
+                }
+            }
         }
         Message::PaletteMove(delta) => {
             let len = filtered_palette_entries(state).len();
@@ -2378,7 +2593,11 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 refresh_changed_files(state);
             }
         }
-        Message::WindowResized(width) => state.window_width = width,
+        Message::WindowResized(width, height) => {
+            state.window_width = width;
+            state.window_height = height;
+        }
+        Message::MouseMoved(pos) => state.mouse_pos = pos,
         Message::OpenShortcutsHelp => {
             state.settings_open = true;
             state.settings_category = SettingsCategory::Shortcuts;
@@ -2411,6 +2630,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.flash = None;
             }
         }
+        Message::ToggleSplitView => toggle_split_view(state),
         Message::EditorSave => return save_current_file(state),
         Message::ToggleFind => {
             if let Some(path) = active_file_path(state)
@@ -2544,7 +2764,12 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             push_flash(state, "TREE COLLAPSED");
         }
         Message::OpenTreeContext(target) => {
-            state.ctx_menu = Some(ContextMenu { target, confirm_delete: false });
+            state.ctx_menu = Some(ContextMenu {
+                target,
+                confirm_delete: false,
+                x: state.mouse_pos.x,
+                y: state.mouse_pos.y,
+            });
             state.overflow_open = false;
             state.projects_open = false;
         }
@@ -2618,6 +2843,18 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if reverted {
                 recompute_diff_for(state, &path);
             }
+        }
+        Message::ToggleDiffIgnoreWhitespace => {
+            state.diff_ignore_whitespace = !state.diff_ignore_whitespace;
+            for path in open_file_paths(state) {
+                recompute_diff_for(state, &path);
+            }
+        }
+        Message::ToggleDiffViewMode => {
+            state.diff_view_mode = match state.diff_view_mode {
+                DiffViewMode::Unified => DiffViewMode::SideBySide,
+                DiffViewMode::SideBySide => DiffViewMode::Unified,
+            };
         }
         Message::CloseOtherTabs => {
             state.overflow_open = false;
@@ -2719,6 +2956,10 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.tab_switcher = None;
             } else if state.draft.is_some() {
                 state.draft = None;
+            } else if state.rename_prompt.is_some() {
+                state.rename_prompt = None;
+            } else if state.editor_ctx_menu.is_some() {
+                state.editor_ctx_menu = None;
             } else if state.ctx_menu.is_some() {
                 state.ctx_menu = None;
             } else if state.overflow_open {
@@ -2806,7 +3047,7 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
                         }
                     }
                     mark_edited(state, &path);
-                    return scroll_cursor_into_view(state);
+                    return scroll_cursor_into_view(state, Pane::Primary);
                 }
             }
         }
@@ -2888,7 +3129,55 @@ pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
             if let Some(editor) = find_editor_mut(state, &path) {
                 editor.click(pos.line, pos.col, false);
             }
-            return scroll_cursor_into_view(state);
+            return scroll_cursor_into_view(state, Pane::Primary);
+        }
+        Message::OpenEditorContext { line, col, x, y } => {
+            state.ctx_menu = None;
+            state.editor_ctx_menu = Some(EditorContextMenu { line, col, x, y });
+        }
+        Message::CloseEditorContext => state.editor_ctx_menu = None,
+        Message::BeginRenameSymbol => {
+            let Some(menu) = state.editor_ctx_menu.take() else {
+                return iced::Task::none();
+            };
+            let seed = active_file_path(state)
+                .and_then(|path| find_editor(state, &path)?.word_at(menu.line, menu.col))
+                .unwrap_or_default();
+            state.rename_prompt = Some(RenamePrompt { line: menu.line, col: menu.col, query: seed });
+            return iced::widget::operation::focus(rename_prompt_id());
+        }
+        Message::RenameQueryChanged(text) => {
+            if let Some(prompt) = state.rename_prompt.as_mut() {
+                prompt.query = text;
+            }
+        }
+        Message::CancelRenameSymbol => state.rename_prompt = None,
+        Message::ConfirmRenameSymbol => {
+            let Some(prompt) = state.rename_prompt.take() else {
+                return iced::Task::none();
+            };
+            let new_name = prompt.query.trim().to_string();
+            if new_name.is_empty() {
+                return iced::Task::none();
+            }
+            if let Some(path) = active_file_path(state)
+                && matches!(state.lsp_status, LspStatus::Ready)
+                && let Some(uri) = lsp_uri(&path)
+            {
+                let line_text = find_editor(state, &path).map(|e| e.document.line_text(prompt.line)).unwrap_or_default();
+                let character = char_col_to_utf16_col(&line_text, prompt.col);
+                if let Some(sender) = state.lsp_sender.as_mut() {
+                    let _ = sender.try_send(LspCommand::Rename { uri, line: prompt.line as u32, character, new_name });
+                }
+            }
+        }
+        Message::SearchSymbolInProject => {
+            state.editor_ctx_menu = None;
+            state.palette_open = true;
+            state.palette_query = "#".to_string();
+            state.palette_selected = 0;
+            state.settings_open = false;
+            return iced::widget::operation::focus(palette_query_id());
         }
         Message::Noop => {}
     }
@@ -2946,6 +3235,15 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
         PaletteAction::SaveFile => return save_current_file(state),
         PaletteAction::NewUntitledFile => begin_untitled_buffer(state),
         PaletteAction::GoToLine(line) => return goto_line(state, line),
+        PaletteAction::ToggleSplitView => toggle_split_view(state),
+        PaletteAction::OpenFileInSplit(path) => open_or_focus_file_in_split(state, path),
+        PaletteAction::JumpToSymbolLocation { path, line, col } => {
+            open_or_focus_file(state, path.clone());
+            if let Some(editor) = find_editor_mut(state, &path) {
+                editor.click(line, col, false);
+            }
+            return scroll_cursor_into_view(state, Pane::Primary);
+        }
     }
     iced::Task::none()
 }
@@ -3142,6 +3440,13 @@ pub fn palette_query_id() -> iced::widget::Id {
     iced::widget::Id::new("command-palette-query")
 }
 
+/// A stable id for the "Rename Symbol" prompt's text input, so `update()`
+/// can focus it the moment `rename_prompt` opens — same pattern as
+/// `palette_query_id`/`draft_input_id`.
+pub fn rename_prompt_id() -> iced::widget::Id {
+    iced::widget::Id::new("rename-symbol-prompt")
+}
+
 fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
     let mut entries = Vec::new();
 
@@ -3155,6 +3460,26 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
             label: format!("Open: {label}"),
             action: PaletteAction::OpenFile(path.to_path_buf()),
         });
+    }
+    // "Open in Split" is only meaningful once there's a primary file to
+    // compare it against — see `open_or_focus_file_in_split`'s own doc
+    // comment on why panes never show the same file, hence skipping it
+    // here too.
+    if let Some(primary) = active_file_path(state) {
+        for path in fs_tree::flatten_files(&state.tree) {
+            if path == primary {
+                continue;
+            }
+            let label = path
+                .strip_prefix(&state.root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            entries.push(PaletteEntry {
+                label: format!("Open in Split: {label}"),
+                action: PaletteAction::OpenFileInSplit(path.to_path_buf()),
+            });
+        }
     }
 
     for mode in ThemeMode::ALL {
@@ -3200,6 +3525,10 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
         entries.push(PaletteEntry {
             label: "Close active tab".to_string(),
             action: PaletteAction::CloseActiveTab,
+        });
+        entries.push(PaletteEntry {
+            label: if state.split_tab.is_some() { "Close Split Editor".to_string() } else { "Split Editor".to_string() },
+            action: PaletteAction::ToggleSplitView,
         });
     }
 
@@ -3270,6 +3599,13 @@ pub fn filtered_palette_entries(state: &State) -> Vec<PaletteEntry> {
             }],
             _ => Vec::new(),
         };
+    }
+    // `#query` is workspace symbol search — like `:`'s Go to Line, additive
+    // rather than a text filter over `all_palette_entries`: the LSP server
+    // already did the matching (`workspace_symbol_query`/`workspace_symbol_results`),
+    // this just turns whatever it last replied with into rows.
+    if query.starts_with('#') {
+        return symbol_palette_entries(state, &state.workspace_symbol_results);
     }
     let query = query.to_ascii_lowercase();
     all_palette_entries(state)
@@ -3376,6 +3712,9 @@ fn global_keys(event: keyboard::Event) -> Message {
             if c.eq_ignore_ascii_case("/") {
                 return Message::OpenShortcutsHelp;
             }
+            if c.eq_ignore_ascii_case("\\") {
+                return Message::ToggleSplitView;
+            }
         }
         if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
             return Message::EscapePressed;
@@ -3400,7 +3739,9 @@ fn window_events((_id, event): (iced::window::Id, iced::window::Event)) -> Messa
     match event {
         iced::window::Event::Unfocused => Message::WindowUnfocused,
         iced::window::Event::Focused => Message::WindowFocused,
-        iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size) => Message::WindowResized(size.width),
+        iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size) => {
+            Message::WindowResized(size.width, size.height)
+        }
         _ => Message::Noop,
     }
 }

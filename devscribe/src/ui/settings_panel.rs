@@ -777,6 +777,7 @@ fn shortcuts_content(p: Palette) -> Element<'static, Message> {
                 shortcut_row("Find in project", "\u{21e7}\u{2318}F", p),
                 shortcut_row("Working tree diff", "\u{21e7}\u{2318}D", p),
                 shortcut_row("Go to line", "\u{2318}G", p),
+                shortcut_row("Split editor", "\u{2318}\\", p),
             ]
         ]
         .spacing(8.0),

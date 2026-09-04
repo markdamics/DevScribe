@@ -170,6 +170,19 @@ fn completion_sort_key(item: &CompletionItem) -> (&str, &str) {
     (item.sort_text.as_deref().unwrap_or(item.label.as_str()), item.label.as_str())
 }
 
+/// `State::diff_view_mode` — how `diff_view.rs` lays out a changed file's
+/// lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffViewMode {
+    /// Old and new lines interleaved in one column, git-diff style.
+    #[default]
+    Unified,
+    /// Old on the left, new on the right, aligned row-for-row so a single
+    /// shared `scrollable` keeps both sides in sync automatically — see
+    /// `diff_view::side_by_side_rows`.
+    SideBySide,
+}
+
 /// The diff panel's state for the current file, distinguishing the reasons
 /// a diff can be empty (worth showing differently) from an actual diff.
 #[derive(Debug, Clone, Default)]
@@ -180,6 +193,28 @@ pub enum DiffStatus {
     Untracked,
     UpToDate,
     Changed(Vec<DiffLine>),
+}
+
+/// `State::editor_ctx_menu` — where a right-click landed, both in document
+/// terms (`line`/`col`, what the menu's actions actually act on) and screen
+/// terms (`x`/`y`, where to draw it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditorContextMenu {
+    pub line: usize,
+    pub col: usize,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// `State::rename_prompt` — "Rename Symbol"'s floating input. `line`/`col`
+/// are the position the eventual `LspCommand::Rename` request targets (the
+/// same ones `EditorContextMenu` had when "Rename Symbol" was clicked);
+/// `query` is the text box's live content, seeded from `EditorState::word_at`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenamePrompt {
+    pub line: usize,
+    pub col: usize,
+    pub query: String,
 }
 
 /// One match of an in-file "find" query, as an absolute char range — the
@@ -1000,6 +1035,50 @@ impl EditorState {
         }
     }
 
+    /// Applies a language server's `TextEdit`s (UTF-16 line/character
+    /// ranges) as a single undo step — the "Rename Symbol" refactor's
+    /// per-file half; `state::apply_rename` calls this once per file the
+    /// `WorkspaceEdit` touches. `false` (no-op) for an empty edit list, same
+    /// shape as `revert_lines`.
+    ///
+    /// Every range is converted to a char-offset span against the buffer's
+    /// *current* text up front, then applied in descending-start order —
+    /// same reasoning as `revert_lines`: an edit can shift the char offsets
+    /// of anything after it, so processing highest-offset-first keeps every
+    /// not-yet-applied span's own already-computed offsets valid.
+    pub fn apply_text_edits(&mut self, edits: &[lsp::TextEdit]) -> bool {
+        if edits.is_empty() {
+            return false;
+        }
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|edit| {
+                let start_line = edit.range.start.line as usize;
+                let start_col = utf16_col_to_char_col(&self.document.line_text(start_line), edit.range.start.character as usize);
+                let start = self.document.char_index(start_line, start_col);
+                let end_line = edit.range.end.line as usize;
+                let end_col = utf16_col_to_char_col(&self.document.line_text(end_line), edit.range.end.character as usize);
+                let end = self.document.char_index(end_line, end_col);
+                (start, end, edit.new_text.as_str())
+            })
+            .collect();
+        spans.sort_by(|a, b| b.0.cmp(&a.0));
+
+        self.record_undo_boundary(EditKind::Other);
+        for (start, end, new_text) in spans {
+            self.edit_remove(start..end);
+            self.edit_insert(start, new_text);
+        }
+        // Most of these edits land away from wherever the cursor happens to
+        // be (often in a file the user isn't even looking at) — not worth
+        // relocating it to any one of them, just keeping it in-bounds.
+        self.cursor.line = self.cursor.line.min(self.document.line_count().saturating_sub(1));
+        self.cursor.col = self.cursor.col.min(self.document.line_len_chars(self.cursor.line));
+        self.resync_after_edit();
+        self.recompute_max_line_chars();
+        true
+    }
+
     /// Pushes a fresh undo snapshot unless this edit is the same `kind` as
     /// the one right before it (typing coalescing into one word, backspaces
     /// coalescing into one run) — always call this *before* mutating
@@ -1507,6 +1586,33 @@ impl EditorState {
         }
         self.selection_anchor = Some(CursorPos { line, col: start });
         self.cursor = CursorPos { line, col: end };
+    }
+
+    /// The identifier word at `(line, col)`, if any — same word-boundary
+    /// rule `select_word_at`'s double-click uses (`char_class`), but
+    /// read-only and `None` for anything that isn't `CharClass::Word`
+    /// (whitespace, punctuation). Used to pre-fill the context menu's
+    /// "Rename Symbol" prompt with whatever's actually under the click,
+    /// rather than starting it blank.
+    pub fn word_at(&self, line: usize, col: usize) -> Option<String> {
+        let len = self.document.line_len_chars(line);
+        if len == 0 {
+            return None;
+        }
+        let idx = col.min(len - 1);
+        let class_at = |i: usize| self.document.line_char(line, i).map(char_class);
+        if class_at(idx) != Some(CharClass::Word) {
+            return None;
+        }
+        let mut start = idx;
+        while start > 0 && class_at(start - 1) == Some(CharClass::Word) {
+            start -= 1;
+        }
+        let mut end = idx + 1;
+        while end < len && class_at(end) == Some(CharClass::Word) {
+            end += 1;
+        }
+        Some((start..end).filter_map(|i| self.document.line_char(line, i)).collect())
     }
 
     /// Triple-click line selection: the whole line including its trailing
@@ -2028,12 +2134,19 @@ pub fn find_query_id() -> iced::widget::Id {
     iced::widget::Id::new("find-query")
 }
 
-/// A stable id for the active file's editor scroll area, so `find_step` can
-/// scroll a Find match into view. Only one editor pane is ever shown at a
-/// time (the active tab's), so a single fixed id is enough — same pattern
-/// as `find_query_id`.
+/// A stable id for the primary pane's editor scroll area, so `find_step` can
+/// scroll a Find match into view — same pattern as `find_query_id`. Find
+/// only ever operates on the primary pane, so this is the one fixed id for
+/// it; the split pane (when open) gets its own, `split_editor_scroll_id`.
 pub fn editor_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("editor-scroll-area")
+}
+
+/// The split pane's own version of `editor_scroll_id` — distinct so the two
+/// panes' `scrollable`s (and `scroll_cursor_into_view`'s `scroll_to` calls)
+/// never fight over one widget id when both are showing at once.
+pub fn split_editor_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("split-editor-scroll-area")
 }
 
 /// Finishes a Save As (`save_file_as`'s dialog result): repoints the tab
@@ -2244,14 +2357,18 @@ pub const ASSUMED_VIEWPORT_WIDTH: f32 = 700.0;
 /// axes while the caret is already fully visible, which matters because
 /// this runs on every cursor move and every keystroke — it must never fight
 /// the user's own scrolling.
-pub fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
-    let Some(path) = active_file_path(state) else {
+pub fn scroll_cursor_into_view(state: &mut State, pane: Pane) -> iced::Task<Message> {
+    let Some(path) = pane_file_path(state, pane) else {
         return iced::Task::none();
     };
     let font_size = state.editor_font_size;
     let word_wrap = state.word_wrap;
     let Some(editor) = find_editor_mut(state, &path) else {
         return iced::Task::none();
+    };
+    let scroll_id = match pane {
+        Pane::Primary => editor_scroll_id(),
+        Pane::Split => split_editor_scroll_id(),
     };
 
     let line_top = if word_wrap {
@@ -2331,7 +2448,7 @@ pub fn scroll_cursor_into_view(state: &mut State) -> iced::Task<Message> {
     editor.scroll_offset = target_y;
     editor.scroll_offset_x = target_x;
     iced::widget::operation::scroll_to(
-        editor_scroll_id(),
+        scroll_id,
         iced::widget::scrollable::AbsoluteOffset { x: target_x, y: target_y },
     )
 }
@@ -2344,6 +2461,67 @@ pub fn active_file_path(state: &State) -> Option<PathBuf> {
         TabKey::File(path) => Some(path.clone()),
         _ => None,
     }
+}
+
+/// The file a given pane is currently showing — `Pane::Primary` is just
+/// `active_file_path`; `Pane::Split` reads `state.split_tab` instead. Every
+/// editing `Message` resolves its target buffer through this rather than
+/// `active_file_path` directly, so a keystroke in the split pane mutates
+/// the split pane's file, not the primary one.
+pub fn pane_file_path(state: &State, pane: Pane) -> Option<PathBuf> {
+    match pane {
+        Pane::Primary => active_file_path(state),
+        Pane::Split => match state.split_tab.as_ref()? {
+            TabKey::File(path) => Some(path.clone()),
+            _ => None,
+        },
+    }
+}
+
+/// `⌘\` / the palette's "Split Editor" — opens the split pane showing
+/// whichever other open file tab comes first, or closes it if already open.
+/// A no-op (past a flash telling the user why) when there's no primary file
+/// to compare against, or no *other* file open to fill the split with —
+/// `split_tab` must never equal `active_tab` (see its own doc comment).
+pub fn toggle_split_view(state: &mut State) {
+    if state.split_tab.is_some() {
+        state.split_tab = None;
+        return;
+    }
+    let Some(primary) = active_file_path(state) else {
+        return;
+    };
+    let other = state.open_tabs.iter().find_map(|t| match t {
+        OpenTab::File(editor) if editor.path != primary => Some(editor.path.clone()),
+        _ => None,
+    });
+    match other {
+        Some(path) => state.split_tab = Some(TabKey::File(path)),
+        None => push_flash(state, "OPEN ANOTHER FILE TO SPLIT"),
+    }
+}
+
+/// Shows `path` in the split pane — from the palette's "Open in Split: ..."
+/// entries. Opens it as a tab first if it isn't already one, mirroring
+/// `open_or_focus_file`, but sets `split_tab` instead of `active_tab`. A
+/// no-op if `path` is already the primary pane's file, same reasoning as
+/// `toggle_split_view`.
+pub fn open_or_focus_file_in_split(state: &mut State, path: PathBuf) {
+    if active_file_path(state).as_deref() == Some(path.as_path()) {
+        return;
+    }
+    let key = TabKey::File(path.clone());
+    if !state.open_tabs.iter().any(|t| t.key() == key) {
+        let Ok(document) = Document::open(&path) else {
+            return;
+        };
+        state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(document, path.clone()))));
+        send_did_open_for(state, &path);
+        send_copilot_did_open_for(state, &path);
+        recompute_diff_for(state, &path);
+    }
+    state.split_tab = Some(key);
+    persist_session(state);
 }
 
 pub fn find_editor<'a>(state: &'a State, path: &Path) -> Option<&'a EditorState> {
@@ -2483,6 +2661,60 @@ pub fn open_or_focus_file(state: &mut State, path: PathBuf) {
         send_copilot_did_open_for(state, &path);
         recompute_diff_for(state, &path);
         persist_session(state);
+    }
+}
+
+/// Opens `path` as a `File` tab if it isn't one already, same as
+/// `open_or_focus_file`'s "ensure it's open" half — but never touches
+/// `active_tab`. Used by `apply_rename`: a workspace-wide rename routinely
+/// touches files the user never opened (or has open in neither pane), and
+/// jumping the primary pane to each one in turn as its edit lands would
+/// yank focus away from wherever the user actually is mid-rename.
+fn ensure_file_open(state: &mut State, path: &Path) {
+    let key = TabKey::File(path.to_path_buf());
+    if state.open_tabs.iter().any(|t| t.key() == key) {
+        return;
+    }
+    if let Ok(document) = Document::open(path) {
+        state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(document, path.to_path_buf()))));
+        send_did_open_for(state, path);
+        send_copilot_did_open_for(state, path);
+        recompute_diff_for(state, path);
+    }
+}
+
+/// Applies a `LspEvent::RenameResult`'s edits, one file at a time —
+/// opening each as a tab first if needed (`ensure_file_open`) since a
+/// project-wide rename routinely touches files well outside whatever's
+/// currently open. Each file's edits land as that file's own single undo
+/// step (`EditorState::apply_text_edits`); nothing is auto-saved, so the
+/// user reviews (and can undo) each touched file same as any other edit —
+/// consistent with this app's "save is explicit" model everywhere else.
+/// Reports how many files actually changed via a toast, since a rename
+/// that silently touches several files scattered across the tree would
+/// otherwise be invisible.
+pub fn apply_rename(state: &mut State, edits: Vec<(lsp::Url, Vec<lsp::TextEdit>)>) {
+    if edits.is_empty() {
+        push_toast(state, ToastKind::Warning, "Rename found nothing to change");
+        return;
+    }
+    let mut changed = 0usize;
+    for (uri, text_edits) in edits {
+        let Ok(path) = uri.to_file_path() else { continue };
+        ensure_file_open(state, &path);
+        if find_editor_mut(state, &path).is_some_and(|editor| editor.apply_text_edits(&text_edits)) {
+            changed += 1;
+            mark_edited(state, &path);
+        }
+    }
+    if changed > 0 {
+        push_toast(
+            state,
+            ToastKind::Success,
+            format!("Renamed across {changed} file{}", if changed == 1 { "" } else { "s" }),
+        );
+    } else {
+        push_toast(state, ToastKind::Warning, "Rename found nothing to change");
     }
 }
 
@@ -2694,7 +2926,11 @@ pub fn recompute_diff_for(state: &mut State, path: &Path) {
         None if state.repo.is_none() => DiffStatus::NoRepo,
         None => DiffStatus::Untracked,
         Some(old) => {
-            let lines = devscribe_core::diff::diff_lines(&old, &current_text);
+            let lines = if state.diff_ignore_whitespace {
+                devscribe_core::diff::diff_lines_ignoring_whitespace(&old, &current_text)
+            } else {
+                devscribe_core::diff::diff_lines(&old, &current_text)
+            };
             if lines.iter().all(|l| l.kind == devscribe_core::diff::DiffLineKind::Equal) {
                 DiffStatus::UpToDate
             } else {
@@ -2986,6 +3222,31 @@ fn location_entry(state: &State, loc: &lsp::Location) -> Option<LocationEntry> {
     })
 }
 
+/// Turns `workspace/symbol` results into ready-made palette rows — the
+/// palette's `#query` mode. Reuses `location_entry`'s same UTF-16-to-char
+/// conversion (open-buffer-aware, disk-fallback) so a symbol in a dirty,
+/// unsaved file still resolves against its live content rather than
+/// whatever's on disk. Entries whose `uri` doesn't resolve to a real file
+/// (or that fail the on-disk read) are silently dropped, same as
+/// `apply_locations`' own filtering.
+pub fn symbol_palette_entries(state: &State, symbols: &[lsp::SymbolEntry]) -> Vec<PaletteEntry> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            let entry = location_entry(state, &symbol.location)?;
+            let file_name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let label = match &symbol.container_name {
+                Some(container) => format!("{} \u{2014} {container} \u{2022} {file_name}:{}", symbol.name, entry.line + 1),
+                None => format!("{} \u{2014} {file_name}:{}", symbol.name, entry.line + 1),
+            };
+            Some(PaletteEntry {
+                label,
+                action: PaletteAction::JumpToSymbolLocation { path: entry.path, line: entry.line, col: entry.col },
+            })
+        })
+        .collect()
+}
+
 /// Shared landing logic for both `LspEvent::Definition` and
 /// `LspEvent::References`: a single result (by far the common case for Go to
 /// Definition — most symbols have exactly one) jumps straight there; several
@@ -3008,7 +3269,7 @@ pub fn apply_locations(state: &mut State, locations: Vec<lsp::Location>, label: 
             if let Some(editor) = find_editor_mut(state, &entry.path) {
                 editor.click(entry.line, entry.col, false);
             }
-            scroll_cursor_into_view(state)
+            scroll_cursor_into_view(state, Pane::Primary)
         }
         n => {
             state.references_label = format!("{label} \u{2014} {n} results");

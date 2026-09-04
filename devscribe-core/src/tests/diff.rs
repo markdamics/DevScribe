@@ -139,6 +139,56 @@ fn hunk_range_spans_every_row_the_hunk_contributes() {
 }
 
 #[test]
+fn ignoring_whitespace_treats_a_reindented_line_as_equal() {
+    let lines = diff_lines_ignoring_whitespace("a\n  b\nc\n", "a\n\tb  \nc\n");
+    assert!(lines.iter().all(|l| l.kind == DiffLineKind::Equal), "{lines:?}");
+}
+
+#[test]
+fn ignoring_whitespace_still_catches_a_real_content_change() {
+    let lines = diff_lines_ignoring_whitespace("a\n  b\nc\n", "a\n  x\nc\n");
+    let kinds: Vec<_> = lines.iter().map(|l| (l.kind, l.text.as_str())).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (DiffLineKind::Equal, "a"),
+            (DiffLineKind::Delete, "  b"),
+            (DiffLineKind::Insert, "  x"),
+            (DiffLineKind::Equal, "c"),
+        ]
+    );
+}
+
+#[test]
+fn exact_mode_still_flags_a_whitespace_only_change_that_ignore_mode_would_hide() {
+    let lines = diff_lines("a\n  b\nc\n", "a\n\tb\nc\n");
+    assert!(lines.iter().any(|l| l.kind != DiffLineKind::Equal), "{lines:?}");
+}
+
+#[test]
+fn diff_words_flags_only_the_changed_word_not_the_whole_line() {
+    let spans = diff_words("the quick fox", "the slow fox");
+    let tagged: Vec<_> = spans.iter().map(|s| (s.kind, s.text.as_str())).collect();
+    assert_eq!(
+        tagged,
+        vec![
+            (DiffLineKind::Equal, "the"),
+            (DiffLineKind::Equal, " "),
+            (DiffLineKind::Delete, "quick"),
+            (DiffLineKind::Insert, "slow"),
+            (DiffLineKind::Equal, " "),
+            (DiffLineKind::Equal, "fox"),
+        ]
+    );
+}
+
+#[test]
+fn diff_words_of_identical_lines_is_all_equal() {
+    let spans = diff_words("same text", "same text");
+    assert!(spans.iter().all(|s| s.kind == DiffLineKind::Equal));
+}
+
+#[test]
 fn hunks_and_gutter_marks_agree() {
     let lines = diff_lines("a\nb\nc\nd\ne\n", "a\nx\ny\nz\ne\n");
     let from_hunks = {

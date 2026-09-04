@@ -112,6 +112,12 @@ pub struct ContextMenu {
     /// destructive action in the whole app that needs a deliberate second
     /// step before it touches disk.
     pub confirm_delete: bool,
+    /// Where the right-click that opened this menu landed, in window
+    /// space — taken from `State::mouse_pos` at open time (`mouse_area`'s
+    /// `on_right_press` carries no position of its own). The menu draws at
+    /// this point rather than a fixed spot, clamped to stay on-screen.
+    pub x: f32,
+    pub y: f32,
 }
 
 /// A project root's derived data — tree, collapsed dirs, and git summary —

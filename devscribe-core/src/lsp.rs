@@ -15,12 +15,13 @@ use async_lsp::lsp_types::{
     DynamicRegistrationClientCapabilities, GotoCapability, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverContents, HoverParams,
     InitializeParams, InitializedParams, LocationLink, LogMessageParams, MarkedString,
-    PartialResultParams, ProgressParams, PublishDiagnosticsParams, ReferenceContext,
-    NumberOrString, ProgressParamsValue, ReferenceParams, ShowMessageParams,
-    SignatureHelpClientCapabilities, SignatureHelpParams, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgress,
-    WorkDoneProgressParams, WorkspaceFolder,
+    OneOf, PartialResultParams, ProgressParams, PublishDiagnosticsParams, ReferenceContext,
+    NumberOrString, ProgressParamsValue, ReferenceParams, RenameClientCapabilities, RenameParams,
+    ShowMessageParams, SignatureHelpClientCapabilities, SignatureHelpParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, VersionedTextDocumentIdentifier,
+    WorkDoneProgress, WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceFolder,
+    WorkspaceSymbolClientCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use async_lsp::router::Router;
 use async_lsp::{LanguageClient, LanguageServer, MainLoop, ResponseError};
@@ -30,7 +31,7 @@ use futures::{FutureExt, SinkExt, StreamExt};
 pub use async_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, Documentation,
     InsertTextFormat, Location, MarkupContent, ParameterInformation, ParameterLabel, Position,
-    Range, SignatureInformation, Url,
+    Range, SignatureInformation, SymbolKind, TextEdit, Url,
 };
 
 /// A language DevScribe knows how to talk to a language server for.
@@ -109,6 +110,16 @@ pub enum LspCommand {
     /// project (every server this app talks to indexes the workspace, not
     /// just the open file).
     References { uri: Url, line: u32, character: u32 },
+    /// `textDocument/rename` — "Rename Symbol". `new_name` is whatever the
+    /// user typed into the context menu's rename prompt; the server is
+    /// trusted to reject an invalid one via a `ResponseError` (surfaced as
+    /// `LspEvent::Unavailable`-style silence — see the `run` loop's handler).
+    Rename { uri: Url, line: u32, character: u32, new_name: String },
+    /// `workspace/symbol` — "Search Symbol in Project", the command
+    /// palette's `#query` mode. Every server this app talks to indexes the
+    /// whole workspace for this the same way `References` does, not just
+    /// open files.
+    WorkspaceSymbol { query: String },
 }
 
 /// An event a running worker reports back to the app.
@@ -165,6 +176,27 @@ pub enum LspEvent {
         character: u32,
         locations: Vec<Location>,
     },
+    /// The result of a `LspCommand::Rename` request — `edits` is the
+    /// server's `WorkspaceEdit.changes` flattened to a plain list (this
+    /// client never advertises `documentChanges` support, so a
+    /// spec-conforming server replies with `changes` alone). Empty means
+    /// either the server had nothing to rename at that position or rejected
+    /// `new_name` outright; both look the same to the caller (a no-op,
+    /// nothing applied) since a `ResponseError`'s message isn't worth a
+    /// whole new event variant just to surface here.
+    RenameResult {
+        uri: Url,
+        line: u32,
+        character: u32,
+        edits: Vec<(Url, Vec<TextEdit>)>,
+    },
+    /// The result of a `LspCommand::WorkspaceSymbol` request, already
+    /// flattened past `WorkspaceSymbolResponse`'s two response shapes (see
+    /// `workspace_symbol_response_to_entries`) — entries with no concrete
+    /// `Location` (a `WorkspaceSymbol` resolved lazily, which this client
+    /// never requests — see `symbol` capability below) are dropped rather
+    /// than shown as unreachable.
+    WorkspaceSymbols { query: String, symbols: Vec<SymbolEntry> },
     /// Binary not found anywhere — the app should auto-install it.
     NeedsInstall,
     /// The server binary couldn't be spawned, or the connection died.
@@ -186,6 +218,20 @@ pub enum LspEvent {
         percentage: Option<u32>,
         done: bool,
     },
+}
+
+/// One `workspace/symbol` search result, flattened from whichever of
+/// `SymbolInformation`/`WorkspaceSymbol` the server replied with — see
+/// `workspace_symbol_response_to_entries`.
+#[derive(Debug, Clone)]
+pub struct SymbolEntry {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// The enclosing scope's name, if the server sent one (e.g. the class a
+    /// method belongs to) — shown as secondary context, not used for
+    /// matching.
+    pub container_name: Option<String>,
+    pub location: Location,
 }
 
 struct ClientState {
@@ -348,6 +394,15 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                             ..Default::default()
                         }),
                         references: Some(DynamicRegistrationClientCapabilities {
+                            ..Default::default()
+                        }),
+                        rename: Some(RenameClientCapabilities {
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    workspace: Some(WorkspaceClientCapabilities {
+                        symbol: Some(WorkspaceSymbolClientCapabilities {
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -672,6 +727,71 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                                 .await;
                         }
                     }
+                    LspCommand::Rename { uri, line, character, new_name } => {
+                        let rename_fut = server
+                            .rename(RenameParams {
+                                text_document_position: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                    position: Position { line, character },
+                                },
+                                new_name,
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                            })
+                            .fuse();
+                        futures::pin_mut!(rename_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = rename_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(response) = result {
+                            let edits = response.map(workspace_edit_to_changes).unwrap_or_default();
+                            let _ = output
+                                .send(LspEvent::RenameResult { uri, line, character, edits })
+                                .await;
+                        }
+                    }
+                    LspCommand::WorkspaceSymbol { query } => {
+                        let symbol_fut = server
+                            .symbol(WorkspaceSymbolParams {
+                                query: query.clone(),
+                                partial_result_params: PartialResultParams::default(),
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                            })
+                            .fuse();
+                        futures::pin_mut!(symbol_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = symbol_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(response) = result {
+                            let symbols = response.map(workspace_symbol_response_to_entries).unwrap_or_default();
+                            let _ = output.send(LspEvent::WorkspaceSymbols { query, symbols }).await;
+                        }
+                    }
                 }
             }
         }
@@ -696,6 +816,50 @@ fn goto_definition_to_locations(response: GotoDefinitionResponse) -> Vec<Locatio
             })
             .collect(),
     }
+}
+
+/// Flattens `workspace/symbol`'s two legal response shapes into a plain
+/// list. A `WorkspaceSymbol` (the newer, "Nested" shape) resolving to a bare
+/// `WorkspaceLocation` (uri only, no range — legal only when the client
+/// advertises `resolveSupport`, which this one doesn't request) has nowhere
+/// to jump to, so it's dropped rather than kept with a fabricated range.
+fn workspace_symbol_response_to_entries(response: WorkspaceSymbolResponse) -> Vec<SymbolEntry> {
+    match response {
+        WorkspaceSymbolResponse::Flat(items) => items
+            .into_iter()
+            .map(|item| SymbolEntry {
+                name: item.name,
+                kind: item.kind,
+                container_name: item.container_name,
+                location: item.location,
+            })
+            .collect(),
+        WorkspaceSymbolResponse::Nested(items) => items
+            .into_iter()
+            .filter_map(|item| match item.location {
+                OneOf::Left(location) => Some(SymbolEntry {
+                    name: item.name,
+                    kind: item.kind,
+                    container_name: item.container_name,
+                    location,
+                }),
+                OneOf::Right(_) => None,
+            })
+            .collect(),
+    }
+}
+
+/// Flattens `WorkspaceEdit.changes` (this client never advertises
+/// `documentChanges` support, so a spec-conforming server always populates
+/// this field rather than the alternative `document_changes` one) into a
+/// plain list, dropping the `HashMap`'s unspecified iteration order in
+/// favor of one the caller can treat deterministically if it ever needs to
+/// (applying edits file-by-file doesn't actually care about the order, but
+/// a flat `Vec` is still simpler for `devscribe`'s state layer to fold over
+/// than re-deriving this same "handle `None`, iterate the map" dance
+/// itself).
+fn workspace_edit_to_changes(edit: async_lsp::lsp_types::WorkspaceEdit) -> Vec<(Url, Vec<TextEdit>)> {
+    edit.changes.map(|m| m.into_iter().collect()).unwrap_or_default()
 }
 
 /// Flattens any of `HoverContents`' three shapes into plain text for the

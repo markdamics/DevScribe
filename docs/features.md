@@ -13,9 +13,10 @@
 - Breadcrumb bar
 - JSON tree view
 - Markdown preview
-- Diff view (working tree)
+- Diff view (working tree) — unified or side-by-side, word-level highlighting, ignore-whitespace toggle
 - Word wrap / density settings
 - Adjustable text scale
+- Split editor panes (side-by-side file comparison)
 
 ## Language Intelligence (LSP)
 - rust-analyzer, jdtls, pyright, typescript-language-server, clangd support
@@ -28,6 +29,8 @@
 - Dot-completion popup
 - Code outline
 - Language server auto-install
+- Rename Symbol (editor right-click menu)
+- Search Symbol in Project (editor right-click menu, or `#query` in the command palette)
 
 ## AI Assist
 - AI chat panel
@@ -62,10 +65,10 @@
 - Fuzzy file/command matching
 
 ## UI / UX
-- Command palette
+- Command palette (with keyboard-shortcut hints)
 - Settings panel (Explorer, Editor, Toolchains, Shortcuts, About)
 - Keyboard shortcuts reference
-- Context menus
+- Context menus (sidebar file tree, editor code actions)
 - Tab bar with overflow menu
 - Status bar
 - Toast notifications

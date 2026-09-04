@@ -232,7 +232,7 @@ fn reveal_active_in_tree_uncollapses_ancestor_dirs() {
 fn collapse_sidebar_sets_collapsed_and_closes_menus_anchored_to_it() {
     let mut state = State {
         projects_open: true,
-        ctx_menu: Some(ContextMenu { target: None, confirm_delete: false }),
+        ctx_menu: Some(ContextMenu { target: None, confirm_delete: false, x: 0.0, y: 0.0 }),
         ..State::default()
     };
 
@@ -702,7 +702,7 @@ fn reset_project_scoped_state_clears_everything_tied_to_the_previous_project() {
         active_tab: Some(TabKey::Diff(PathBuf::from("/old/a.txt"))),
         closed_tabs: vec![TabKey::Diff(PathBuf::from("/old/b.txt"))],
         draft: Some(Draft { kind: DraftKind::NewFile, dir: PathBuf::from("/old"), target: None, text: "x".into() }),
-        ctx_menu: Some(ContextMenu { target: None, confirm_delete: false }),
+        ctx_menu: Some(ContextMenu { target: None, confirm_delete: false, x: 0.0, y: 0.0 }),
         changes_panel_open: true,
         search_query: "needle".into(),
         search_in_progress: true,
@@ -1876,7 +1876,7 @@ fn typing_defers_the_expensive_work_and_one_settle_covers_the_whole_burst() {
     assert!(state.edit_settled_at.is_none(), "nothing pending before any edit");
 
     for _ in 0..5 {
-        update(&mut state, Message::EditorInsertText("x".into()));
+        update(&mut state, Message::EditorInsertText { text: "x".into(), pane: Pane::Primary });
     }
     assert!(state.edit_settled_at.is_some(), "typing must arm the settle timer");
     assert_eq!(
@@ -1908,7 +1908,7 @@ fn saving_flushes_pending_work_so_the_diff_is_not_left_stale() {
     let files = TempFiles::new("settle-save");
     let mut state = State::default();
     open_or_focus_file(&mut state, files.a.clone());
-    update(&mut state, Message::EditorInsertText("x".into()));
+    update(&mut state, Message::EditorInsertText { text: "x".into(), pane: Pane::Primary });
     assert!(state.edit_settled_at.is_some());
 
     let _ = save_current_file(&mut state);
@@ -2062,6 +2062,73 @@ fn revert_lines_reverts_every_target_as_a_single_undo_step() {
 
     assert!(editor.undo());
     assert_eq!(editor.document.text().to_string(), "a\nx\nc\ny\ne\n", "undo should restore the pre-revert buffer in one step");
+}
+
+#[test]
+fn word_at_returns_the_identifier_under_the_cursor() {
+    let editor = EditorState::new(Document::from_str("let foo_bar = 1;\n"), PathBuf::from("t.rs"));
+    assert_eq!(editor.word_at(0, 5), Some("foo_bar".to_string()), "middle of the word");
+    assert_eq!(editor.word_at(0, 4), Some("foo_bar".to_string()), "leading edge");
+    assert_eq!(editor.word_at(0, 10), Some("foo_bar".to_string()), "trailing edge");
+}
+
+#[test]
+fn word_at_is_none_over_whitespace_or_punctuation() {
+    let editor = EditorState::new(Document::from_str("let foo_bar = 1;\n"), PathBuf::from("t.rs"));
+    assert_eq!(editor.word_at(0, 3), None, "the space after \"let\"");
+    assert_eq!(editor.word_at(0, 12), None, "the \"=\" itself");
+}
+
+#[test]
+fn apply_text_edits_replaces_ranges_as_one_undo_step() {
+    let mut editor = EditorState::new(Document::from_str("let foo = 1;\nlet bar = foo;\n"), PathBuf::from("t.rs"));
+    // Renaming `foo` to `renamed` — two edits, same shape a `WorkspaceEdit`
+    // for a two-usage local variable would carry.
+    let edits = vec![
+        lsp::TextEdit {
+            range: lsp::Range { start: lsp::Position { line: 0, character: 4 }, end: lsp::Position { line: 0, character: 7 } },
+            new_text: "renamed".to_string(),
+        },
+        lsp::TextEdit {
+            range: lsp::Range { start: lsp::Position { line: 1, character: 10 }, end: lsp::Position { line: 1, character: 13 } },
+            new_text: "renamed".to_string(),
+        },
+    ];
+    assert!(editor.apply_text_edits(&edits));
+    assert_eq!(editor.document.text().to_string(), "let renamed = 1;\nlet bar = renamed;\n");
+    assert_eq!(editor.undo_stack.len(), 1, "every edit in one `WorkspaceEdit` must land as a single undo step");
+
+    assert!(editor.undo());
+    assert_eq!(editor.document.text().to_string(), "let foo = 1;\nlet bar = foo;\n");
+}
+
+#[test]
+fn apply_text_edits_processes_descending_so_an_earlier_edit_does_not_shift_a_later_ones_offsets() {
+    // Both edits are on the same line; applying the first (lower-column) one
+    // first would shift where the second one's own pre-computed char offset
+    // actually lands, corrupting it — same reasoning `revert_lines`'
+    // descending-order test above exercises for line-level reverts.
+    let mut editor = EditorState::new(Document::from_str("aa bb cc\n"), PathBuf::from("t.rs"));
+    let edits = vec![
+        lsp::TextEdit {
+            range: lsp::Range { start: lsp::Position { line: 0, character: 0 }, end: lsp::Position { line: 0, character: 2 } },
+            new_text: "xx".to_string(),
+        },
+        lsp::TextEdit {
+            range: lsp::Range { start: lsp::Position { line: 0, character: 6 }, end: lsp::Position { line: 0, character: 8 } },
+            new_text: "yy".to_string(),
+        },
+    ];
+    assert!(editor.apply_text_edits(&edits));
+    assert_eq!(editor.document.text().to_string(), "xx bb yy\n");
+}
+
+#[test]
+fn apply_text_edits_is_a_noop_for_an_empty_list() {
+    let mut editor = EditorState::new(Document::from_str("unchanged\n"), PathBuf::from("t.rs"));
+    assert!(!editor.apply_text_edits(&[]));
+    assert_eq!(editor.document.text().to_string(), "unchanged\n");
+    assert!(editor.undo_stack.is_empty());
 }
 
 #[test]
@@ -2795,7 +2862,7 @@ fn typing_past_the_right_edge_of_a_narrow_viewport_scrolls_right() {
     find_editor_mut(&mut state, &files.a).unwrap().viewport_width = 100.0;
 
     for _ in 0..20 {
-        let _ = update(&mut state, Message::EditorTypeChar('x'));
+        let _ = update(&mut state, Message::EditorTypeChar { ch: 'x', pane: Pane::Primary });
     }
 
     let editor = find_editor(&state, &files.a).unwrap();
@@ -2813,13 +2880,13 @@ fn moving_back_to_column_zero_resets_horizontal_scroll_to_show_the_gutter_again(
         editor.viewport_width = 100.0;
         editor.cursor = CursorPos { line: 0, col: 60 };
     }
-    let _ = update(&mut state, Message::EditorMove { dir: Direction::LineEnd, extend: false });
+    let _ = update(&mut state, Message::EditorMove { dir: Direction::LineEnd, extend: false, pane: Pane::Primary });
     assert!(
         find_editor(&state, &files.a).unwrap().scroll_offset_x > 0.0,
         "sanity: starting scrolled right"
     );
 
-    let _ = update(&mut state, Message::EditorMove { dir: Direction::LineStart, extend: false });
+    let _ = update(&mut state, Message::EditorMove { dir: Direction::LineStart, extend: false, pane: Pane::Primary });
 
     assert_eq!(
         find_editor(&state, &files.a).unwrap().scroll_offset_x,
@@ -2840,7 +2907,7 @@ fn scroll_cursor_into_view_is_a_no_op_when_already_visible() {
         editor.viewport_height = 800.0;
     }
 
-    let task = scroll_cursor_into_view(&mut state);
+    let task = scroll_cursor_into_view(&mut state, Pane::Primary);
 
     assert_eq!(task.units(), 0, "a fully-visible caret must not produce a scroll task");
     let editor = find_editor(&state, &files.a).unwrap();
@@ -3029,7 +3096,7 @@ fn completion_select_expands_a_snippet_with_no_literal_dollar_syntax_left_in_the
     );
     assert!(editor.snippet_active(), "a snippet with more than one stop must start a Tab walk");
 
-    let _ = update(&mut state, Message::EditorIndent);
+    let _ = update(&mut state, Message::EditorIndent { pane: Pane::Primary });
 
     let editor = find_editor(&state, &path).unwrap();
     assert!(editor.selection().is_none(), "$0 is a bare cursor position, not a selection");
@@ -3117,7 +3184,7 @@ fn editor_indent_accepts_a_showing_ghost_completion_instead_of_indenting() {
         editor.ghost_completion = Some(GhostCompletion { at: cursor, insert_text: "bc".to_string(), item: ghost_item("bc") });
     }
 
-    let _ = update(&mut state, Message::EditorIndent);
+    let _ = update(&mut state, Message::EditorIndent { pane: Pane::Primary });
 
     let editor = find_editor(&state, &path).unwrap();
     assert_eq!(editor.document.text().to_string(), "bca", "Tab must accept the suggestion, not insert a real indent");

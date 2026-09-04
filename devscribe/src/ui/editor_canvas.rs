@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{CursorPos, Direction, EditorDiagnostic, Message};
+use crate::state::{CursorPos, Direction, EditorDiagnostic, Message, Pane};
 
 /// The font-size-to-`line_height`/`char_width` ratios the original static
 /// design used (22/13 and 0.6 respectively) — kept fixed so the editor's
@@ -83,6 +83,11 @@ pub struct EditorCanvas {
     /// the first line is shown even for a multi-line suggestion (accepting
     /// still inserts the whole thing; this is a rendering-only limitation).
     pub ghost_text: Option<String>,
+    /// Which pane this instance renders — stamped onto every `Message` it
+    /// publishes (see `Pane`'s own doc comment) and used to gate the
+    /// primary-only interactions below (go to definition, hover, gutter
+    /// revert) to `Pane::Primary`.
+    pub pane: Pane,
 }
 
 /// Purely local interaction state — never synced back into `State` directly.
@@ -193,54 +198,65 @@ impl EditorCanvas {
         // keys into selection-extending moves.
         let plain = !(modifiers.command() || modifiers.control() || modifiers.alt());
 
+        let pane = self.pane;
+
         if plain && let Key::Named(named) = key {
             let extend = modifiers.shift();
             return match named {
-                Named::Enter => publish(Message::EditorInsertText("\n".into())),
-                Named::Space => publish(Message::EditorInsertText(" ".into())),
-                Named::Backspace => publish(Message::EditorBackspace),
-                Named::Delete => publish(Message::EditorDelete),
+                Named::Enter => publish(Message::EditorInsertText { text: "\n".into(), pane }),
+                Named::Space => publish(Message::EditorInsertText { text: " ".into(), pane }),
+                Named::Backspace => publish(Message::EditorBackspace { pane }),
+                Named::Delete => publish(Message::EditorDelete { pane }),
                 Named::Tab => {
                     if extend {
-                        publish(Message::EditorDedent)
+                        publish(Message::EditorDedent { pane })
                     } else {
-                        publish(Message::EditorIndent)
+                        publish(Message::EditorIndent { pane })
                     }
                 }
                 Named::ArrowLeft => publish(Message::EditorMove {
                     dir: Direction::Left,
                     extend,
+                    pane,
                 }),
                 Named::ArrowRight => publish(Message::EditorMove {
                     dir: Direction::Right,
                     extend,
+                    pane,
                 }),
                 Named::ArrowUp => publish(Message::EditorMove {
                     dir: Direction::Up,
                     extend,
+                    pane,
                 }),
                 Named::ArrowDown => publish(Message::EditorMove {
                     dir: Direction::Down,
                     extend,
+                    pane,
                 }),
                 Named::Home => publish(Message::EditorMove {
                     dir: Direction::LineStart,
                     extend,
+                    pane,
                 }),
                 Named::End => publish(Message::EditorMove {
                     dir: Direction::LineEnd,
                     extend,
+                    pane,
                 }),
                 // Only captured while a ghost-text suggestion is actually
                 // showing — an unguarded arm here would swallow Escape even
                 // with nothing to dismiss, keeping it from ever reaching the
                 // app-wide Escape handling (`iced::keyboard::listen()` only
-                // sees events no focused widget captured).
+                // sees events no focused widget captured). Ghost text is
+                // primary-pane-only (see `Pane`), so this is never true for
+                // the split pane in practice.
                 Named::Escape if self.ghost_text.is_some() => publish(Message::DismissGhostCompletion),
                 // Same VS Code bindings: `F12` "Go to Definition", `Shift+F12`
                 // "Find All References" — both act on the cursor's current
-                // position rather than needing a fresh click.
-                Named::F12 => {
+                // position rather than needing a fresh click. Primary-pane
+                // only — see `Pane`'s own doc comment.
+                Named::F12 if pane == Pane::Primary => {
                     if extend {
                         publish(Message::FindReferences { line: self.cursor.line, col: self.cursor.col })
                     } else {
@@ -255,28 +271,28 @@ impl EditorCanvas {
             && let Key::Character(c) = key.as_ref()
         {
             return if c.eq_ignore_ascii_case("a") {
-                publish(Message::EditorSelectAll)
+                publish(Message::EditorSelectAll { pane })
             } else if c.eq_ignore_ascii_case("c") {
-                publish(Message::EditorCopy)
+                publish(Message::EditorCopy { pane })
             } else if c.eq_ignore_ascii_case("x") {
-                publish(Message::EditorCut)
+                publish(Message::EditorCut { pane })
             } else if c.eq_ignore_ascii_case("v") {
-                publish(Message::EditorPaste)
+                publish(Message::EditorPaste { pane })
             } else if c.eq_ignore_ascii_case("z") {
                 if modifiers.shift() {
-                    publish(Message::EditorRedo)
+                    publish(Message::EditorRedo { pane })
                 } else {
-                    publish(Message::EditorUndo)
+                    publish(Message::EditorUndo { pane })
                 }
             } else if c.eq_ignore_ascii_case("y") {
-                publish(Message::EditorRedo)
+                publish(Message::EditorRedo { pane })
             } else if c.eq_ignore_ascii_case("/") {
                 // Captured here rather than left to bubble to the app-wide
                 // shortcut handler, which maps the same chord to "open
                 // shortcuts help" — toggle-comment is what `Cmd+/` should do
                 // while actually typing in a file; the help screen stays
                 // reachable from everywhere else (sidebar, chat, welcome).
-                publish(Message::EditorToggleComment)
+                publish(Message::EditorToggleComment { pane })
             } else {
                 None
             };
@@ -300,8 +316,8 @@ impl EditorCanvas {
         // typed at a time.
         let mut chars = text.chars();
         match (chars.next(), chars.next()) {
-            (Some(ch), None) => publish(Message::EditorTypeChar(ch)),
-            _ => publish(Message::EditorInsertText(text.to_string())),
+            (Some(ch), None) => publish(Message::EditorTypeChar { ch, pane }),
+            _ => publish(Message::EditorInsertText { text: text.to_string(), pane }),
         }
     }
 }
@@ -338,8 +354,10 @@ impl canvas::Program<Message> for EditorCanvas {
                 // placing the cursor or starting a drag-select — the same
                 // modifier VS Code uses for this gesture. Checked before the
                 // gutter/revert handling below since it's meant to apply
-                // anywhere over the text, not just plain clicks.
-                if state.modifiers.command() {
+                // anywhere over the text, not just plain clicks. Primary-pane
+                // only (see `Pane`) — in the split pane this just falls
+                // through to a plain click below.
+                if state.modifiers.command() && self.pane == Pane::Primary {
                     return Some(canvas::Action::publish(Message::GoToDefinition { line, col }).and_capture());
                 }
 
@@ -353,8 +371,12 @@ impl canvas::Program<Message> for EditorCanvas {
                 // label in place of the line number — see `draw`), so a
                 // stray click can't silently discard edits. Unmarked-line
                 // gutter clicks fall through unchanged, to today's
-                // cursor-to-column-0.
-                if position.x < GUTTER_WIDTH && self.gutter_marks.get(line).and_then(Option::as_ref).is_some() {
+                // cursor-to-column-0. Primary-pane only, same as go to
+                // definition above.
+                if self.pane == Pane::Primary
+                    && position.x < GUTTER_WIDTH
+                    && self.gutter_marks.get(line).and_then(Option::as_ref).is_some()
+                {
                     let message = if self.pending_revert_line == Some(line) {
                         Message::RevertLine { line }
                     } else {
@@ -372,6 +394,7 @@ impl canvas::Program<Message> for EditorCanvas {
                     return Some(canvas::Action::publish(Message::CancelRevertLine).and_capture());
                 }
                 state.dragging = true;
+                let pane = self.pane;
 
                 // Shift-click always just extends, same as shift+arrow —
                 // doesn't participate in double/triple-click detection.
@@ -379,7 +402,7 @@ impl canvas::Program<Message> for EditorCanvas {
                     state.last_click = None;
                     state.click_streak = 0;
                     return Some(
-                        canvas::Action::publish(Message::EditorClick { line, col, extend: true })
+                        canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane })
                             .and_capture(),
                     );
                 }
@@ -392,9 +415,9 @@ impl canvas::Program<Message> for EditorCanvas {
                 state.last_click = Some((now, line, col));
 
                 let message = match state.click_streak {
-                    2 => Message::EditorSelectWord { line, col },
-                    3 => Message::EditorSelectLine { line },
-                    _ => Message::EditorClick { line, col, extend: false },
+                    2 => Message::EditorSelectWord { line, col, pane },
+                    3 => Message::EditorSelectLine { line, pane },
+                    _ => Message::EditorClick { line, col, extend: false, pane },
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
@@ -408,13 +431,15 @@ impl canvas::Program<Message> for EditorCanvas {
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
                 let position = cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))?;
                 let (line, col) = self.hit_test(position, bounds.width);
-                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true }).and_capture())
+                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane: self.pane }).and_capture())
             }
             // Passive hover tracking (dwell-based `textDocument/hover`) —
             // only published on an actual cell change, so a stationary
             // mouse's sub-pixel `CursorMoved` noise doesn't restart the
             // dwell timer or force a `view()` rebuild every frame.
-            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if !state.dragging => {
+            // Primary-pane only, same as go to definition above — the split
+            // pane never requests hover info.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if !state.dragging && self.pane == Pane::Primary => {
                 match cursor.position_in(bounds) {
                     Some(position) => {
                         let cell = self.hit_test(position, bounds.width);
@@ -437,6 +462,30 @@ impl canvas::Program<Message> for EditorCanvas {
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
                 None
+            }
+            // A right-click over the text opens the code-actions context
+            // menu (Rename Symbol, Go to Definition, Find All References,
+            // Search Symbol in Project) at the click position — primary
+            // pane only, same as the other LSP-assisted interactions (see
+            // `Pane`'s own doc comment). One outside the canvas, or over the
+            // split pane, falls through to the generic case right below,
+            // same "outside click releases focus" behavior as a left-click.
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+                if self.pane == Pane::Primary && cursor.position_in(bounds).is_some() =>
+            {
+                let position = cursor.position_in(bounds)?;
+                let (line, col) = self.hit_test(position, bounds.width);
+                let screen = cursor.position()?;
+                state.focused = true;
+                Some(
+                    canvas::Action::publish(Message::OpenEditorContext {
+                        line,
+                        col,
+                        x: screen.x,
+                        y: screen.y,
+                    })
+                    .and_capture(),
+                )
             }
             // Right/middle presses outside the canvas give focus away too —
             // same reason as the left-button case above (a right-click into

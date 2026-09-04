@@ -47,12 +47,22 @@ fn entry_row(
     let label = text(entry.label.clone())
         .font(fonts::mono(Weight::Medium))
         .size(crate::text_scale::px(15.0))
+        .width(Length::Fill)
         .color(if is_selected {
             color(p.text_strong)
         } else {
             color(p.text_body)
         });
-    button(label)
+    let mut contents = row![label].width(Length::Fill).align_y(Alignment::Center);
+    if let Some(keys) = state::palette_shortcut(&entry.action) {
+        contents = contents.push(
+            text(keys)
+                .font(fonts::mono(Weight::Medium))
+                .size(crate::text_scale::px(13.0))
+                .color(color(p.text_muted)),
+        );
+    }
+    button(contents)
         .width(Length::Fill)
         .padding(Padding {
             top: 8.0,

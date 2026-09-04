@@ -1,12 +1,22 @@
 //! Line-level text diffing, independent of `git` — the diff panel feeds it
 //! `HEAD`'s blob text (from `git::Repo::head_text`) against the live buffer.
-use similar::{ChangeTag, TextDiff};
+use similar::{ChangeTag, TextDiff, WhitespaceMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
     Equal,
     Insert,
     Delete,
+}
+
+impl From<ChangeTag> for DiffLineKind {
+    fn from(tag: ChangeTag) -> Self {
+        match tag {
+            ChangeTag::Equal => DiffLineKind::Equal,
+            ChangeTag::Insert => DiffLineKind::Insert,
+            ChangeTag::Delete => DiffLineKind::Delete,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -19,22 +29,59 @@ pub struct DiffLine {
     pub text: String,
 }
 
-/// A line-by-line diff of `old` against `new`, in document order.
+/// A line-by-line diff of `old` against `new`, in document order. Exact
+/// whitespace comparison — see `diff_lines_ignoring_whitespace` for the
+/// "Ignore Whitespace" diff-view toggle's version of this.
 pub fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
-    TextDiff::from_lines(old, new)
+    diff_lines_with_mode(old, new, WhitespaceMode::Exact)
+}
+
+/// Same as `diff_lines`, but a line that only differs from its counterpart
+/// by whitespace (leading/trailing/run-length — git's `-w`/`--ignore-all-space`)
+/// diffs as `Equal` instead of `Insert`/`Delete`. Line splitting itself is
+/// untouched (same tokenizer either way), so `old_line`/`new_line` indices
+/// and hunk/gutter-mark grouping downstream behave identically either way —
+/// only *which* lines count as changed differs.
+pub fn diff_lines_ignoring_whitespace(old: &str, new: &str) -> Vec<DiffLine> {
+    diff_lines_with_mode(old, new, WhitespaceMode::IgnoreAll)
+}
+
+fn diff_lines_with_mode(old: &str, new: &str, mode: WhitespaceMode) -> Vec<DiffLine> {
+    TextDiff::configure()
+        .whitespace_mode(mode)
+        .diff_lines(old, new)
         .iter_all_changes()
-        .map(|change| {
-            let kind = match change.tag() {
-                ChangeTag::Equal => DiffLineKind::Equal,
-                ChangeTag::Insert => DiffLineKind::Insert,
-                ChangeTag::Delete => DiffLineKind::Delete,
-            };
-            DiffLine {
-                kind,
-                old_line: change.old_index(),
-                new_line: change.new_index(),
-                text: change.value().trim_end_matches(['\n', '\r']).to_string(),
-            }
+        .map(|change| DiffLine {
+            kind: change.tag().into(),
+            old_line: change.old_index(),
+            new_line: change.new_index(),
+            text: change.value().trim_end_matches(['\n', '\r']).to_string(),
+        })
+        .collect()
+}
+
+/// One word (or run of whitespace/punctuation — `similar`'s word tokenizer,
+/// not a linguistic one) of a single-line word-level diff — see `diff_words`.
+#[derive(Debug, Clone)]
+pub struct WordSpan {
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
+/// A word-level diff of two *single lines* (typically a paired `Delete`
+/// then `Insert` from the same `Hunk`) — the change list `diff_lines` would
+/// give two whole-line entries for, broken down further so the diff view
+/// can highlight just the changed words within an otherwise-similar line
+/// instead of tinting the entire line uniformly. `Equal` spans appear on
+/// both `old`'s and `new`'s own reconstruction; `Delete` spans only belong
+/// to `old`'s, `Insert` spans only to `new`'s — same filtering
+/// `diff_row_spans` in `diff_view.rs` does.
+pub fn diff_words(old: &str, new: &str) -> Vec<WordSpan> {
+    TextDiff::from_words(old, new)
+        .iter_all_changes()
+        .map(|change| WordSpan {
+            kind: change.tag().into(),
+            text: change.value().to_string(),
         })
         .collect()
 }
