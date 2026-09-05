@@ -74,6 +74,7 @@ fn sample_settings() -> Settings {
         density: Density::Compact,
         ui_font_scale: 1.2,
         editor_font_size: 16.0,
+        markdown_preview_zoom: 1.3,
         git_status_in_tree: true,
         show_hidden_files: true,
         problem_lens_enabled: false,

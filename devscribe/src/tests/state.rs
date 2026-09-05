@@ -1864,6 +1864,119 @@ fn editing_a_markdown_buffer_reparses_the_preview_only_once_settled() {
 }
 
 #[test]
+fn markdown_headings_are_extracted_in_order_with_deduped_slugs() {
+    let text = "\
+# Title
+
+Intro paragraph.
+
+## Setup
+
+Setup text.
+
+## Setup
+
+Duplicate heading text.
+";
+    let editor = EditorState::new(Document::from_str(text), PathBuf::from("t.md"));
+
+    let headings: Vec<(u8, &str, &str)> =
+        editor.markdown_headings.iter().map(|h| (h.level, h.text.as_str(), h.slug.as_str())).collect();
+    assert_eq!(
+        headings,
+        vec![(1, "Title", "title"), (2, "Setup", "setup"), (2, "Setup", "setup-1")],
+        "duplicate heading text must get a de-duplicated slug, GitHub-anchor style"
+    );
+
+    let offsets: Vec<f32> = editor.markdown_headings.iter().map(|h| h.offset).collect();
+    assert!(
+        offsets.windows(2).all(|w| w[0] < w[1]),
+        "headings must be offset in increasing, document order: {offsets:?}"
+    );
+    assert!(offsets.iter().all(|&o| (0.0..1.0).contains(&o)), "offsets must stay within [0, 1): {offsets:?}");
+}
+
+/// A scratch dir for `handle_markdown_link` tests, which (unlike
+/// `TempFiles`) needs a nested directory so a `../`-relative link has
+/// somewhere real to resolve against. Cleaned up on drop, same as
+/// `TempFiles`.
+struct TempMarkdownProject {
+    dir: PathBuf,
+}
+
+impl TempMarkdownProject {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "devscribe-markdown-link-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        Self { dir }
+    }
+}
+
+impl Drop for TempMarkdownProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn markdown_link_click_resolves_a_relative_path_to_a_new_tab() {
+    let project = TempMarkdownProject::new("relative");
+    let guide = project.dir.join("docs").join("guide.md");
+    let readme = project.dir.join("README.md");
+    std::fs::write(&guide, "# Guide\n\nSee [readme](../README.md).\n").unwrap();
+    std::fs::write(&readme, "# Readme\n").unwrap();
+
+    let mut state = State { root: project.dir.clone(), ..State::default() };
+    open_or_focus_file(&mut state, guide.clone());
+    assert_eq!(state.open_tabs.len(), 1);
+
+    let _task = handle_markdown_link(&mut state, Pane::Primary, "../README.md");
+
+    assert_eq!(state.open_tabs.len(), 2, "a resolvable relative link opens a new tab instead of shelling out");
+    assert_eq!(state.active_tab, Some(TabKey::File(readme.canonicalize().unwrap())));
+}
+
+#[test]
+fn markdown_link_click_same_document_anchor_does_not_open_a_new_tab() {
+    let project = TempMarkdownProject::new("anchor");
+    let guide = project.dir.join("guide.md");
+    std::fs::write(&guide, "# Guide\n\n## Conclusion\n\nThe end.\n").unwrap();
+
+    let mut state = State { root: project.dir.clone(), ..State::default() };
+    open_or_focus_file(&mut state, guide.clone());
+    assert_eq!(state.open_tabs.len(), 1);
+
+    let _task = handle_markdown_link(&mut state, Pane::Primary, "#conclusion");
+    assert_eq!(state.open_tabs.len(), 1, "an in-document anchor must not open a new tab");
+    assert_eq!(state.active_tab, Some(TabKey::File(guide.clone())));
+
+    // An anchor matching nothing in the document is just as much a no-op.
+    let _task = handle_markdown_link(&mut state, Pane::Primary, "#no-such-heading");
+    assert_eq!(state.open_tabs.len(), 1);
+}
+
+#[test]
+fn resolve_local_markdown_path_accepts_relative_files_and_rejects_schemes_and_missing_files() {
+    let project = TempMarkdownProject::new("resolve");
+    let image = project.dir.join("docs").join("cover.png");
+    std::fs::write(&image, "not a real png, just bytes for path resolution").unwrap();
+    let resolved = image.canonicalize().unwrap();
+
+    assert_eq!(resolve_local_markdown_path(&project.dir.join("docs"), "cover.png"), Some(resolved.clone()));
+    assert_eq!(resolve_local_markdown_path(&project.dir, "docs/cover.png"), Some(resolved));
+    assert_eq!(
+        resolve_local_markdown_path(&project.dir, "https://example.com/cover.png"),
+        None,
+        "a URL scheme must never resolve to a local file, however plausible-looking the path part"
+    );
+    assert_eq!(resolve_local_markdown_path(&project.dir, "docs/missing.png"), None, "a nonexistent file must not resolve");
+}
+
+#[test]
 fn typing_defers_the_expensive_work_and_one_settle_covers_the_whole_burst() {
     // The freeze this guards: a tree-sitter reparse, a `HEAD` blob read and
     // a whole-file LSP `didChange` on *every* keystroke measured ~37 ms per

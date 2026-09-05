@@ -51,15 +51,25 @@ pub enum TabKey {
 }
 
 /// Which editor pane a mouse/keyboard-originated `Message` came from — the
-/// primary pane (`state.active_tab`, unchanged single-pane behavior) or the
-/// secondary split pane (`state.split_tab`). Every `EditorCanvas` instance
-/// is tagged with one at construction (`shell.rs`'s `code_area`) and stamps
-/// it onto the messages it publishes, so `update()` mutates the buffer the
+/// primary pane (`state.active_tab`, unchanged single-pane behavior), the
+/// secondary split pane (`state.split_tab`), or a solo window's own pane
+/// (`state.solo_windows`). Every `EditorCanvas` instance is tagged with one
+/// at construction (`shell.rs`'s `code_area`) and stamps it onto the
+/// messages it publishes, so `update()` mutates the buffer the
 /// keystroke/click actually happened in rather than always the primary one.
+///
+/// `Solo` shares its `EditorState` with whichever tab has the same path (see
+/// `pane_file_path`) — same document, undo history, diagnostics, and LSP
+/// connection — but gets its own cursor/selection/scroll, swapped in for the
+/// duration of one message by `with_solo_view` so the two windows' viewports
+/// never fight over one shared position. LSP-assisted popups (completion,
+/// signature help, hover) and the find bar stay `Primary`-only for now, same
+/// as they already are for `Split` — extending those is a separate follow-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Primary,
     Split,
+    Solo(iced::window::Id),
 }
 
 /// One entry in `State::open_tabs`. Search isn't one of these — it's a
@@ -167,6 +177,8 @@ pub enum PaletteAction {
     DecreaseEditorFontSize,
     IncreaseUiFontScale,
     DecreaseUiFontScale,
+    IncreaseMarkdownPreviewZoom,
+    DecreaseMarkdownPreviewZoom,
     OpenSettings,
     SaveFile,
     /// Opens a blank tab with no file on disk yet ("Untitled-1", ...) — see
@@ -184,6 +196,10 @@ pub enum PaletteAction {
     /// an open tab. A no-op if `path` is already the primary pane's file —
     /// see `open_or_focus_file_in_split`.
     OpenFileInSplit(PathBuf),
+    /// Opens `path` in a brand-new, minimal OS window — see
+    /// `Message::OpenInNewWindow`. Palette-only, same reasoning
+    /// `OpenFileInSplit` gives for having no keybinding of its own.
+    OpenInNewWindow(PathBuf),
     /// The palette's `#query` syntax (workspace symbol search) — jumps to
     /// one `SymbolEntry` result, same "open (or focus), place the cursor,
     /// scroll it into view" shape as `Message::JumpToLocation`. Kept as a
@@ -415,6 +431,15 @@ pub struct State {
     /// is in flight — drives the welcome screen's "Loading workspace"
     /// overlay.
     pub loading_project: Option<LoadingProject>,
+    /// The file `Message::OpenFileDialog` picked while no project was open
+    /// yet (`welcome_open`) — since a project must have a folder root,
+    /// picking a file there bootstraps one from the file's own parent
+    /// directory (`start_loading_project`) rather than opening it directly.
+    /// This is what to do with the actual file once that load finishes:
+    /// taken and passed to `open_in_new_window` by `Message::ProjectLoaded`.
+    /// `None` when `OpenFileDialog` was used from an already-open project,
+    /// where the file opens immediately with no project load to wait on.
+    pub pending_solo_open: Option<PathBuf>,
     /// Project root the sidebar tree was walked from.
     pub root: PathBuf,
     /// Walked once at startup (filesystem walks are far too slow to redo on
@@ -592,6 +617,11 @@ pub struct State {
     /// bar, palette, settings, toasts). Independent of `editor_font_size` —
     /// see `text_scale`.
     pub ui_font_scale: f32,
+    /// Multiplies the Markdown preview's base text size
+    /// (`markdown_view.rs::view`) — independent of both `editor_font_size`
+    /// (the plain-text `code_area` the preview replaces) and `ui_font_scale`
+    /// (chrome only, never the previewed document).
+    pub markdown_preview_zoom: f32,
     /// Spaces inserted per `Tab`/removed per `Shift+Tab` — see
     /// `EditorState::indent`/`dedent`.
     pub tab_size: u8,
@@ -654,6 +684,29 @@ pub struct State {
     /// but the index is stable for as long as the mouse stays over the same
     /// segment, which is all a dwell timer needs.
     pub breadcrumb_hover: Option<(usize, Instant)>,
+    /// The id of the main, full-chrome window opened at boot — see
+    /// `main::boot`. `Message::WindowClosed` compares against this to tell
+    /// "the app is quitting" (returns `iced::exit()`) from "just a solo
+    /// window went away" (only removes that one `solo_windows` entry); also
+    /// gates `WindowResized`, so a solo window's own size never clobbers
+    /// `window_width`/`window_height` (those drive the *main* window's own
+    /// chat-panel-resize and context-menu-clamp math). `None` only for the
+    /// instant between `State::default()` and `boot()` setting it.
+    pub main_window_id: Option<iced::window::Id>,
+    /// Every currently open "solo" window — see `Message::OpenInNewWindow` —
+    /// keyed by its own window id. Each entry's file is also a normal tab in
+    /// `open_tabs` (opened via `ensure_file_open`, same as any other
+    /// background tab), so the document/diagnostics/highlighting/undo
+    /// history/LSP connection are all the exact same shared `EditorState`
+    /// that tab uses; `SoloWindow::view` is the one part that isn't shared —
+    /// see `Pane::Solo`/`with_solo_view`. This map exists so `main::view`/
+    /// `title` can tell a solo window's id apart from the main one and route
+    /// it to `ui::solo_window::view` instead of the full `ui::shell::view`.
+    /// An entry is removed the moment that window reports
+    /// `Message::WindowClosed` — closing a solo window never touches its
+    /// `open_tabs` entry, so the file stays open in the main window exactly
+    /// as if it'd never gone solo.
+    pub solo_windows: std::collections::HashMap<iced::window::Id, SoloWindow>,
 }
 
 /// A snapshot of the open tabs (in tab-bar order) taken the moment the
@@ -678,6 +731,11 @@ pub const UI_FONT_SCALE_MIN: f32 = 0.8;
 pub const UI_FONT_SCALE_MAX: f32 = 1.5;
 pub const UI_FONT_SCALE_DEFAULT: f32 = 1.0;
 pub const UI_FONT_SCALE_STEP: f32 = 0.1;
+
+pub const MARKDOWN_PREVIEW_ZOOM_MIN: f32 = 0.6;
+pub const MARKDOWN_PREVIEW_ZOOM_MAX: f32 = 2.0;
+pub const MARKDOWN_PREVIEW_ZOOM_DEFAULT: f32 = 1.0;
+pub const MARKDOWN_PREVIEW_ZOOM_STEP: f32 = 0.1;
 
 pub const TAB_SIZE_MIN: u8 = 2;
 pub const TAB_SIZE_MAX: u8 = 8;
@@ -752,6 +810,7 @@ impl Default for State {
             recent_projects,
             welcome_rows,
             loading_project: None,
+            pending_solo_open: None,
             root,
             tree: snapshot.tree,
             collapsed_dirs: snapshot.collapsed_dirs,
@@ -803,6 +862,7 @@ impl Default for State {
             diff_view_mode: DiffViewMode::default(),
             editor_font_size: settings.editor_font_size,
             ui_font_scale: settings.ui_font_scale,
+            markdown_preview_zoom: settings.markdown_preview_zoom,
             tab_size: settings.tab_size,
             show_line_numbers: settings.show_line_numbers,
             word_wrap: settings.word_wrap,
@@ -818,6 +878,8 @@ impl Default for State {
             tab_hover: None,
             tab_switcher: None,
             breadcrumb_hover: None,
+            main_window_id: None,
+            solo_windows: std::collections::HashMap::new(),
         };
 
         if !state.welcome_open {
@@ -1122,10 +1184,14 @@ pub enum Message {
     FilesChanged(Vec<WatchEvent>),
     JsonToggle(String),
     JsonToggleTextMode,
-    MarkdownToggleTextMode,
-    /// A link clicked in the Markdown preview (`markdown_view.rs`) — handed
-    /// to `open_externally`, the OS's default handler for it.
-    OpenMarkdownLink(String),
+    MarkdownToggleTextMode { pane: Pane },
+    /// The table-of-contents panel's expand/collapse toggle
+    /// (`markdown_view.rs`).
+    MarkdownToggleToc { pane: Pane },
+    /// A link (or table-of-contents entry, which is just a link to its own
+    /// heading) clicked in the Markdown preview (`markdown_view.rs`) —
+    /// resolved by `editor::handle_markdown_link`.
+    OpenMarkdownLink { pane: Pane, url: String },
     ToggleDirCollapsed(PathBuf),
     SearchQueryChanged(String),
     /// Enter in the search box — starts a search immediately, bypassing
@@ -1183,9 +1249,24 @@ pub enum Message {
     /// a project is open, same guard the watcher subscription itself uses.
     WindowFocused,
     /// The window was opened or resized — tracked for the chat panel's
-    /// right-edge resize math and for clamping context menus on-screen;
-    /// see `State::window_width`/`window_height`.
-    WindowResized(f32, f32),
+    /// right-edge resize math and for clamping context menus on-screen; see
+    /// `State::window_width`/`window_height`. Carries the id so a solo
+    /// window's own size (see `solo_windows`) never overwrites those — only
+    /// applied when the id matches `main_window_id`.
+    WindowResized(iced::window::Id, f32, f32),
+    /// Any window — main or solo — was closed. Drops that id's
+    /// `solo_windows` entry, if any; if it's `main_window_id` itself, exits
+    /// the whole app (a `Daemon`, unlike the old single-window
+    /// `Application`, doesn't do this on its own — see `main::main`).
+    WindowClosed(iced::window::Id),
+    /// Opens `path` in a brand-new, minimal OS window — bare breadcrumb
+    /// strip + editor canvas, no sidebar/tab bar/chat panel — for
+    /// distraction-free editing of one file alongside the main window. Adds
+    /// it to `open_tabs` like any other background tab (`ensure_file_open`)
+    /// rather than something window-local, so LSP/highlighting/git status
+    /// all work exactly as they do for a normal tab; doesn't touch
+    /// `active_tab`/`split_tab` in the main window. See `solo_windows`.
+    OpenInNewWindow(PathBuf),
     /// The cursor moved anywhere in the window — tracked only so a
     /// right-click's position is known when the message it fires
     /// (`OpenTreeContext`) can't carry one itself; see `State::mouse_pos`.
@@ -1195,6 +1276,7 @@ pub enum Message {
     OpenShortcutsHelp,
     SetEditorFontSize(f32),
     SetUiFontScale(f32),
+    SetMarkdownPreviewZoom(f32),
     SetTabSize(u8),
     ToggleShowLineNumbers,
     ToggleWordWrap,
@@ -1340,6 +1422,16 @@ pub enum Message {
     /// cancelled it. The `bool` is `OpenFolderDialog` (`false`) vs.
     /// `NewProjectDialog` (`true`) — whether to `git init` the result.
     FolderDialogResult(Option<PathBuf>, bool),
+    /// "Open file…" — welcome screen or the sidebar projects dropdown.
+    /// Unlike `OpenFolderDialog`, this doesn't replace the current project:
+    /// from an already-open one, the picked file is just added as a
+    /// background tab and shown in its own solo window (see
+    /// `open_in_new_window`); from the welcome screen, see
+    /// `pending_solo_open`.
+    OpenFileDialog,
+    /// The async file-picker dialog finished. `None` means the user
+    /// cancelled it.
+    FileDialogResult(Option<PathBuf>),
     /// A row in the welcome screen's recent list or the sidebar's projects
     /// dropdown was clicked.
     RecentProjectPicked(PathBuf),
@@ -1420,7 +1512,21 @@ pub enum Message {
 /// that something is promoted to primary rather than leaving an empty
 /// primary pane next to a lone split one.
 pub fn update(state: &mut State, message: Message) -> iced::Task<Message> {
+    // Brackets a `Pane::Solo`-tagged message with `enter_solo_view`/
+    // `exit_solo_view` so `update_impl`'s own `find_editor_mut(state, &path)`
+    // calls (unaware of `pane` — they only ever look up by path) transparently
+    // mutate that window's own cursor/selection/scroll rather than whichever
+    // tab's happened to be resident in the shared `EditorState`. A no-op for
+    // every other message, `Primary`/`Split` included — see `Pane`'s own doc
+    // comment for why those two don't need this at all.
+    let solo = match message_pane(&message) {
+        Some(Pane::Solo(id)) => enter_solo_view(state, id).map(|(path, stashed)| (id, path, stashed)),
+        _ => None,
+    };
     let task = update_impl(state, message);
+    if let Some((id, path, stashed)) = solo {
+        exit_solo_view(state, id, path, stashed);
+    }
     if state.active_tab.is_none() && state.split_tab.is_some() {
         state.active_tab = state.split_tab.take();
     } else if state.split_tab.is_some() && state.split_tab == state.active_tab {
@@ -1880,14 +1986,21 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
         Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
         Message::SelectFile(path) => open_or_focus_file(state, path),
-        Message::MarkdownToggleTextMode => {
-            if let Some(path) = active_file_path(state)
+        Message::MarkdownToggleTextMode { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.markdown_text_mode = !editor.markdown_text_mode;
             }
         }
-        Message::OpenMarkdownLink(url) => open_externally(&url),
+        Message::MarkdownToggleToc { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.markdown_toc_open = !editor.markdown_toc_open;
+            }
+        }
+        Message::OpenMarkdownLink { pane, url } => return handle_markdown_link(state, pane, &url),
         Message::EditorInsertText { text, pane } => {
             if let Some(path) = pane_file_path(state, pane) {
                 // Intercept Enter when the completion popup is open — select
@@ -2593,9 +2706,21 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 refresh_changed_files(state);
             }
         }
-        Message::WindowResized(width, height) => {
-            state.window_width = width;
-            state.window_height = height;
+        Message::WindowResized(id, width, height) => {
+            if state.main_window_id == Some(id) {
+                state.window_width = width;
+                state.window_height = height;
+            }
+        }
+        Message::WindowClosed(id) => {
+            state.solo_windows.remove(&id);
+            if state.main_window_id == Some(id) {
+                return iced::exit();
+            }
+        }
+        Message::OpenInNewWindow(path) => {
+            state.ctx_menu = None;
+            return open_in_new_window(state, path);
         }
         Message::MouseMoved(pos) => state.mouse_pos = pos,
         Message::OpenShortcutsHelp => {
@@ -2609,6 +2734,10 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::SetUiFontScale(scale) => {
             state.ui_font_scale = scale.clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
+            persist_settings(state);
+        }
+        Message::SetMarkdownPreviewZoom(zoom) => {
+            state.markdown_preview_zoom = zoom.clamp(MARKDOWN_PREVIEW_ZOOM_MIN, MARKDOWN_PREVIEW_ZOOM_MAX);
             persist_settings(state);
         }
         Message::SetTabSize(size) => {
@@ -2887,6 +3016,29 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 return start_loading_project(state, path, init_git);
             }
         }
+        Message::OpenFileDialog => {
+            state.projects_open = false;
+            return iced::Task::perform(pick_file(), Message::FileDialogResult);
+        }
+        Message::FileDialogResult(path) => {
+            let Some(path) = path else {
+                return iced::Task::none();
+            };
+            // No project open yet — a project needs a folder root, so
+            // bootstrap one from the picked file's own parent directory,
+            // then open the file itself once that finishes loading (see
+            // `pending_solo_open`). Already in a project: just add it and
+            // pop the solo window immediately, no load to wait on.
+            if state.welcome_open {
+                if state.loading_project.is_some() {
+                    return iced::Task::none();
+                }
+                state.pending_solo_open = Some(path.clone());
+                let root = path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone());
+                return start_loading_project(state, root, false);
+            }
+            return open_in_new_window(state, path);
+        }
         Message::RecentProjectPicked(path) => {
             state.projects_open = false;
             if state.loading_project.is_none() {
@@ -2894,7 +3046,12 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::CloseProject => close_project(state),
-        Message::ProjectLoaded(loaded) => apply_loaded_project(state, *loaded),
+        Message::ProjectLoaded(loaded) => {
+            apply_loaded_project(state, *loaded);
+            if let Some(path) = state.pending_solo_open.take() {
+                return open_in_new_window(state, path);
+            }
+        }
         Message::SaveAsResult(old_path, new_path) => {
             if let Some(new_path) = new_path {
                 complete_save_as(state, old_path, new_path);
@@ -3231,12 +3388,23 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
                 (state.ui_font_scale - UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX);
             persist_settings(state);
         }
+        PaletteAction::IncreaseMarkdownPreviewZoom => {
+            state.markdown_preview_zoom = (state.markdown_preview_zoom + MARKDOWN_PREVIEW_ZOOM_STEP)
+                .clamp(MARKDOWN_PREVIEW_ZOOM_MIN, MARKDOWN_PREVIEW_ZOOM_MAX);
+            persist_settings(state);
+        }
+        PaletteAction::DecreaseMarkdownPreviewZoom => {
+            state.markdown_preview_zoom = (state.markdown_preview_zoom - MARKDOWN_PREVIEW_ZOOM_STEP)
+                .clamp(MARKDOWN_PREVIEW_ZOOM_MIN, MARKDOWN_PREVIEW_ZOOM_MAX);
+            persist_settings(state);
+        }
         PaletteAction::OpenSettings => state.settings_open = true,
         PaletteAction::SaveFile => return save_current_file(state),
         PaletteAction::NewUntitledFile => begin_untitled_buffer(state),
         PaletteAction::GoToLine(line) => return goto_line(state, line),
         PaletteAction::ToggleSplitView => toggle_split_view(state),
         PaletteAction::OpenFileInSplit(path) => open_or_focus_file_in_split(state, path),
+        PaletteAction::OpenInNewWindow(path) => return open_in_new_window(state, path),
         PaletteAction::JumpToSymbolLocation { path, line, col } => {
             open_or_focus_file(state, path.clone());
             if let Some(editor) = find_editor_mut(state, &path) {
@@ -3262,6 +3430,7 @@ fn persist_settings(state: &State) {
         density: state.density,
         ui_font_scale: state.ui_font_scale,
         editor_font_size: state.editor_font_size,
+        markdown_preview_zoom: state.markdown_preview_zoom,
         git_status_in_tree: state.git_status_in_tree,
         show_hidden_files: state.show_hidden_files,
         problem_lens_enabled: state.problem_lens_enabled,
@@ -3481,6 +3650,17 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
             });
         }
     }
+    for path in fs_tree::flatten_files(&state.tree) {
+        let label = path
+            .strip_prefix(&state.root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        entries.push(PaletteEntry {
+            label: format!("Open in New Window: {label}"),
+            action: PaletteAction::OpenInNewWindow(path.to_path_buf()),
+        });
+    }
 
     for mode in ThemeMode::ALL {
         entries.push(PaletteEntry {
@@ -3562,6 +3742,14 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
     entries.push(PaletteEntry {
         label: "Decrease UI font size".to_string(),
         action: PaletteAction::DecreaseUiFontScale,
+    });
+    entries.push(PaletteEntry {
+        label: "Increase Markdown preview zoom".to_string(),
+        action: PaletteAction::IncreaseMarkdownPreviewZoom,
+    });
+    entries.push(PaletteEntry {
+        label: "Decrease Markdown preview zoom".to_string(),
+        action: PaletteAction::DecreaseMarkdownPreviewZoom,
     });
     entries.push(PaletteEntry {
         label: "Open Settings".to_string(),
@@ -3733,15 +3921,16 @@ fn global_keys(event: keyboard::Event) -> Message {
 }
 
 /// Maps `iced::window::events()` to `Message::WindowUnfocused`/`WindowFocused`/
-/// `WindowResized`, the variants anything here cares about — every other
-/// window event (move, redraw…) is a no-op.
-fn window_events((_id, event): (iced::window::Id, iced::window::Event)) -> Message {
+/// `WindowResized`/`WindowClosed`, the variants anything here cares about —
+/// every other window event (move, redraw…) is a no-op.
+fn window_events((id, event): (iced::window::Id, iced::window::Event)) -> Message {
     match event {
         iced::window::Event::Unfocused => Message::WindowUnfocused,
         iced::window::Event::Focused => Message::WindowFocused,
         iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size) => {
-            Message::WindowResized(size.width, size.height)
+            Message::WindowResized(id, size.width, size.height)
         }
+        iced::window::Event::Closed => Message::WindowClosed(id),
         _ => Message::Noop,
     }
 }

@@ -17,6 +17,7 @@ pub mod search_view;
 pub mod settings_panel;
 pub mod shell;
 pub mod sidebar;
+pub mod solo_window;
 pub mod status_bar;
 pub mod tab_bar;
 pub mod title_bar;

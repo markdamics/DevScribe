@@ -484,6 +484,7 @@ pub fn projects_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
             column(rows).spacing(2.0),
             widgets::hline(color(p.border_hairline)),
             projects_menu_row("+", "Open folder\u{2026}", Message::OpenFolderDialog, p),
+            projects_menu_row("\u{25a3}", "Open file\u{2026}", Message::OpenFileDialog, p),
             projects_menu_row("\u{21a9}", "Close project", Message::CloseProject, p),
         ]
         .spacing(8.0)

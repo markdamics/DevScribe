@@ -19,14 +19,38 @@ use std::path::Path;
 
 use iced::font::Weight;
 use iced::window;
-use iced::Element;
+use iced::{Element, Task};
 use state::{Message, State};
 
 const ICON_RGBA: &[u8] = include_bytes!("../assets/icons/devscribe-icon-64.rgba");
 const ICON_SIZE: u32 = 64;
 
-fn view(state: &State) -> Element<'_, Message> {
-    ui::shell::view(state)
+/// Opens the main window itself, since a `Daemon` (unlike the old
+/// single-window `Application`) doesn't open one automatically — see
+/// `state::State::main_window_id`'s own doc comment for why `update` needs
+/// to know this id, and `main`'s own comment for why this is a `Daemon` at
+/// all rather than `Application`.
+fn boot() -> (State, Task<Message>) {
+    let mut state = State::default();
+    let (id, opened) = window::open(window::Settings {
+        icon: Some(window_icon()),
+        maximized: true,
+        size: (1280.0, 800.0).into(),
+        ..window::Settings::default()
+    });
+    state.main_window_id = Some(id);
+    (state, opened.map(|_| Message::Noop))
+}
+
+fn view(state: &State, window: window::Id) -> Element<'_, Message> {
+    ui::shell::view(state, window)
+}
+
+fn title(state: &State, window: window::Id) -> String {
+    match state.solo_windows.get(&window) {
+        Some(solo) => solo.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "DevScribe".into()),
+        None => "DevScribe".into(),
+    }
 }
 
 fn window_icon() -> window::Icon {
@@ -51,16 +75,17 @@ pub fn main() -> iced::Result {
 
     logging::init();
 
-    let mut app = iced::application(State::default, state::update, view)
-        .title("DevScribe")
+    // `daemon` rather than `application`: `Message::OpenInNewWindow` needs a
+    // second, independently-titled OS window (see `ui::solo_window`), and
+    // `application`'s `view`/`title` builders only ever take `&State` — no
+    // `window::Id` — so there's no way to tell which window is which. `boot`
+    // opens the main window itself, and `Message::WindowClosed` calls
+    // `iced::exit()` when it goes away, since a `Daemon` otherwise keeps
+    // running once every window has closed.
+    let mut app = iced::daemon(boot, state::update, view)
+        .title(title)
         .default_font(fonts::sans(Weight::Normal))
-        .subscription(state::subscription)
-        .window(window::Settings {
-            icon: Some(window_icon()),
-            maximized: true,
-            ..window::Settings::default()
-        })
-        .window_size((1280.0, 800.0));
+        .subscription(state::subscription);
 
     for bytes in fonts::BYTES {
         app = app.font(*bytes);

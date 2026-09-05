@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{self, EditorState, Message, State};
+use crate::state::{self, EditorState, Message, Pane, State};
 use crate::widgets;
 
 const HEIGHT: f32 = 30.0;
@@ -143,7 +143,11 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
         right = right.push(toggle_view_button("Tree View", Message::JsonToggleTextMode, p));
     }
     if editor.markdown.is_some() && editor.markdown_text_mode {
-        right = right.push(toggle_view_button("Preview", Message::MarkdownToggleTextMode, p));
+        right = right.push(toggle_view_button(
+            "Preview",
+            Message::MarkdownToggleTextMode { pane: Pane::Primary },
+            p,
+        ));
     }
     if let Some((inserted, deleted)) = diff_counts {
         if inserted > 0 || deleted > 0 {

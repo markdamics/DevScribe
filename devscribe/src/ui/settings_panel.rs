@@ -27,8 +27,9 @@ use crate::fonts;
 use crate::server_install;
 use crate::state::{
     self, Message, SettingsCategory, State, ThemePreview, EDITOR_FONT_SIZE_MAX,
-    EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_STEP, TAB_SIZE_MAX, TAB_SIZE_MIN, TAB_SIZE_STEP,
-    UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
+    EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_STEP, MARKDOWN_PREVIEW_ZOOM_MAX,
+    MARKDOWN_PREVIEW_ZOOM_MIN, MARKDOWN_PREVIEW_ZOOM_STEP, TAB_SIZE_MAX, TAB_SIZE_MIN,
+    TAB_SIZE_STEP, UI_FONT_SCALE_MAX, UI_FONT_SCALE_MIN, UI_FONT_SCALE_STEP,
 };
 use crate::widgets;
 
@@ -125,6 +126,22 @@ fn ui_scale_row(state: &State, p: Palette) -> Element<'static, Message> {
         Message::SetUiFontScale((scale + UI_FONT_SCALE_STEP).clamp(UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX)),
         scale > UI_FONT_SCALE_MIN + f32::EPSILON,
         scale < UI_FONT_SCALE_MAX - f32::EPSILON,
+        p,
+    )
+}
+
+fn markdown_zoom_row(state: &State, p: Palette) -> Element<'static, Message> {
+    let zoom = state.markdown_preview_zoom;
+    stepper_row(
+        format!("{:.0}%", zoom * 100.0),
+        Message::SetMarkdownPreviewZoom(
+            (zoom - MARKDOWN_PREVIEW_ZOOM_STEP).clamp(MARKDOWN_PREVIEW_ZOOM_MIN, MARKDOWN_PREVIEW_ZOOM_MAX),
+        ),
+        Message::SetMarkdownPreviewZoom(
+            (zoom + MARKDOWN_PREVIEW_ZOOM_STEP).clamp(MARKDOWN_PREVIEW_ZOOM_MIN, MARKDOWN_PREVIEW_ZOOM_MAX),
+        ),
+        zoom > MARKDOWN_PREVIEW_ZOOM_MIN + f32::EPSILON,
+        zoom < MARKDOWN_PREVIEW_ZOOM_MAX - f32::EPSILON,
         p,
     )
 }
@@ -560,6 +577,7 @@ fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
     column![
         column![section_label("FONT SIZE", p), font_size_row(state, p)].spacing(8.0),
         column![section_label("TAB SIZE", p), tab_size_row(state, p)].spacing(8.0),
+        column![section_label("MARKDOWN PREVIEW ZOOM", p), markdown_zoom_row(state, p)].spacing(8.0),
         column![
             section_label("GUTTER", p),
             toggle_row(

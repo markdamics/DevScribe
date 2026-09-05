@@ -655,6 +655,13 @@ pub async fn pick_folder() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new().pick_folder().await.map(|handle| handle.path().to_path_buf())
 }
 
+/// The native async file picker behind `OpenFileDialog` — "just open one
+/// file," as opposed to `pick_folder`'s "open a whole project." Same no
+/// parent-window-handle shape.
+pub async fn pick_file() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new().pick_file().await.map(|handle| handle.path().to_path_buf())
+}
+
 /// Starts a background project load: optionally `git init`s `path` (for
 /// "New project", when it isn't already a repo), then computes a full
 /// `snapshot_project`. Guarded by the caller checking `loading_project` is

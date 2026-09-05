@@ -142,7 +142,10 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         if let Some(target) = ctx.target.clone() {
             rows.push(widgets::hline(color(p.border_hairline)));
             rows.push(menu_row("Rename", "\u{21b5}", Message::BeginRename(target.clone()), p));
-            rows.push(menu_row("Copy path", "\u{2325}\u{2318}C", Message::CopyPath(target), p));
+            rows.push(menu_row("Copy path", "\u{2325}\u{2318}C", Message::CopyPath(target.clone()), p));
+            if !target.is_dir() {
+                rows.push(menu_row("Open in New Window", "", Message::OpenInNewWindow(target.clone()), p));
+            }
             rows.push(widgets::hline(color(p.border_hairline)));
             rows.push(danger_menu_row("Delete", Message::PromptDeletePath, p));
         }

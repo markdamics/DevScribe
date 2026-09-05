@@ -30,6 +30,11 @@ pub struct Settings {
     pub density: Density,
     pub ui_font_scale: f32,
     pub editor_font_size: f32,
+    /// Multiplies the Markdown preview's base text size (`markdown_view.rs`)
+    /// — independent of `editor_font_size` (that's the plain-text `code_area`
+    /// the preview replaces) and `ui_font_scale` (chrome only, never the
+    /// previewed document itself).
+    pub markdown_preview_zoom: f32,
     pub git_status_in_tree: bool,
     pub show_hidden_files: bool,
     pub problem_lens_enabled: bool,
@@ -56,6 +61,7 @@ impl Default for Settings {
             density: Density::default(),
             ui_font_scale: crate::state::UI_FONT_SCALE_DEFAULT,
             editor_font_size: crate::state::EDITOR_FONT_SIZE_DEFAULT,
+            markdown_preview_zoom: crate::state::MARKDOWN_PREVIEW_ZOOM_DEFAULT,
             git_status_in_tree: true,
             show_hidden_files: false,
             problem_lens_enabled: true,
@@ -105,6 +111,8 @@ struct SettingsFile {
     ui_font_scale: f32,
     #[serde(default = "default_editor_font_size")]
     editor_font_size: f32,
+    #[serde(default = "default_markdown_preview_zoom")]
+    markdown_preview_zoom: f32,
     #[serde(default = "default_true")]
     git_status_in_tree: bool,
     #[serde(default)]
@@ -139,6 +147,10 @@ fn default_ui_font_scale() -> f32 {
 
 fn default_editor_font_size() -> f32 {
     crate::state::EDITOR_FONT_SIZE_DEFAULT
+}
+
+fn default_markdown_preview_zoom() -> f32 {
+    crate::state::MARKDOWN_PREVIEW_ZOOM_DEFAULT
 }
 
 fn default_chat_panel_width() -> f32 {
@@ -230,6 +242,7 @@ fn load_from(path: &Path) -> Option<Settings> {
         density: density_from_key(&file.density).unwrap_or(defaults.density),
         ui_font_scale: file.ui_font_scale,
         editor_font_size: file.editor_font_size,
+        markdown_preview_zoom: file.markdown_preview_zoom,
         git_status_in_tree: file.git_status_in_tree,
         show_hidden_files: file.show_hidden_files,
         problem_lens_enabled: file.problem_lens_enabled,
@@ -268,6 +281,7 @@ fn save_to(path: &Path, settings: &Settings) {
         density: density_key(settings.density).to_string(),
         ui_font_scale: settings.ui_font_scale,
         editor_font_size: settings.editor_font_size,
+        markdown_preview_zoom: settings.markdown_preview_zoom,
         git_status_in_tree: settings.git_status_in_tree,
         show_hidden_files: settings.show_hidden_files,
         problem_lens_enabled: settings.problem_lens_enabled,

@@ -14,7 +14,7 @@ use crate::ui::{
 };
 use crate::widgets;
 
-fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Element<'static, Message> {
+pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Element<'static, Message> {
     let line_count = editor.document.line_count();
     let find_matches: Vec<(usize, usize)> = editor
         .find
@@ -23,9 +23,17 @@ fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Ele
         .unwrap_or_default();
     let find_current = editor.find.as_ref().map(|f| f.current).unwrap_or(0);
 
+    // `editor`'s own fields for `Primary`/`Split` (unchanged) — a solo
+    // window's independent, persisted cursor/selection/scroll for `Solo`,
+    // since the shared `EditorState` only ever holds that transiently, for
+    // the span of one message (`state::with_solo_view`); by the time `view()`
+    // runs again its fields are back to whichever tab actually owns them.
+    // Everything else below (document, highlights, diagnostics, find, ...)
+    // stays shared, read straight off `editor`, same as always.
+    let view = state::effective_view(state, editor, pane);
     let document = editor.document.clone();
-    let cursor = editor.cursor;
-    let selection = editor.selection();
+    let cursor = view.cursor;
+    let selection = editor.selection_for(view.cursor, view.selection_anchor);
     let caret_visible = state.caret_visible;
     let highlights = editor.highlights.clone();
     let diagnostics = editor.diagnostics.clone();
@@ -35,7 +43,7 @@ fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Ele
     let show_line_numbers = state.show_line_numbers;
     let word_wrap = state.word_wrap;
     let font_size = state.editor_font_size;
-    let scroll_offset = editor.scroll_offset;
+    let scroll_offset = view.scroll_offset;
     let max_line_chars = editor.max_line_chars();
     // Position-checked here (not trusted from storage) — see
     // `GhostCompletion`'s own doc comment. Only the suggestion's first line
@@ -43,7 +51,7 @@ fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Ele
     let ghost_text = editor
         .ghost_completion
         .as_ref()
-        .filter(|g| g.at == editor.cursor)
+        .filter(|g| g.at == view.cursor)
         .and_then(|g| g.insert_text.lines().next())
         .filter(|line| !line.is_empty())
         .map(str::to_string);
@@ -115,6 +123,7 @@ fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Ele
             .id(match pane {
                 Pane::Primary => state::editor_scroll_id(),
                 Pane::Split => state::split_editor_scroll_id(),
+                Pane::Solo(id) => state::solo_editor_scroll_id(id),
             })
             .direction(if word_wrap {
                 scrollable::Direction::Vertical(scrollable::Scrollbar::default())
@@ -236,7 +245,7 @@ fn primary_content(state: &State, p: Palette) -> Element<'_, Message> {
             if editor.json.is_some() && !editor.json_text_mode {
                 json_view::view(editor, p)
             } else if editor.markdown.is_some() && !editor.markdown_text_mode {
-                markdown_view::view(editor, p)
+                markdown_view::view(editor, Pane::Primary, state.markdown_preview_zoom, p)
             } else {
                 code_area(editor, state, Pane::Primary, p)
             }
@@ -288,7 +297,7 @@ fn split_pane_view(state: &State, p: Palette) -> Option<Element<'_, Message>> {
     let body = if editor.json.is_some() && !editor.json_text_mode {
         json_view::view(editor, p)
     } else if editor.markdown.is_some() && !editor.markdown_text_mode {
-        markdown_view::view(editor, p)
+        markdown_view::view(editor, Pane::Split, state.markdown_preview_zoom, p)
     } else {
         code_area(editor, state, Pane::Split, p)
     };
@@ -329,10 +338,17 @@ fn content_area(state: &State, p: Palette) -> Element<'_, Message> {
     }
 }
 
-pub fn view(state: &State) -> Element<'_, Message> {
+pub fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
     crate::text_scale::set(state.ui_font_scale);
 
     let p = state::active_palette(state);
+
+    // A "solo" window (`Message::OpenInNewWindow`) gets a completely
+    // different, minimal view — no sidebar/tab bar/chat panel — rather than
+    // this function's usual full-chrome body below.
+    if state.solo_windows.contains_key(&window) {
+        return crate::ui::solo_window::view(state, window, p);
+    }
 
     // No project open — the welcome screen replaces the whole editor
     // (title bar included: the window still has default OS decorations,

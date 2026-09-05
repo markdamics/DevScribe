@@ -225,6 +225,7 @@ fn right_pane(state: &State, p: Palette) -> Element<'static, Message> {
     let actions = row![
         action_button("+", "Open folder", Message::OpenFolderDialog, p),
         action_button("\u{2726}", "New project", Message::NewProjectDialog, p),
+        action_button("\u{25a3}", "Open file", Message::OpenFileDialog, p),
     ]
     .spacing(12.0);
 

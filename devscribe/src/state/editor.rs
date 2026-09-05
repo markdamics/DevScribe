@@ -317,6 +317,14 @@ pub struct EditorState {
     /// files default to the rendered preview; this flips a single tab back
     /// to the normal editable `code_area`. Ignored for non-Markdown files.
     pub markdown_text_mode: bool,
+    /// Headings harvested from `markdown`, in document order — the source
+    /// for the preview's table-of-contents panel and for resolving
+    /// `#anchor` links (both in-document and cross-file). Recomputed
+    /// alongside `markdown`, empty for non-Markdown files.
+    pub markdown_headings: Vec<MarkdownHeading>,
+    /// Whether the preview's table-of-contents panel is expanded. Ignored
+    /// for non-Markdown files, same as `markdown_text_mode`.
+    pub markdown_toc_open: bool,
     /// This file's content at `HEAD` diffed against the live buffer.
     pub diff: DiffStatus,
     /// One entry per buffer line, derived from `diff` — the editor gutter's
@@ -571,6 +579,8 @@ impl EditorState {
             json_text_mode: false,
             markdown: None,
             markdown_text_mode: false,
+            markdown_headings: Vec::new(),
+            markdown_toc_open: false,
             diff: DiffStatus::default(),
             gutter_marks: Rc::new(Vec::new()),
             hunks: Rc::new(Vec::new()),
@@ -803,11 +813,14 @@ impl EditorState {
         });
     }
 
-    /// Recomputes `markdown` from `text` (the current buffer contents), for
-    /// `.md`/`.markdown` files. Mirrors `reparse_json_with`.
+    /// Recomputes `markdown` (and `markdown_headings` alongside it) from
+    /// `text` (the current buffer contents), for `.md`/`.markdown` files.
+    /// Mirrors `reparse_json_with`.
     fn reparse_markdown_with(&mut self, text: &str) {
         self.markdown = (self.language == Some(syntax::Language::Markdown))
             .then(|| iced::widget::markdown::Content::parse(text));
+        self.markdown_headings =
+            self.markdown.as_ref().map(markdown_headings).unwrap_or_default();
     }
 
     /// `refind_with`, materializing the buffer itself. For the two callers
@@ -933,6 +946,20 @@ impl EditorState {
     /// Non-empty (start, end) char range currently selected, if any.
     pub fn selection(&self) -> Option<(usize, usize)> {
         self.selection_range().filter(|(start, end)| start != end)
+    }
+
+    /// `selection()`'s own logic, but against an explicit `cursor`/`anchor`
+    /// rather than `self.cursor`/`self.selection_anchor` — lets
+    /// `shell::code_area` compute a solo window's own selection against the
+    /// shared document without swapping its view into `self` first (that's
+    /// only done for mutations, via `with_solo_view` — rendering just reads).
+    pub fn selection_for(&self, cursor: CursorPos, anchor: Option<CursorPos>) -> Option<(usize, usize)> {
+        let (start, end) = anchor.map(|anchor| {
+            let a = self.document.char_index(anchor.line, anchor.col);
+            let b = self.document.char_index(cursor.line, cursor.col);
+            if a <= b { (a, b) } else { (b, a) }
+        })?;
+        (start != end).then_some((start, end))
     }
 
     /// The document's longest line, capped — see the field's own doc
@@ -2149,6 +2176,132 @@ pub fn split_editor_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("split-editor-scroll-area")
 }
 
+/// A solo window's own version of `editor_scroll_id` — suffixed with the
+/// window id, unlike the two fixed strings above, since there's exactly one
+/// primary and one split pane but any number of solo windows at once.
+pub fn solo_editor_scroll_id(id: iced::window::Id) -> iced::widget::Id {
+    iced::widget::Id::from(format!("solo-editor-scroll-area-{id:?}"))
+}
+
+/// A stable id for the Markdown preview's scroll area, one per pane — same
+/// per-pane-id pattern as `editor_scroll_id`/`split_editor_scroll_id`.
+/// `handle_markdown_link` snaps this to a heading's `MarkdownHeading::offset`
+/// to resolve `#anchor` links and table-of-contents clicks.
+pub fn markdown_scroll_id(pane: Pane) -> iced::widget::Id {
+    match pane {
+        Pane::Primary => iced::widget::Id::new("markdown-scroll-area"),
+        Pane::Split => iced::widget::Id::new("split-markdown-scroll-area"),
+        // Suffixed with the window id (unlike the fixed strings above)
+        // because there can be any number of these at once, unlike the one
+        // Primary and one Split pane the main window ever has.
+        Pane::Solo(id) => iced::widget::Id::from(format!("solo-markdown-scroll-area-{id:?}")),
+    }
+}
+
+/// One heading harvested from a `.md`/`.markdown` file's parsed content —
+/// what the preview's table-of-contents panel lists and what `#anchor`
+/// links resolve against (`markdown_view.rs`, `handle_markdown_link`).
+#[derive(Debug, Clone)]
+pub struct MarkdownHeading {
+    /// 1 for `#`, up to 6 for `######`.
+    pub level: u8,
+    /// Plain text of the heading, with all inline formatting stripped.
+    pub text: String,
+    /// A GitHub-style slug (lowercased, spaces to hyphens, punctuation
+    /// dropped, de-duplicated with a `-1`/`-2`/... suffix within the same
+    /// document) — matched against the fragment of a clicked `#anchor` link.
+    pub slug: String,
+    /// This heading's position in the rendered preview, as a fraction of
+    /// total content (0.0 = top, 1.0 = bottom). iced's `scrollable` only
+    /// exposes ratio-based `snap_to`, not "scroll this widget into view", so
+    /// this is a proportional estimate — weighted by each item's
+    /// approximate rendered size, not a pixel-accurate layout position.
+    pub offset: f32,
+}
+
+/// A rough, unitless "how tall does this render" weight for one top-level
+/// Markdown item — used only to spread heading offsets proportionally
+/// across the document (see `MarkdownHeading::offset`). Headings nested
+/// inside a list/quote are counted towards their container's weight, since
+/// CommonMark rarely (blockquotes aside) nests one inside those anyway.
+fn markdown_item_weight(item: &iced::widget::markdown::Item) -> f32 {
+    use iced::widget::markdown::{Bullet, Item};
+    match item {
+        Item::Heading(_, _) => 2.0,
+        Item::Paragraph(_) => 1.5,
+        Item::CodeBlock { lines, .. } => 0.5 + lines.len().max(1) as f32 * 0.6,
+        Item::List { bullets, .. } => bullets
+            .iter()
+            .map(|bullet| {
+                let (Bullet::Point { items } | Bullet::Task { items, .. }) = bullet;
+                items.iter().map(markdown_item_weight).sum::<f32>().max(1.0)
+            })
+            .sum(),
+        Item::Image { .. } => 3.0,
+        Item::Quote(items) => items.iter().map(markdown_item_weight).sum::<f32>().max(1.0),
+        Item::Rule => 0.5,
+        Item::Table { rows, .. } => 1.0 + rows.len() as f32 * 0.8,
+    }
+}
+
+/// Extracts `content`'s headings for the table-of-contents panel and
+/// `#anchor`-link resolution. See `MarkdownHeading` for what each field
+/// means and the caveats behind `offset`.
+fn markdown_headings(content: &iced::widget::markdown::Content) -> Vec<MarkdownHeading> {
+    use iced::widget::markdown::{HeadingLevel, Item};
+
+    let items = content.items();
+    let weights: Vec<f32> = items.iter().map(markdown_item_weight).collect();
+    let total: f32 = weights.iter().sum::<f32>().max(1.0);
+    // Only used to pull plain text out of a `Text`'s spans — its styling is
+    // irrelevant here, spans carry their own text regardless of `Style`.
+    let style = iced::widget::markdown::Style::from(iced::Theme::Light);
+
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut cumulative = 0.0f32;
+    let mut headings = Vec::new();
+
+    for (item, weight) in items.iter().zip(weights.iter()) {
+        if let Item::Heading(level, text) = item {
+            let plain: String =
+                text.spans(style).iter().map(|span| span.text.as_ref()).collect();
+            let base_slug = markdown_slugify(&plain);
+            let count = seen.entry(base_slug.clone()).or_insert(0);
+            let slug = if *count == 0 { base_slug } else { format!("{base_slug}-{count}") };
+            *count += 1;
+
+            headings.push(MarkdownHeading {
+                level: match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                },
+                text: plain,
+                slug,
+                offset: (cumulative / total).clamp(0.0, 1.0),
+            });
+        }
+        cumulative += weight;
+    }
+
+    headings
+}
+
+/// GitHub-style heading-anchor slug: lowercased, runs of whitespace
+/// collapsed to a single `-`, everything else that isn't alphanumeric or
+/// `-`/`_` dropped. Used both to build `MarkdownHeading::slug` and to
+/// normalize a clicked `#fragment` before matching against it, so the two
+/// sides only need to agree with each other, not with GitHub exactly.
+fn markdown_slugify(text: &str) -> String {
+    let lower: String = text.chars().flat_map(|c| c.to_lowercase()).collect();
+    let filtered: String =
+        lower.chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_').collect();
+    filtered.split_whitespace().collect::<Vec<_>>().join("-")
+}
+
 /// Finishes a Save As (`save_file_as`'s dialog result): repoints the tab
 /// from `old_path` to `new_path` in place — no close/reopen, so no lost
 /// cursor/undo/find state — then actually writes the content, since
@@ -2369,6 +2522,7 @@ pub fn scroll_cursor_into_view(state: &mut State, pane: Pane) -> iced::Task<Mess
     let scroll_id = match pane {
         Pane::Primary => editor_scroll_id(),
         Pane::Split => split_editor_scroll_id(),
+        Pane::Solo(id) => solo_editor_scroll_id(id),
     };
 
     let line_top = if word_wrap {
@@ -2475,6 +2629,7 @@ pub fn pane_file_path(state: &State, pane: Pane) -> Option<PathBuf> {
             TabKey::File(path) => Some(path.clone()),
             _ => None,
         },
+        Pane::Solo(id) => state.solo_windows.get(&id).map(|w| w.path.clone()),
     }
 }
 
@@ -2522,6 +2677,166 @@ pub fn open_or_focus_file_in_split(state: &mut State, path: PathBuf) {
     }
     state.split_tab = Some(key);
     persist_session(state);
+}
+
+/// The per-window slice of `EditorState` — cursor/selection/scroll/goal
+/// column — as opposed to the document/diagnostics/undo history/highlights
+/// every view of a file shares. `Default` is "top of file, nothing
+/// selected, unscrolled," used both for a freshly opened solo window and as
+/// the placeholder `with_solo_view` swaps into `state.solo_windows` while it
+/// briefly owns the real value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ViewSnapshot {
+    pub cursor: CursorPos,
+    pub selection_anchor: Option<CursorPos>,
+    pub scroll_offset: f32,
+    scroll_offset_x: f32,
+    viewport_height: f32,
+    viewport_width: f32,
+    goal_col: Option<usize>,
+}
+
+/// The cursor/selection/scroll `shell::code_area` should actually render for
+/// `pane` — `editor`'s own fields for `Primary`/`Split` (unchanged), or
+/// `state.solo_windows[id]`'s independent, persisted copy for `Solo`. Needed
+/// because the shared `EditorState` only ever holds a solo window's view
+/// transiently, for the span of one message (`with_solo_view`) — by the time
+/// any `view()` runs again, its fields are back to whichever tab actually
+/// owns them, so rendering has to read the persisted copy instead.
+pub fn effective_view(state: &State, editor: &EditorState, pane: Pane) -> ViewSnapshot {
+    match pane {
+        Pane::Primary | Pane::Split => editor.view_snapshot(),
+        Pane::Solo(id) => state.solo_windows.get(&id).map(|w| w.view).unwrap_or_default(),
+    }
+}
+
+impl EditorState {
+    fn view_snapshot(&self) -> ViewSnapshot {
+        ViewSnapshot {
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+            scroll_offset: self.scroll_offset,
+            scroll_offset_x: self.scroll_offset_x,
+            viewport_height: self.viewport_height,
+            viewport_width: self.viewport_width,
+            goal_col: self.goal_col,
+        }
+    }
+
+    /// Swaps `view`'s fields in, returning whatever was there before — the
+    /// "borrow this shared `EditorState` for one window's own view, then
+    /// give it back" half of `with_solo_view`. Every other field (document,
+    /// diagnostics, undo history, ...) is untouched, since those are shared
+    /// by every view of this file, solo window or not.
+    fn swap_view(&mut self, view: ViewSnapshot) -> ViewSnapshot {
+        let previous = self.view_snapshot();
+        self.cursor = view.cursor;
+        self.selection_anchor = view.selection_anchor;
+        self.scroll_offset = view.scroll_offset;
+        self.scroll_offset_x = view.scroll_offset_x;
+        self.viewport_height = view.viewport_height;
+        self.viewport_width = view.viewport_width;
+        self.goal_col = view.goal_col;
+        previous
+    }
+}
+
+/// A solo window's own entry in `state.solo_windows` — the file it shows,
+/// plus its independent cursor/selection/scroll (`ViewSnapshot`). See
+/// `Pane::Solo`/`with_solo_view` for how the latter gets swapped into the
+/// shared `EditorState` for the span of one message.
+pub struct SoloWindow {
+    pub path: PathBuf,
+    view: ViewSnapshot,
+}
+
+/// Opens `path` in a new, minimal OS window (`Message::OpenInNewWindow`) —
+/// added to `open_tabs` like any background tab (`ensure_file_open`), never
+/// touching `active_tab`/`split_tab`, so the main window's own view is
+/// completely unaffected. `window::open` hands back the new window's id
+/// synchronously (the `Task` only resolves once it's actually on screen), so
+/// `solo_windows` is updated immediately rather than waiting on that task.
+/// The new window's view starts wherever the shared editor's cursor/scroll
+/// already were (a fresh `ViewSnapshot::default()` would instead always
+/// reopen at the top of the file), then diverges independently from there.
+pub fn open_in_new_window(state: &mut State, path: PathBuf) -> iced::Task<Message> {
+    ensure_file_open(state, &path);
+    let view = find_editor(state, &path).map(EditorState::view_snapshot).unwrap_or_default();
+    let (id, opened) = iced::window::open(iced::window::Settings {
+        size: iced::Size::new(900.0, 700.0),
+        ..iced::window::Settings::default()
+    });
+    state.solo_windows.insert(id, SoloWindow { path, view });
+    opened.map(|_| Message::Noop)
+}
+
+/// Swaps `id`'s solo window's own cursor/selection/scroll into the shared
+/// `EditorState` for its file, so the rest of `update()` — in particular
+/// whichever handler `pane_file_path`/`find_editor_mut` end up in — mutates
+/// that window's own view rather than whichever tab's happened to be
+/// resident there. The "enter" half of the pair `pub fn update` wraps every
+/// `Pane::Solo`-tagged message in; `exit_solo_view` is the other half. Not a
+/// single closure-taking function (unlike this pair's read-side counterpart,
+/// `effective_view`) because the thing being wrapped is `update_impl` itself,
+/// which takes `&mut State` wholesale rather than `&mut EditorState`.
+/// Returns the file's path and whatever view was there before (the main
+/// window's own tab, if the same file happens to be open there too) — both
+/// needed by `exit_solo_view` afterward. `None` if the window's file isn't
+/// open, e.g. closed from the main window in the same instant this message
+/// was already in flight; the wrapped call then just no-ops on that path,
+/// same as any other message naming one with no matching tab.
+pub fn enter_solo_view(state: &mut State, id: iced::window::Id) -> Option<(PathBuf, ViewSnapshot)> {
+    let path = state.solo_windows.get(&id)?.path.clone();
+    let incoming = std::mem::take(&mut state.solo_windows.get_mut(&id)?.view);
+    let editor = find_editor_mut(state, &path)?;
+    let stashed = editor.swap_view(incoming);
+    Some((path, stashed))
+}
+
+/// The "exit" half of `enter_solo_view` — persists whatever the wrapped call
+/// left in the shared `EditorState`'s view fields back into `id`'s own
+/// `solo_windows` entry, then restores `stashed` so the tab `enter_solo_view`
+/// borrowed it from is left exactly as it found it.
+pub fn exit_solo_view(state: &mut State, id: iced::window::Id, path: PathBuf, stashed: ViewSnapshot) {
+    let Some(editor) = find_editor_mut(state, &path) else { return };
+    let produced = editor.swap_view(stashed);
+    if let Some(window) = state.solo_windows.get_mut(&id) {
+        window.view = produced;
+    }
+}
+
+/// The `Pane` a `Message` should be treated as coming from, for
+/// `enter_solo_view`/`exit_solo_view` to bracket around it — every variant
+/// `EditorCanvas`/the breadcrumb bar/the Markdown preview tag with one at
+/// publish time (see `Pane`'s own doc comment). Everything else (which is
+/// most messages) returns `None`, so `pub fn update`'s wrapping is a no-op
+/// for them, same as before this existed.
+pub fn message_pane(message: &Message) -> Option<Pane> {
+    match *message {
+        Message::EditorInsertText { pane, .. }
+        | Message::EditorTypeChar { pane, .. }
+        | Message::EditorBackspace { pane }
+        | Message::EditorDelete { pane }
+        | Message::EditorIndent { pane }
+        | Message::EditorDedent { pane }
+        | Message::EditorToggleComment { pane }
+        | Message::EditorMove { pane, .. }
+        | Message::EditorClick { pane, .. }
+        | Message::EditorSelectWord { pane, .. }
+        | Message::EditorSelectLine { pane, .. }
+        | Message::EditorSelectAll { pane }
+        | Message::EditorUndo { pane }
+        | Message::EditorRedo { pane }
+        | Message::EditorCopy { pane }
+        | Message::EditorCut { pane }
+        | Message::EditorPaste { pane }
+        | Message::EditorPasteWithText { pane, .. }
+        | Message::EditorScrolled { pane, .. }
+        | Message::MarkdownToggleTextMode { pane }
+        | Message::MarkdownToggleToc { pane }
+        | Message::OpenMarkdownLink { pane, .. } => Some(pane),
+        _ => None,
+    }
 }
 
 pub fn find_editor<'a>(state: &'a State, path: &Path) -> Option<&'a EditorState> {
@@ -2718,14 +3033,116 @@ pub fn apply_rename(state: &mut State, edits: Vec<(lsp::Url, Vec<lsp::TextEdit>)
     }
 }
 
-/// Hands `target` (a URL, per `Message::OpenMarkdownLink`) to the OS's
-/// default application for it — a relative/`file:` link opens whatever
-/// handles that path locally, `https:`/`mailto:` etc. go to the OS's usual
-/// browser/mail client.
+/// Hands `target` (a URL) to the OS's default application for it —
+/// `https:`/`mailto:` etc. go to the OS's usual browser/mail client. The
+/// fallback `handle_markdown_link` reaches for once it's ruled out an
+/// in-app resolution (an in-document anchor, or a local file it can open as
+/// a tab instead).
 pub fn open_externally(target: &str) {
     if let Err(err) = opener::open(target) {
         crate::logging::error(format!("failed to open {target} externally: {err}"));
     }
+}
+
+/// Resolves a Markdown preview link click (`Message::OpenMarkdownLink`,
+/// `pane`'s preview), in order:
+///
+/// 1. A bare `#fragment` (`[section](#heading)`) — scrolls `pane`'s own
+///    preview to the matching heading, if any.
+/// 2. Anything with a URL scheme (`https://...`, `mailto:...`, ...) — handed
+///    to `open_externally`, unchanged from before this resolution existed.
+/// 3. Otherwise, a relative/absolute local path (optionally with its own
+///    `#fragment`) — resolved against `pane`'s current file's directory. If
+///    it names a real file, it's opened as a tab (in `pane`) instead of
+///    shelling out, and any `#fragment` scrolls the newly opened preview.
+///    Anything that doesn't resolve to a file falls back to
+///    `open_externally`, same as an unrecognized scheme — covers bare
+///    fragment-less non-existent paths, `tel:`-style schemes this doesn't
+///    special-case, and the like.
+pub fn handle_markdown_link(state: &mut State, pane: Pane, url: &str) -> iced::Task<Message> {
+    let (path_part, fragment) = match url.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (url, None),
+    };
+
+    if path_part.is_empty() {
+        let Some(fragment) = fragment else { return iced::Task::none() };
+        let Some(current) = pane_file_path(state, pane) else { return iced::Task::none() };
+        let Some(editor) = find_editor(state, &current) else { return iced::Task::none() };
+        return scroll_to_markdown_anchor(editor, pane, fragment);
+    }
+
+    let resolved = pane_file_path(state, pane)
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(|base| resolve_local_markdown_path(base, path_part));
+
+    let Some(resolved) = resolved else {
+        open_externally(url);
+        return iced::Task::none();
+    };
+
+    match pane {
+        Pane::Primary => open_or_focus_file(state, resolved.clone()),
+        Pane::Split => open_or_focus_file_in_split(state, resolved.clone()),
+        // Retargets the same solo window to the linked file rather than
+        // opening a new tab/window — a solo window is one pane, same as
+        // Primary/Split, just with nowhere else of its own to put a second
+        // file.
+        Pane::Solo(id) => {
+            ensure_file_open(state, &resolved);
+            if let Some(window) = state.solo_windows.get_mut(&id) {
+                window.path = resolved.clone();
+                window.view = ViewSnapshot::default();
+            }
+        }
+    }
+
+    let Some(fragment) = fragment else { return iced::Task::none() };
+    let Some(editor) = find_editor(state, &resolved) else { return iced::Task::none() };
+    scroll_to_markdown_anchor(editor, pane, fragment)
+}
+
+/// Snaps `pane`'s Markdown preview scrollable to `editor`'s heading matching
+/// `fragment` (slugified the same way `MarkdownHeading::slug` was built), if
+/// any — a no-op `Task` when nothing matches.
+fn scroll_to_markdown_anchor(editor: &EditorState, pane: Pane, fragment: &str) -> iced::Task<Message> {
+    let slug = markdown_slugify(fragment);
+    let Some(heading) = editor.markdown_headings.iter().find(|heading| heading.slug == slug) else {
+        return iced::Task::none();
+    };
+
+    iced_runtime::task::widget(iced::advanced::widget::operation::scrollable::snap_to(
+        markdown_scroll_id(pane),
+        iced::widget::scrollable::RelativeOffset { x: None, y: Some(heading.offset) },
+    ))
+}
+
+/// Whether `s` starts with a URL scheme (`scheme:...`, per RFC 3986's
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) rather than a bare local
+/// path. Requires at least 2 scheme characters before the `:` so a Windows
+/// drive letter (`C:\...`) isn't mistaken for one.
+fn has_url_scheme(s: &str) -> bool {
+    match s.find(':') {
+        Some(idx) if idx >= 2 => {
+            s[..idx].chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        }
+        _ => false,
+    }
+}
+
+/// Resolves a Markdown reference's path part (a link's, with any `#fragment`
+/// already split off, or an image's `src`) against `base_dir` to a real file
+/// on disk. `None` for anything carrying a URL scheme (an external link, or
+/// a remote image) or that doesn't name an existing file — shared by
+/// `handle_markdown_link` (relative links) and `markdown_view`'s image
+/// rendering (relative image sources), so both agree on what counts as
+/// "local" and resolve it the same way.
+pub fn resolve_local_markdown_path(base_dir: &Path, path_part: &str) -> Option<PathBuf> {
+    if path_part.is_empty() || has_url_scheme(path_part) {
+        return None;
+    }
+    base_dir.join(path_part).canonicalize().ok().filter(|resolved| resolved.is_file())
 }
 
 /// Opens a diff tab for `path`, or focuses it if already open. Always

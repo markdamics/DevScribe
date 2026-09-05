@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 devscribe-core = { path = "../devscribe-core" }
 dirs = "6.0.0"
-iced = { version = "0.14", features = ["canvas", "tokio", "markdown"] }
+iced = { version = "0.14", features = ["canvas", "tokio", "markdown", "highlighter", "advanced", "image"] }
 # Only for `task::blocking` — runs project search on its own OS thread so a
 # slow/stalled file read (network mount, cloud-sync placeholder) can never
 # freeze the UI, which `iced`'s own re-exports don't expose directly.

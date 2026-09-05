@@ -13,10 +13,15 @@
 - Breadcrumb bar
 - JSON tree view
 - Markdown preview
+- Markdown preview outline (table of contents) panel
+- Markdown preview anchor-link and relative-file-link navigation
+- Markdown preview inline local images
+- Markdown preview zoom control
 - Diff view (working tree) — unified or side-by-side, word-level highlighting, ignore-whitespace toggle
 - Word wrap / density settings
 - Adjustable text scale
 - Split editor panes (side-by-side file comparison)
+- Open in New Window (minimal per-file window: header + editor/preview, no sidebar/tabs/chat)
 
 ## Language Intelligence (LSP)
 - rust-analyzer, jdtls, pyright, typescript-language-server, clangd support
@@ -47,6 +52,7 @@
 ## Project & File Management
 - Sidebar file tree
 - Open folder / New project / Close project
+- Open file… (single file via native dialog, without replacing current project)
 - Recent projects
 - New file / New folder
 - Reveal in tree
