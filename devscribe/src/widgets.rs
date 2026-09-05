@@ -4,8 +4,8 @@ use crate::fonts;
 use devscribe_core::theme::Palette;
 use iced::alignment::Vertical;
 use iced::border;
-use iced::widget::{container, text, Space};
-use iced::{Border, Color, Element, Length};
+use iced::widget::{column, container, text, Space};
+use iced::{Alignment, Border, Color, Element, Length};
 
 /// Centers `content` in both axes, filling whatever space its parent (e.g. a
 /// fixed-size `button`) allocates. `iced`'s `button`/`container` don't center
@@ -40,6 +40,36 @@ pub fn dot<'a, Message: 'a>(color: Color, size: f32) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+/// A small pin/thumbtack silhouette (head + stem) for the tab bar's "this
+/// tab is pinned" indicator — drawn from plain styled rectangles, the same
+/// `dot`-above idiom, rather than a Unicode pin glyph (`\u{1F4CC}` and
+/// similar are in the emoji block; the app only bundles JetBrains Mono,
+/// which has no emoji coverage at all, so that glyph would either fall back
+/// to a missing-glyph box or, on a platform with an emoji fallback font,
+/// render in color — the one thing every other icon in this app deliberately
+/// avoids). `size` is the head's diameter; the stem is sized off it.
+pub fn pin_icon<'a, Message: 'a>(color: Color, size: f32) -> Element<'a, Message> {
+    let head = container(Space::new().width(Length::Fixed(size)).height(Length::Fixed(size)))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |_theme| container::Style {
+            background: Some(color.into()),
+            border: border::rounded(size / 2.0),
+            ..container::Style::default()
+        });
+    let stem_width = (size * 0.3).max(1.5);
+    let stem_height = size * 0.65;
+    let stem = container(Space::new().width(Length::Fixed(stem_width)).height(Length::Fixed(stem_height)))
+        .width(Length::Fixed(stem_width))
+        .height(Length::Fixed(stem_height))
+        .style(move |_theme| container::Style {
+            background: Some(color.into()),
+            border: border::rounded(stem_width / 3.0),
+            ..container::Style::default()
+        });
+    column![head, stem].align_x(Alignment::Center).spacing(1.0).into()
 }
 
 /// A two-letter monospace language badge on a tinted square (e.g. `RS`, `TS`, `JV`).

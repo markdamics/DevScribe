@@ -36,8 +36,18 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
     let selection = editor.selection_for(view.cursor, view.selection_anchor);
     let caret_visible = state.caret_visible;
     let highlights = editor.highlights.clone();
+    // Recomputed fresh every `view()` rebuild rather than cached on
+    // `EditorState` — same reasoning as `find_matches` above: it's cheap and
+    // bounded (`bracket::MAX_BRACKET_SCAN`), and the cursor (which this
+    // depends on) already changes on essentially every rebuild anyway.
+    let bracket_match = devscribe_core::bracket::matching_bracket_pair(
+        document.text(),
+        &highlights,
+        document.char_index(cursor.line, cursor.col),
+    );
     let diagnostics = editor.diagnostics.clone();
     let gutter_marks = editor.gutter_marks.clone();
+    let content_revision = editor.revision();
     let pending_revert_line = editor.pending_revert_line;
     let problem_lens_enabled = state.problem_lens_enabled;
     let show_line_numbers = state.show_line_numbers;
@@ -82,6 +92,7 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
             highlights: highlights.clone(),
             diagnostics: diagnostics.clone(),
             gutter_marks: gutter_marks.clone(),
+            content_revision,
             pending_revert_line,
             problem_lens_enabled,
             show_line_numbers,
@@ -90,6 +101,7 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
             font_size,
             find_matches: find_matches.clone(),
             find_current,
+            bracket_match,
             scroll_offset,
             viewport_height: size.height,
             ghost_text: ghost_text.clone(),
@@ -310,26 +322,34 @@ fn split_pane_view(state: &State, p: Palette) -> Option<Element<'_, Message>> {
     )
 }
 
-/// A hairline divider between the primary and split panes — same fixed
-/// 1px-bar idiom `code_area` uses for the command palette's separators, not
-/// a drag handle: the split is a fixed 50/50, unlike the sidebar/chat
-/// panel's resizable edges.
-fn split_divider(p: Palette) -> Element<'static, Message> {
-    container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
-        .style(move |_theme| container::Style {
-            background: Some(color(p.border_hairline).into()),
-            ..container::Style::default()
-        })
-        .into()
+/// A drag handle between the primary and split panes — same 4px idiom as
+/// `sidebar::resize_handle`/`chat_panel::resize_handle`, driving
+/// `state.split_primary_width` (the primary pane's width; the split pane
+/// itself always fills whatever's left) via the same window-wide
+/// cursor-tracking subscription pattern (`Message::SplitResizeStarted`,
+/// then `state::split_resize_events` while `state.split_resizing`).
+fn split_resize_handle(p: Palette) -> Element<'static, Message> {
+    mouse_area(
+        container(Space::new().width(Length::Fixed(4.0)).height(Length::Fill))
+            .width(Length::Fixed(4.0))
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(color(p.border_hairline).into()),
+                ..container::Style::default()
+            }),
+    )
+    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+    .on_press(Message::SplitResizeStarted)
+    .into()
 }
 
 fn content_area(state: &State, p: Palette) -> Element<'_, Message> {
     let primary = primary_content(state, p);
     match split_pane_view(state, p) {
         Some(split) => row![
-            container(primary).width(Length::FillPortion(1)).height(Length::Fill),
-            split_divider(p),
-            container(split).width(Length::FillPortion(1)).height(Length::Fill),
+            container(primary).width(Length::Fixed(state.split_primary_width)).height(Length::Fill),
+            split_resize_handle(p),
+            container(split).width(Length::Fill).height(Length::Fill),
         ]
         .width(Length::Fill)
         .height(Length::Fill)

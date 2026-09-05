@@ -221,12 +221,16 @@ pub struct Palette {
     pub status_danger: Rgba,
     pub status_info: Rgba,
 
-    /// Editor syntax-highlighting hues. Not part of the Maho mockup's own
-    /// token set (its code samples were static, pre-colored HTML) — these
-    /// are DevScribe-specific, chosen for mutual contrast against each
-    /// other rather than reused from the chrome tokens above. Reusing
-    /// `accent_solid`/`status_info`/etc. for this left `Keyword` and `Type`
-    /// literally the same color and collapsed several other kinds together.
+    /// Editor syntax-highlighting hues ("Cool Spectrum"). Not part of the
+    /// Maho mockup's own token set (its code samples were static,
+    /// pre-colored HTML) — these are DevScribe-specific, chosen for mutual
+    /// contrast against each other rather than reused from the chrome
+    /// tokens above. Reusing `accent_solid`/`status_info`/etc. for this left
+    /// `Keyword` and `Type` literally the same color and collapsed several
+    /// other kinds together. Deliberately restricted to a blue/teal/green/
+    /// amber spectrum (two shades each) for the eight semantic token kinds;
+    /// `comment`/`punctuation` stay neutral cool grays since desaturated
+    /// chrome for those two is conventional regardless of theme.
     pub syntax_keyword: Rgba,
     pub syntax_type: Rgba,
     pub syntax_function: Rgba,
@@ -312,15 +316,15 @@ const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
             status_danger: Rgba::hex(0xE4714D),
             status_info: Rgba::hex(r.a400),
 
-            syntax_keyword: Rgba::hex(0xC792E0),
-            syntax_type: Rgba::hex(0x6FC2BD),
-            syntax_function: Rgba::hex(0x7AB0EA),
-            syntax_macro: Rgba::hex(0xE07BAE),
+            syntax_keyword: Rgba::hex(0x5C9EE6),
+            syntax_type: Rgba::hex(0x4FC7B8),
+            syntax_function: Rgba::hex(0x82B8F0),
+            syntax_macro: Rgba::hex(0x4FD9A0),
             syntax_string: Rgba::hex(0x8FBF6E),
             syntax_number: Rgba::hex(0xE0A25E),
             syntax_comment: Rgba::hex(0x6B7A8F),
-            syntax_constant: Rgba::hex(0xD9B65C),
-            syntax_attribute: Rgba::hex(0x8FA8C0),
+            syntax_constant: Rgba::hex(0xE8C46C),
+            syntax_attribute: Rgba::hex(0x8AD1C4),
             syntax_punctuation: Rgba::hex(0x9FADBD),
         },
         ThemeMode::Light => Palette {
@@ -358,15 +362,15 @@ const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
             status_danger: Rgba::hex(0xA84124),
             status_info: Rgba::hex(r.a600),
 
-            syntax_keyword: Rgba::hex(0x8A4FBE),
+            syntax_keyword: Rgba::hex(0x2A5DB0),
             syntax_type: Rgba::hex(0x1F8880),
-            syntax_function: Rgba::hex(0x2F6DA8),
-            syntax_macro: Rgba::hex(0xAE4788),
+            syntax_function: Rgba::hex(0x1E7FB8),
+            syntax_macro: Rgba::hex(0x2E8F6B),
             syntax_string: Rgba::hex(0x3F7A3F),
             syntax_number: Rgba::hex(0xAD6420),
             syntax_comment: Rgba::hex(0x647688),
-            syntax_constant: Rgba::hex(0x967221),
-            syntax_attribute: Rgba::hex(0x4F6E82),
+            syntax_constant: Rgba::hex(0x8F6D1C),
+            syntax_attribute: Rgba::hex(0x2E7A70),
             syntax_punctuation: Rgba::hex(0x4A5A6E),
         },
     }

@@ -21,6 +21,11 @@ pub struct SessionTab {
     pub is_diff: bool,
     pub cursor_line: usize,
     pub cursor_col: usize,
+    /// Mirrors `State::pinned_tabs` — always `false` for a `Diff` tab, which
+    /// isn't independently pinnable (see `is_tab_pinned`). `#[serde(default)]`
+    /// so a session file saved before pinning existed still loads.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Everything `state.rs`'s `capture_session`/`restore_session` round-trip.
@@ -35,6 +40,13 @@ pub struct Session {
     /// active tab at save time was `Search`/`Chat`/nothing.
     pub active_tab: Option<usize>,
     pub sidebar_width: f32,
+    /// Mirrors `State::split_primary_width` — not `split_tab` itself, which
+    /// is never restored (see its own doc comment). `#[serde(default)]` so a
+    /// session file saved before split-resize existed still loads (as `0.0`,
+    /// which `restore_session` clamps up to `SPLIT_MIN_WIDTH` the same as
+    /// any other stale/never-set value).
+    #[serde(default)]
+    pub split_primary_width: f32,
     pub sidebar_collapsed: bool,
     pub collapsed_dirs: Vec<PathBuf>,
     pub changes_panel_open: bool,
@@ -59,6 +71,10 @@ pub struct Session {
     /// the chat tab has no backing `OpenTab` entry).
     #[serde(default)]
     pub chat_tab_active: bool,
+    /// The last in-buffer find query (`State::last_find_query`) — `#[serde(default)]`
+    /// for the same reason as the `chat_*` fields above.
+    #[serde(default)]
+    pub last_find_query: String,
 }
 
 fn sessions_dir() -> Option<PathBuf> {

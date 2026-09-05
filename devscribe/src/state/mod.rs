@@ -89,6 +89,13 @@ impl OpenTab {
     }
 }
 
+/// See `State::tab_closing_ghosts`.
+#[derive(Debug, Clone)]
+pub struct ClosingTabGhost {
+    pub label: String,
+    pub started_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     Success,
@@ -280,6 +287,18 @@ pub struct State {
     /// closed. Not restored across sessions — only `open_tabs`/`active_tab`
     /// are.
     pub split_tab: Option<TabKey>,
+    /// The primary pane's width when a split is open, dragged via
+    /// `split_resize_handle` — the split pane itself always fills whatever's
+    /// left. Clamped to `[SPLIT_MIN_WIDTH, SPLIT_MAX_WIDTH]`. Persisted (see
+    /// `Session::split_primary_width`) even though `split_tab` itself isn't:
+    /// a remembered *size* is useful the next time a split is opened, but
+    /// restoring exactly *which* file was split needs its own staleness
+    /// handling (the file may be gone, or already the active tab) that
+    /// isn't worth taking on for this.
+    pub split_primary_width: f32,
+    /// `true` while the split divider is being dragged — mirrors
+    /// `sidebar_resizing`.
+    pub split_resizing: bool,
     /// `true` only while `restore_session` is re-opening tabs from a
     /// persisted session — suppresses `persist_session`'s writes for that
     /// duration so restoring a session doesn't immediately re-save a
@@ -579,6 +598,13 @@ pub struct State {
     /// The results `filtered_palette_entries` turns into `#query` mode's
     /// palette rows — see `workspace_symbol_query`.
     pub workspace_symbol_results: Vec<lsp::SymbolEntry>,
+    /// The most recent in-buffer find query (Ctrl+F/`FindState::query`),
+    /// persisted per-project (`session::Session`) so reopening the project
+    /// and pressing Ctrl+F again doesn't start from empty. Only ever a
+    /// fallback: opening find with an active selection still prefills from
+    /// that selection first, same as today — this only fills the gap where
+    /// there's nothing selected.
+    pub last_find_query: String,
     pub settings_open: bool,
     pub settings_category: SettingsCategory,
     pub density: Density,
@@ -663,6 +689,35 @@ pub struct State {
     /// `Diff` tab auto-closed with its backing `File` tab) — `ReopenClosedTab`
     /// pops and reopens the most recent. Capped at `MAX_CLOSED_TABS`.
     pub closed_tabs: Vec<TabKey>,
+    /// `File` tabs (by path) protected from `Message::CloseTab`/`CloseActiveTab`/
+    /// `CloseOtherTabs` — see `close_tab_unless_pinned`. Only ever a closure
+    /// guard, not a reordering: a pinned tab stays wherever it already sits
+    /// in `open_tabs`/the tab bar rather than jumping to the front. `Diff`/
+    /// `Search`/`Chat` tabs are never pinnable — `is_tab_pinned` is always
+    /// `false` for them.
+    pub pinned_tabs: std::collections::HashSet<PathBuf>,
+    /// Bumped by `touch_tab_mru` every time a tab becomes active through
+    /// deliberate navigation — the "clock" `tab_last_activated`'s values are
+    /// measured against, so recency only ever needs a `u64` compare, not
+    /// timestamps.
+    pub tab_activation_seq: u64,
+    /// When each `TabKey` was last activated (`tab_activation_seq`'s value
+    /// at that moment) — drives the Ctrl+Tab switcher's most-recent-first
+    /// ordering (`tab_switcher_entries`). A tab with no entry here (never
+    /// explicitly switched to, only ever cycled past) sorts as oldest.
+    pub tab_last_activated: std::collections::HashMap<TabKey, u64>,
+    /// `TabKey -> when a just-created `File`/`Diff` tab's slide-in animation
+    /// started (`ui::tab_bar::TAB_ANIM_DURATION`) — read by `tab_bar::view`
+    /// to shrink a leading spacer down to nothing, then pruned by
+    /// `Message::TabAnimTick` once elapsed. Absent for any tab that's
+    /// already settled, including every tab restored at startup — only one
+    /// opened via a live `Message` during this session animates.
+    pub tab_opening: std::collections::HashMap<TabKey, Instant>,
+    /// A just-closed tab's label, fading out in place at the end of the tab
+    /// bar — captured in `close_tab` right before the real removal, since
+    /// the tab (and its `EditorState`) is already gone by the time this
+    /// renders. Pruned by `Message::TabAnimTick` once fully faded.
+    pub tab_closing_ghosts: Vec<ClosingTabGhost>,
     /// Monotonic counter for naming untitled buffers ("Untitled-1",
     /// "Untitled-2", ...) — see `begin_untitled_buffer`. Never reused, even
     /// after the tab closes, so two buffers can never end up with the same
@@ -709,11 +764,11 @@ pub struct State {
     pub solo_windows: std::collections::HashMap<iced::window::Id, SoloWindow>,
 }
 
-/// A snapshot of the open tabs (in tab-bar order) taken the moment the
-/// Ctrl+Tab switcher opens, plus which entry is currently highlighted —
-/// further Ctrl+Tab/Ctrl+Shift+Tab presses just move `selected` through this
-/// same fixed list rather than re-deriving it (and potentially reordering
-/// mid-cycle) on every step.
+/// A snapshot of the open tabs (most-recently-activated first — see
+/// `tab_switcher_entries`) taken the moment the Ctrl+Tab switcher opens, plus
+/// which entry is currently highlighted — further Ctrl+Tab/Ctrl+Shift+Tab
+/// presses just move `selected` through this same fixed list rather than
+/// re-deriving it (and potentially reordering mid-cycle) on every step.
 #[derive(Debug, Clone)]
 pub struct TabSwitcherState {
     pub entries: Vec<TabKey>,
@@ -721,6 +776,15 @@ pub struct TabSwitcherState {
 }
 
 const MAX_CLOSED_TABS: usize = 20;
+
+/// How long a tab's open/close animation runs — `ui::tab_bar::view` reads
+/// this to compute a slide-in/fade-out progress fraction; `TabAnimTick`'s
+/// handler reads it to know when an entry is done and can be pruned. Short
+/// enough to never feel like it's in the way of actually using the tab.
+pub const TAB_ANIM_DURATION: Duration = Duration::from_millis(160);
+/// How far (in logical pixels) a newly-opened tab's leading spacer starts
+/// before shrinking to 0 over `TAB_ANIM_DURATION` — see `tab_opening`.
+pub const TAB_SLIDE_PX: f32 = 28.0;
 
 pub const EDITOR_FONT_SIZE_MIN: f32 = 10.0;
 pub const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
@@ -775,6 +839,8 @@ impl Default for State {
             open_tabs: Vec::new(),
             active_tab: None,
             split_tab: None,
+            split_primary_width: SPLIT_DEFAULT_WIDTH,
+            split_resizing: false,
             restoring_session: false,
             chat_mode: settings.chat_mode,
             chat_tab_open: false,
@@ -851,6 +917,7 @@ impl Default for State {
             palette_selected: 0,
             workspace_symbol_query: String::new(),
             workspace_symbol_results: Vec::new(),
+            last_find_query: String::new(),
             settings_open: false,
             settings_category: SettingsCategory::default(),
             git_status_in_tree: settings.git_status_in_tree,
@@ -874,6 +941,11 @@ impl Default for State {
             rename_prompt: None,
             flash: None,
             closed_tabs: Vec::new(),
+            pinned_tabs: std::collections::HashSet::new(),
+            tab_activation_seq: 0,
+            tab_last_activated: std::collections::HashMap::new(),
+            tab_opening: std::collections::HashMap::new(),
+            tab_closing_ghosts: Vec::new(),
             next_untitled_id: 0,
             tab_hover: None,
             tab_switcher: None,
@@ -916,6 +988,11 @@ pub enum Message {
     SelectOpenTab(TabKey),
     CloseTab(TabKey),
     CloseActiveTab,
+    /// Pins/unpins a `File` tab (see `State::pinned_tabs`) — a no-op for
+    /// any other `TabKey` variant. Fired by a tab's own pin-glyph button
+    /// (unpin) and the tab-bar overflow menu's "Pin Tab"/"Unpin Tab" row
+    /// (pin/unpin the active tab).
+    ToggleTabPinned(TabKey),
     FocusSearchTab,
     ToggleProjects,
     ToggleOverflow,
@@ -928,6 +1005,16 @@ pub enum Message {
     /// sits flush against the sidebar's right edge at X == 0).
     SidebarResizeDragged(f32),
     SidebarResizeEnded,
+    /// Pressed the split pane's own divider/resize handle.
+    SplitResizeStarted,
+    /// Cursor moved while resizing the split — carries the cursor's raw
+    /// window-space X position (like `SidebarResizeDragged`'s), which the
+    /// handler turns into a primary-pane width by subtracting how far the
+    /// content area itself starts from the window's left edge (past the
+    /// sidebar and its own resize handle, if not collapsed) — unlike the
+    /// sidebar, this handle doesn't sit flush against the window edge.
+    SplitResizeDragged(f32),
+    SplitResizeEnded,
     ToggleChangesPanel,
     /// Clicked the status bar's Problems indicator — see
     /// `State::problems_panel_open`.
@@ -1288,6 +1375,11 @@ pub enum Message {
     /// Ticks while `State::tab_hover` is pending, purely to force a `view()`
     /// rebuild once the dwell elapses — same shape as `HoverDebounceTick`.
     TabPreviewTick,
+    /// Ticks while a tab is opening or closing (`State::tab_opening`/
+    /// `tab_closing_ghosts`) — unlike `TabPreviewTick`, this one does real
+    /// work: pruning whichever entries have finished animating, so the
+    /// subscription driving it can stop once nothing's left to animate.
+    TabAnimTick,
     /// The mouse entered/left a breadcrumb segment — starts/clears the
     /// hover-context tooltip's dwell timer (`State::breadcrumb_hover`,
     /// roadmap item 10). Mirrors `TabHoverStart`/`TabHoverEnd`.
@@ -1574,14 +1666,23 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::SelectOpenTab(key) => {
             if state.open_tabs.iter().any(|t| t.key() == key) {
-                state.active_tab = Some(key);
+                state.active_tab = Some(key.clone());
+                touch_tab_mru(state, &key);
                 persist_session(state);
             }
         }
-        Message::CloseTab(key) => close_tab(state, &key),
+        Message::CloseTab(key) => close_tab_unless_pinned(state, &key),
         Message::CloseActiveTab => {
             if let Some(key) = state.active_tab.clone() {
-                close_tab(state, &key);
+                close_tab_unless_pinned(state, &key);
+            }
+        }
+        Message::ToggleTabPinned(key) => {
+            if let TabKey::File(path) = &key {
+                if !state.pinned_tabs.remove(path) {
+                    state.pinned_tabs.insert(path.clone());
+                }
+                persist_session(state);
             }
         }
         Message::TabHoverStart(key) => {
@@ -1597,6 +1698,11 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         // `HoverDebounceTick`. `ui::tab_bar::hover_preview` is what actually
         // checks the elapsed time and decides whether to render anything.
         Message::TabPreviewTick => {}
+        Message::TabAnimTick => {
+            let now = Instant::now();
+            state.tab_opening.retain(|_, started| now.duration_since(*started) < TAB_ANIM_DURATION);
+            state.tab_closing_ghosts.retain(|g| now.duration_since(g.started_at) < TAB_ANIM_DURATION);
+        }
         Message::BreadcrumbHoverStart(index) => {
             state.breadcrumb_hover = Some((index, Instant::now()));
         }
@@ -1683,6 +1789,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             state.chat_tab_open = true;
             state.chat_mode = ChatMode::Closed;
             state.active_tab = Some(TabKey::Chat);
+            touch_tab_mru(state, &TabKey::Chat);
             state.chat_view_menu_open = false;
             persist_settings(state);
             persist_session(state);
@@ -1931,6 +2038,22 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::SidebarResizeEnded => {
             state.sidebar_resizing = false;
+            persist_session(state);
+        }
+        Message::SplitResizeStarted => state.split_resizing = true,
+        Message::SplitResizeDragged(x) => {
+            if state.split_resizing {
+                // Where the content area (primary pane's own left edge)
+                // starts, past the sidebar and its 4px handle — 0.0 whenever
+                // the sidebar is collapsed, same reasoning `shell.rs`'s own
+                // `body` row construction uses to decide whether to include
+                // that handle at all.
+                let left_offset = if state.sidebar_collapsed { 0.0 } else { state.sidebar_width + 4.0 };
+                state.split_primary_width = (x - left_offset).clamp(SPLIT_MIN_WIDTH, SPLIT_MAX_WIDTH);
+            }
+        }
+        Message::SplitResizeEnded => {
+            state.split_resizing = false;
             persist_session(state);
         }
         Message::ToggleChangesPanel => {
@@ -2478,6 +2601,13 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     reload_editor_from_disk(state, path);
                 }
             }
+            // Invalidates `start_search`'s "same query as last time" cache
+            // hit — a changed/created/deleted file can change what a repeat
+            // of the current query would find, so the next search for it
+            // must actually re-scan rather than trusting the old results.
+            if !events.is_empty() {
+                state.search_last_query.clear();
+            }
         }
         Message::ToggleDirCollapsed(path) => {
             if !state.collapsed_dirs.remove(&path) {
@@ -2762,16 +2892,20 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ToggleSplitView => toggle_split_view(state),
         Message::EditorSave => return save_current_file(state),
         Message::ToggleFind => {
+            let last_find_query = state.last_find_query.clone();
+            let mut closed = false;
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 if editor.find.is_some() {
                     editor.find = None;
+                    closed = true;
                 } else {
                     let initial_query = editor
                         .selection()
                         .map(|(start, end)| editor.document.text().slice(start..end).to_string())
-                        .unwrap_or_default();
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(last_find_query);
                     editor.find = Some(FindState {
                         query: initial_query,
                         ..FindState::default()
@@ -2780,6 +2914,9 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     return iced::widget::operation::focus(find_query_id());
                 }
             }
+            if closed {
+                persist_session(state);
+            }
         }
         Message::CloseFind => {
             if let Some(path) = active_file_path(state)
@@ -2787,8 +2924,10 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 editor.find = None;
             }
+            persist_session(state);
         }
         Message::FindQueryChanged(query) => {
+            state.last_find_query = query.clone();
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
@@ -2804,6 +2943,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::FindNext => return find_step(state, 1),
         Message::FindPrev => return find_step(state, -1),
         Message::ToggleReplace => {
+            let last_find_query = state.last_find_query.clone();
             if let Some(path) = active_file_path(state)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
@@ -2814,7 +2954,8 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     let initial_query = editor
                         .selection()
                         .map(|(start, end)| editor.document.text().slice(start..end).to_string())
-                        .unwrap_or_default();
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(last_find_query);
                     editor.find = Some(FindState {
                         query: initial_query,
                         replace_open: true,
@@ -3461,10 +3602,11 @@ fn capture_session(state: &State) -> session::Session {
                     is_diff: false,
                     cursor_line: editor.cursor.line,
                     cursor_col: editor.cursor.col,
+                    pinned: state.pinned_tabs.contains(&editor.path),
                 })
             }
             OpenTab::Diff(path) => {
-                Some(session::SessionTab { path: path.clone(), is_diff: true, cursor_line: 0, cursor_col: 0 })
+                Some(session::SessionTab { path: path.clone(), is_diff: true, cursor_line: 0, cursor_col: 0, pinned: false })
             }
         })
         .collect();
@@ -3477,6 +3619,7 @@ fn capture_session(state: &State) -> session::Session {
         open_tabs,
         active_tab,
         sidebar_width: state.sidebar_width,
+        split_primary_width: state.split_primary_width,
         sidebar_collapsed: state.sidebar_collapsed,
         collapsed_dirs: state.collapsed_dirs.iter().cloned().collect(),
         changes_panel_open: state.changes_panel_open,
@@ -3484,6 +3627,7 @@ fn capture_session(state: &State) -> session::Session {
         chat_mode: settings::chat_mode_key(state.chat_mode).to_string(),
         chat_tab_open: state.chat_tab_open,
         chat_tab_active: state.active_tab == Some(TabKey::Chat),
+        last_find_query: state.last_find_query.clone(),
     }
 }
 
@@ -3537,14 +3681,27 @@ fn restore_session(state: &mut State) {
             let col = tab.cursor_col.min(editor.document.line_len_chars(line));
             editor.click(line, col, false);
         }
+        if tab.pinned {
+            state.pinned_tabs.insert(tab.path.clone());
+        }
     }
     if let Some(tab) = session.active_tab.and_then(|i| session.open_tabs.get(i)) {
         let key = if tab.is_diff { TabKey::Diff(tab.path.clone()) } else { TabKey::File(tab.path.clone()) };
         if state.open_tabs.iter().any(|t| t.key() == key) {
-            state.active_tab = Some(key);
+            state.active_tab = Some(key.clone());
+            // After the restore loop above (which touched every restored
+            // tab's own recency in session order), so the tab that was
+            // actually active when the session was saved ends up most
+            // recent again — not whichever tab happened to restore last.
+            touch_tab_mru(state, &key);
         }
     }
     state.sidebar_width = session.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    // `0.0` for a session saved before split-resize existed (or one that
+    // never dragged it) clamps up to `SPLIT_MIN_WIDTH` rather than the
+    // nicer `SPLIT_DEFAULT_WIDTH` — same trade-off `sidebar_width` above
+    // already accepts for the same reason.
+    state.split_primary_width = session.split_primary_width.clamp(SPLIT_MIN_WIDTH, SPLIT_MAX_WIDTH);
     state.sidebar_collapsed = session.sidebar_collapsed;
     state.collapsed_dirs = session.collapsed_dirs.into_iter().collect();
     state.changes_panel_open = session.changes_panel_open;
@@ -3555,7 +3712,9 @@ fn restore_session(state: &mut State) {
     state.chat_tab_open = session.chat_tab_open;
     if session.chat_tab_open && session.chat_tab_active {
         state.active_tab = Some(TabKey::Chat);
+        touch_tab_mru(state, &TabKey::Chat);
     }
+    state.last_find_query = session.last_find_query;
     state.restoring_session = false;
 }
 
@@ -4010,6 +4169,13 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     if state.tab_hover.is_some() {
         subs.push(iced::time::every(Duration::from_millis(80)).map(|_| Message::TabPreviewTick));
     }
+    // A faster cadence than the other ticks above — this one drives an
+    // actual visual animation (not just a dwell-timer wakeup), so it needs
+    // to look smooth rather than merely responsive. Only running while
+    // something's actually mid-animation, same as every other tick here.
+    if !state.tab_opening.is_empty() || !state.tab_closing_ghosts.is_empty() {
+        subs.push(iced::time::every(Duration::from_millis(30)).map(|_| Message::TabAnimTick));
+    }
     // Same shape again: only ticks while the mouse is resting on a
     // breadcrumb segment, waiting on `ui::breadcrumb_bar::HOVER_DWELL`.
     if state.breadcrumb_hover.is_some() {
@@ -4020,6 +4186,9 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     }
     if state.chat_resizing {
         subs.push(iced::event::listen_with(chat_resize_events));
+    }
+    if state.split_resizing {
+        subs.push(iced::event::listen_with(split_resize_events));
     }
     iced::Subscription::batch(subs)
 }

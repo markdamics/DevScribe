@@ -1,3 +1,4 @@
+pub mod bracket;
 pub mod claude_agent;
 pub mod copilot_agent;
 pub mod copilot_completion;

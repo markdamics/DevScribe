@@ -728,6 +728,14 @@ impl EditorState {
         outline::breadcrumbs_at(tree, self.document.text(), byte, lang)
     }
 
+    /// Bumped on every buffer mutation — a cheap proxy for "has the document
+    /// changed" that `EditorCanvas` uses to decide whether its cached
+    /// glyph/highlight geometry needs re-tessellating, without comparing
+    /// buffer contents.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Inserted/deleted line counts for this file's diff against `HEAD` —
     /// the breadcrumb bar's `+N -N` readout. `None` when `diff` isn't
     /// `Changed` (no repo, untracked, or up to date), same as `gutter_marks`
@@ -2032,6 +2040,19 @@ pub const CHAT_MIN_WIDTH: f32 = 280.0;
 pub const CHAT_MAX_WIDTH: f32 = 560.0;
 pub const CHAT_DEFAULT_WIDTH: f32 = 340.0;
 
+/// Split-pane primary-side width bounds — same drag-handle idiom as the
+/// sidebar/chat panel's own resize, just anchored where the primary pane
+/// meets the split pane instead of a window edge; the split pane itself is
+/// always whatever's left (`Length::Fill`), same as the editor area next to
+/// the sidebar/chat panel. `SPLIT_DEFAULT_WIDTH` is a flat guess at "roughly
+/// half a typical window," same spirit as the sidebar/chat defaults above —
+/// not computed from the actual window width, which would need to be
+/// re-derived (and re-clamped) on every resize instead of being one settled
+/// number.
+pub const SPLIT_MIN_WIDTH: f32 = 320.0;
+pub const SPLIT_MAX_WIDTH: f32 = 2400.0;
+pub const SPLIT_DEFAULT_WIDTH: f32 = 640.0;
+
 /// Moves the active file's cursor to the start of `line` (1-based, clamped
 /// to the document's own line count) and scrolls it into view — the
 /// palette's `:N` syntax (`filtered_palette_entries`) and `Ctrl+G`'s job.
@@ -2340,7 +2361,14 @@ pub fn close_other_tabs(state: &mut State) {
     let Some(active) = state.active_tab.clone() else {
         return;
     };
-    let others: Vec<TabKey> = state.open_tabs.iter().map(|t| t.key()).filter(|k| *k != active).collect();
+    // Pinned tabs are exempt, same as a direct close click on one of them —
+    // "close others" shouldn't be a back door around the pin.
+    let others: Vec<TabKey> = state
+        .open_tabs
+        .iter()
+        .map(|t| t.key())
+        .filter(|k| *k != active && !is_tab_pinned(state, k))
+        .collect();
     for key in others {
         close_tab(state, &key);
     }
@@ -2656,6 +2684,19 @@ pub fn toggle_split_view(state: &mut State) {
     }
 }
 
+/// Drives an in-progress split-pane drag (see `Message::SplitResizeStarted`)
+/// with window-wide cursor tracking — same reasoning as
+/// `sidebar_resize_events`: the handle itself is only a few pixels wide, far
+/// narrower than a fast drag's mouse movement. Only subscribed while
+/// `state.split_resizing`.
+pub fn split_resize_events(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::SplitResizeDragged(position.x)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(_)) => Some(Message::SplitResizeEnded),
+        _ => None,
+    }
+}
+
 /// Shows `path` in the split pane — from the palette's "Open in Split: ..."
 /// entries. Opens it as a tab first if it isn't already one, mirroring
 /// `open_or_focus_file`, but sets `split_tab` instead of `active_tab`. A
@@ -2965,13 +3006,22 @@ pub fn open_file_paths(state: &State) -> Vec<PathBuf> {
 pub fn open_or_focus_file(state: &mut State, path: PathBuf) {
     let key = TabKey::File(path.clone());
     if state.open_tabs.iter().any(|t| t.key() == key) {
-        state.active_tab = Some(key);
+        state.active_tab = Some(key.clone());
+        touch_tab_mru(state, &key);
         persist_session(state);
         return;
     }
     if let Ok(document) = Document::open(&path) {
         state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(document, path.clone()))));
-        state.active_tab = Some(key);
+        // Not while restoring a session at startup — every restored tab
+        // goes through this same "not already open" branch in one tight
+        // loop, and none of them should animate in; only a tab opened by a
+        // live `Message` during this session should.
+        if !state.restoring_session {
+            state.tab_opening.insert(key.clone(), Instant::now());
+        }
+        state.active_tab = Some(key.clone());
+        touch_tab_mru(state, &key);
         send_did_open_for(state, &path);
         send_copilot_did_open_for(state, &path);
         recompute_diff_for(state, &path);
@@ -3157,8 +3207,12 @@ pub fn open_or_focus_diff(state: &mut State, path: PathBuf) {
     let key = TabKey::Diff(path.clone());
     if !state.open_tabs.iter().any(|t| t.key() == key) {
         state.open_tabs.push(OpenTab::Diff(path));
+        if !state.restoring_session {
+            state.tab_opening.insert(key.clone(), Instant::now());
+        }
     }
-    state.active_tab = Some(key);
+    state.active_tab = Some(key.clone());
+    touch_tab_mru(state, &key);
     persist_session(state);
 }
 
@@ -3183,7 +3237,9 @@ pub fn begin_untitled_buffer(state: &mut State) {
     let path = PathBuf::from(name);
     let key = TabKey::File(path.clone());
     state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(Document::empty(), path))));
-    state.active_tab = Some(key);
+    state.tab_opening.insert(key.clone(), Instant::now());
+    state.active_tab = Some(key.clone());
+    touch_tab_mru(state, &key);
 }
 
 /// The global `⇧⌘D` / palette "Diff: open working tree changes" handler:
@@ -3201,10 +3257,47 @@ pub fn view_working_tree_diff(state: &mut State) {
     }
 }
 
+/// Whether `key` is a pinned `File` tab (`State::pinned_tabs`) — always
+/// `false` for `Diff`/`Search`/`Chat`, which are never pinnable.
+pub fn is_tab_pinned(state: &State, key: &TabKey) -> bool {
+    matches!(key, TabKey::File(path) if state.pinned_tabs.contains(path))
+}
+
+/// The guarded entry point for every *user-initiated* close
+/// (`Message::CloseTab`/`CloseActiveTab`/`close_other_tabs`) — a no-op (with
+/// a flash explaining why) for a pinned tab, which must be explicitly
+/// unpinned first. Closes that happen because the underlying file is gone
+/// (a discard that deletes a newly-added file, deleting the file from the
+/// sidebar) go straight through `close_tab` instead, since a tab for a file
+/// that no longer exists shouldn't be kept open just because it was pinned.
+pub fn close_tab_unless_pinned(state: &mut State, key: &TabKey) {
+    if is_tab_pinned(state, key) {
+        push_flash(state, "PINNED \u{2014} UNPIN TO CLOSE");
+        return;
+    }
+    close_tab(state, key);
+}
+
+/// A plain-text label for `tab`'s closing-fade ghost (`ClosingTabGhost`) —
+/// deliberately simpler than the tab bar's real `file_tab_label`/
+/// `diff_tab_label` (no language badge, no dirty dot): the tab is already
+/// gone by the time this renders, so there's nothing live left to reflect.
+fn tab_ghost_label(tab: &OpenTab) -> String {
+    match tab {
+        OpenTab::File(editor) => editor.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        OpenTab::Diff(path) => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            format!("{name} \u{2194} HEAD")
+        }
+    }
+}
+
 /// Closes the tab matching `key`. Closing a `File` tab also closes its diff
 /// tab, if any (a `Diff` tab has no content without its backing `File`
 /// tab), and notifies the LSP server. If the active tab was closed, focuses
 /// the tab that's now in its place, or `None` if that was the last one.
+/// Unconditional — most callers want `close_tab_unless_pinned` instead;
+/// see its own doc comment for the distinction.
 pub fn close_tab(state: &mut State, key: &TabKey) {
     let Some(pos) = state.open_tabs.iter().position(|t| &t.key() == key) else {
         return;
@@ -3215,6 +3308,10 @@ pub fn close_tab(state: &mut State, key: &TabKey) {
         state.closed_tabs.remove(0);
     }
     let removed = state.open_tabs.remove(pos);
+    // Gone before its slide-in even finished — stop animating a tab that no
+    // longer exists. A fade-out ghost still starts fresh below either way.
+    state.tab_opening.remove(key);
+    state.tab_closing_ghosts.push(ClosingTabGhost { label: tab_ghost_label(&removed), started_at: Instant::now() });
     if let OpenTab::File(editor) = &removed {
         if let Some(sender) = state.lsp_sender.as_mut() {
             send_did_close(sender, &editor.path);
@@ -3242,17 +3339,34 @@ pub fn close_tab(state: &mut State, key: &TabKey) {
     persist_session(state);
 }
 
-/// The Ctrl+Tab quick switcher's (roadmap item 2) candidate list, in the
-/// same order the tab bar itself renders them (`ui::tab_bar::view`): Chat
-/// first if it's pinned open, then every `open_tabs` entry. `Search` is
-/// deliberately excluded — it's a fixed entry point, not an "open tab" a
-/// user would be cycling back to.
+/// Records `key` as just-activated — the single hook `tab_switcher_entries`
+/// sorts by, called from every place a tab becomes active through
+/// deliberate navigation (`open_or_focus_file`/`open_or_focus_diff`,
+/// `begin_untitled_buffer`, a tab-bar click, confirming the switcher itself,
+/// opening the chat tab). Deliberately *not* called from `close_tab`'s own
+/// "focus whatever's now in the closed tab's place" fallback — that's an
+/// automatic reassignment, not a real navigation, and reordering the
+/// switcher because of it would be surprising.
+pub fn touch_tab_mru(state: &mut State, key: &TabKey) {
+    state.tab_activation_seq += 1;
+    state.tab_last_activated.insert(key.clone(), state.tab_activation_seq);
+}
+
+/// The Ctrl+Tab quick switcher's (roadmap item 2) candidate list, most-
+/// recently-activated first (`touch_tab_mru`/`tab_last_activated`) so a
+/// first press lands on "whatever I was on before this" the way every other
+/// editor's Ctrl+Tab does — Chat included, at whatever position its own
+/// recency earns it, if it's pinned open. Ties (never explicitly activated)
+/// keep `open_tabs`' own tab-bar order, since `sort_by_key` is stable.
+/// `Search` is deliberately excluded — it's a fixed entry point, not an
+/// "open tab" a user would be cycling back to.
 pub fn tab_switcher_entries(state: &State) -> Vec<TabKey> {
     let mut entries = Vec::with_capacity(state.open_tabs.len() + 1);
     if state.chat_tab_open {
         entries.push(TabKey::Chat);
     }
     entries.extend(state.open_tabs.iter().map(|t| t.key()));
+    entries.sort_by_key(|key| std::cmp::Reverse(state.tab_last_activated.get(key).copied().unwrap_or(0)));
     entries
 }
 
@@ -3267,6 +3381,7 @@ pub fn switch_to_tab(state: &mut State, key: &TabKey) -> iced::Task<Message> {
             state.chat_tab_open = true;
             state.chat_mode = ChatMode::Closed;
             state.active_tab = Some(TabKey::Chat);
+            touch_tab_mru(state, key);
             state.chat_view_menu_open = false;
             persist_settings(state);
             persist_session(state);
@@ -3275,6 +3390,7 @@ pub fn switch_to_tab(state: &mut State, key: &TabKey) -> iced::Task<Message> {
         _ => {
             if state.open_tabs.iter().any(|t| &t.key() == key) {
                 state.active_tab = Some(key.clone());
+                touch_tab_mru(state, key);
                 persist_session(state);
             }
             iced::Task::none()

@@ -27,11 +27,12 @@ impl Drop for TempDir {
 fn sample() -> Session {
     Session {
         open_tabs: vec![
-            SessionTab { path: PathBuf::from("/work/a.rs"), is_diff: false, cursor_line: 4, cursor_col: 2 },
-            SessionTab { path: PathBuf::from("/work/b.rs"), is_diff: true, cursor_line: 0, cursor_col: 0 },
+            SessionTab { path: PathBuf::from("/work/a.rs"), is_diff: false, cursor_line: 4, cursor_col: 2, pinned: false },
+            SessionTab { path: PathBuf::from("/work/b.rs"), is_diff: true, cursor_line: 0, cursor_col: 0, pinned: false },
         ],
         active_tab: Some(1),
         sidebar_width: 260.0,
+        split_primary_width: 640.0,
         sidebar_collapsed: false,
         collapsed_dirs: vec![PathBuf::from("/work/target")],
         changes_panel_open: true,
@@ -39,6 +40,7 @@ fn sample() -> Session {
         chat_mode: "Docked".to_string(),
         chat_tab_open: false,
         chat_tab_active: false,
+        last_find_query: "needle".to_string(),
     }
 }
 

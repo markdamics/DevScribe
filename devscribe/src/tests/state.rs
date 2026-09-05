@@ -49,6 +49,227 @@ fn open_or_focus_file_dedups_and_is_additive() {
 }
 
 #[test]
+fn opening_a_new_file_tab_starts_its_slide_in_animation() {
+    let files = TempFiles::new("anim-open");
+    let mut state = State::default();
+    let key = TabKey::File(files.a.clone());
+
+    open_or_focus_file(&mut state, files.a.clone());
+    assert!(state.tab_opening.contains_key(&key));
+}
+
+#[test]
+fn refocusing_an_already_open_tab_does_not_restart_its_animation() {
+    let files = TempFiles::new("anim-refocus");
+    let mut state = State::default();
+    let key = TabKey::File(files.a.clone());
+
+    open_or_focus_file(&mut state, files.a.clone());
+    // Pretend its slide-in already finished (a real `TabAnimTick` would have
+    // pruned it by now).
+    state.tab_opening.clear();
+
+    open_or_focus_file(&mut state, files.a.clone());
+    assert!(!state.tab_opening.contains_key(&key), "refocusing an already-open tab must not make it slide in again");
+}
+
+#[test]
+fn restoring_a_session_does_not_animate_any_restored_tab() {
+    let files = TempFiles::new("anim-restore");
+    let mut state = State::default();
+    state.restoring_session = true;
+
+    open_or_focus_file(&mut state, files.a.clone());
+    assert!(state.tab_opening.is_empty(), "tabs reopened from a saved session should already be in place, not sliding in");
+}
+
+#[test]
+fn closing_a_tab_stops_its_opening_animation_and_starts_a_fading_ghost() {
+    let files = TempFiles::new("anim-close");
+    let mut state = State::default();
+    let key = TabKey::File(files.a.clone());
+    open_or_focus_file(&mut state, files.a.clone());
+    assert!(state.tab_opening.contains_key(&key));
+
+    close_tab(&mut state, &key);
+
+    assert!(!state.tab_opening.contains_key(&key), "a tab closed mid-slide-in shouldn't keep animating in");
+    assert_eq!(state.tab_closing_ghosts.len(), 1);
+    assert_eq!(state.tab_closing_ghosts[0].label, "a.txt");
+}
+
+#[test]
+fn tab_anim_tick_prunes_only_finished_animations() {
+    let mut state = State::default();
+    let fresh_key = TabKey::File(PathBuf::from("fresh.txt"));
+    let stale_key = TabKey::File(PathBuf::from("stale.txt"));
+    state.tab_opening.insert(fresh_key.clone(), Instant::now());
+    state.tab_opening.insert(stale_key.clone(), Instant::now() - TAB_ANIM_DURATION - Duration::from_millis(10));
+    state.tab_closing_ghosts.push(ClosingTabGhost {
+        label: "stale.txt".to_string(),
+        started_at: Instant::now() - TAB_ANIM_DURATION - Duration::from_millis(10),
+    });
+    state.tab_closing_ghosts.push(ClosingTabGhost { label: "fresh.txt".to_string(), started_at: Instant::now() });
+
+    let _ = update(&mut state, Message::TabAnimTick);
+
+    assert!(state.tab_opening.contains_key(&fresh_key));
+    assert!(!state.tab_opening.contains_key(&stale_key));
+    assert_eq!(state.tab_closing_ghosts.len(), 1);
+    assert_eq!(state.tab_closing_ghosts[0].label, "fresh.txt");
+}
+
+#[test]
+fn tab_switcher_entries_orders_most_recently_activated_first() {
+    let files = TempFiles::new("mru");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+    // Re-focusing `a` should move it back to the front, ahead of `b` even
+    // though `b` was opened more recently in tab-bar order.
+    open_or_focus_file(&mut state, files.a.clone());
+
+    let entries = tab_switcher_entries(&state);
+    assert_eq!(entries, vec![TabKey::File(files.a.clone()), TabKey::File(files.b.clone())]);
+}
+
+#[test]
+fn tab_switcher_entries_falls_back_to_tab_bar_order_for_never_activated_tabs() {
+    let files = TempFiles::new("mru-fallback");
+    let mut state = State::default();
+    // Pushed directly rather than through `open_or_focus_file`, so neither
+    // ever earns a `tab_last_activated` entry — both tie at "never
+    // activated," and the sort must leave them in `open_tabs` order instead
+    // of reordering ties arbitrarily.
+    state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(Document::open(&files.a).unwrap(), files.a.clone()))));
+    state.open_tabs.push(OpenTab::File(Box::new(EditorState::new(Document::open(&files.b).unwrap(), files.b.clone()))));
+
+    let entries = tab_switcher_entries(&state);
+    assert_eq!(entries, vec![TabKey::File(files.a.clone()), TabKey::File(files.b.clone())]);
+}
+
+#[test]
+fn switch_to_tab_and_select_open_tab_both_update_mru_like_open_or_focus_file() {
+    let files = TempFiles::new("mru-switch");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+
+    // `SelectOpenTab`'s handler and `switch_to_tab` both mirror
+    // `open_or_focus_file`'s "just activated" bookkeeping (see their own
+    // doc comments) — a direct tab-bar click on `a` should reorder the
+    // switcher exactly the same as reopening it would.
+    let _ = update(&mut state, Message::SelectOpenTab(TabKey::File(files.a.clone())));
+    assert_eq!(
+        tab_switcher_entries(&state),
+        vec![TabKey::File(files.a.clone()), TabKey::File(files.b.clone())]
+    );
+
+    let _ = switch_to_tab(&mut state, &TabKey::File(files.b.clone()));
+    assert_eq!(
+        tab_switcher_entries(&state),
+        vec![TabKey::File(files.b.clone()), TabKey::File(files.a.clone())]
+    );
+}
+
+#[test]
+fn close_tab_is_blocked_for_a_pinned_tab_until_unpinned() {
+    let files = TempFiles::new("pin-close-guard");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let key = TabKey::File(files.a.clone());
+
+    let _ = update(&mut state, Message::ToggleTabPinned(key.clone()));
+    assert!(is_tab_pinned(&state, &key));
+
+    close_tab_unless_pinned(&mut state, &key);
+    assert_eq!(state.open_tabs.len(), 1, "a pinned tab must survive a close attempt");
+    assert!(
+        state.flash.as_ref().is_some_and(|f| f.text.contains("PINNED")),
+        "a blocked close should tell the user why, not just silently do nothing"
+    );
+
+    let _ = update(&mut state, Message::ToggleTabPinned(key.clone()));
+    assert!(!is_tab_pinned(&state, &key));
+    close_tab_unless_pinned(&mut state, &key);
+    assert!(state.open_tabs.is_empty(), "unpinning must let the very next close through");
+}
+
+#[test]
+fn toggle_tab_pinned_is_a_noop_for_a_tab_key_with_no_backing_file() {
+    let mut state = State::default();
+    let _ = update(&mut state, Message::ToggleTabPinned(TabKey::Search));
+    assert!(state.pinned_tabs.is_empty(), "Search/Chat/Diff have no independent pinned state");
+}
+
+#[test]
+fn close_other_tabs_leaves_pinned_tabs_open() {
+    let files = TempFiles::new("pin-close-others");
+    let dir = files.a.parent().unwrap();
+    let c = dir.join("c.txt");
+    std::fs::write(&c, "c").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+    open_or_focus_file(&mut state, c.clone());
+    let _ = update(&mut state, Message::ToggleTabPinned(TabKey::File(files.b.clone())));
+    // `c` is active; closing "others" should skip pinned `b` but still take `a`.
+    close_other_tabs(&mut state);
+
+    assert!(state.open_tabs.iter().any(|t| t.key() == TabKey::File(files.b.clone())), "pinned tab must survive close-others");
+    assert!(!state.open_tabs.iter().any(|t| t.key() == TabKey::File(files.a.clone())), "unpinned tab must still close");
+    assert!(state.open_tabs.iter().any(|t| t.key() == TabKey::File(c.clone())), "the active tab is never a close-others target");
+}
+
+#[test]
+fn close_tab_still_force_closes_a_pinned_tab_when_its_file_is_gone() {
+    // `close_tab` (unconditional) is what `discard_file`/sidebar-delete use
+    // once the underlying file is actually gone — a pin shouldn't keep a
+    // tab open for a file that no longer exists. Only the user-facing
+    // `close_tab_unless_pinned` enforces the guard.
+    let files = TempFiles::new("pin-force-close");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let key = TabKey::File(files.a.clone());
+    let _ = update(&mut state, Message::ToggleTabPinned(key.clone()));
+
+    close_tab(&mut state, &key);
+    assert!(state.open_tabs.is_empty());
+}
+
+#[test]
+fn restore_session_reopens_pinned_tabs_as_still_pinned() {
+    let files = TempFiles::new("pin-restore");
+    let root = files.a.parent().unwrap().to_path_buf();
+    session::save(
+        &root,
+        &session::Session {
+            open_tabs: vec![
+                session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 0, pinned: true },
+                session::SessionTab { path: files.b.clone(), is_diff: false, cursor_line: 0, cursor_col: 0, pinned: false },
+            ],
+            active_tab: Some(0),
+            sidebar_width: 300.0,
+            split_primary_width: 640.0,
+            sidebar_collapsed: false,
+            collapsed_dirs: Vec::new(),
+            changes_panel_open: false,
+            problems_panel_open: false,
+            chat_mode: String::new(),
+            chat_tab_open: false,
+            chat_tab_active: false,
+            last_find_query: String::new(),
+        },
+    );
+
+    let mut state = state_with_project_open(root);
+    restore_session(&mut state);
+
+    assert!(is_tab_pinned(&state, &TabKey::File(files.a.clone())));
+    assert!(!is_tab_pinned(&state, &TabKey::File(files.b.clone())));
+}
+
+#[test]
 fn close_tab_also_closes_its_diff_tab_and_refocuses() {
     let files = TempFiles::new("close");
     let mut state = State::default();
@@ -591,6 +812,49 @@ fn starting_a_new_search_aborts_the_previous_ones_handle() {
     let _ = update(&mut state, Message::SearchSubmit);
 
     assert!(first_handle.is_aborted(), "starting a second search must cancel the first");
+}
+
+#[test]
+fn repeating_the_current_search_query_reuses_cached_results_without_rescanning() {
+    let files = TempFiles::new("search-cache-hit");
+    let dir = files.a.parent().unwrap().to_path_buf();
+    let mut state = State {
+        root: dir.clone(),
+        tree: fs_tree::walk(&dir, false),
+        search_query: "needle".to_string(),
+        search_last_query: "needle".to_string(),
+        search_results: vec![SearchResult {
+            path: dir.join("stale.txt"),
+            hit: SearchHit { line: 0, col: 0, preview: "cached".to_string(), preview_col: 0 },
+            query_len_chars: "needle".chars().count(),
+        }],
+        ..State::default()
+    };
+
+    let _ = update(&mut state, Message::SearchSubmit);
+
+    assert!(state.search_task_handle.is_none(), "an exact repeat of the last query must not spawn a rescan");
+    assert_eq!(state.search_results[0].hit.preview, "cached", "the already-cached results must be left untouched");
+}
+
+#[test]
+fn files_changed_invalidates_the_repeated_query_cache() {
+    let files = TempFiles::new("search-cache-invalidate");
+    let dir = files.a.parent().unwrap().to_path_buf();
+    std::fs::write(dir.join("match.txt"), "needle").unwrap();
+    let mut state = State {
+        root: dir.clone(),
+        tree: fs_tree::walk(&dir, false),
+        search_query: "needle".to_string(),
+        search_last_query: "needle".to_string(),
+        ..State::default()
+    };
+
+    let _ = update(&mut state, Message::FilesChanged(vec![WatchEvent::Changed(dir.join("match.txt"))]));
+    assert!(state.search_last_query.is_empty(), "a file change must invalidate the cached query");
+
+    let _ = update(&mut state, Message::SearchSubmit);
+    assert!(state.search_task_handle.is_some(), "the next repeat of the query must actually rescan after invalidation");
 }
 
 #[test]
@@ -1582,6 +1846,36 @@ fn chat_resize_dragged_is_ignored_when_not_resizing() {
 }
 
 #[test]
+fn split_resize_dragged_subtracts_the_sidebar_offset_and_clamps() {
+    let mut state = State { split_resizing: true, sidebar_width: 272.0, sidebar_collapsed: false, ..State::default() };
+
+    // Content area starts at 272 + 4 (sidebar + its handle), so a cursor at
+    // 872 puts the primary pane at 872 - 276 == 596, within bounds.
+    let _ = update(&mut state, Message::SplitResizeDragged(872.0));
+    assert_eq!(state.split_primary_width, 596.0);
+
+    let _ = update(&mut state, Message::SplitResizeDragged(0.0));
+    assert_eq!(state.split_primary_width, SPLIT_MIN_WIDTH, "a cursor left of the content area would go negative, so it clamps to the min");
+
+    let _ = update(&mut state, Message::SplitResizeDragged(9000.0));
+    assert_eq!(state.split_primary_width, SPLIT_MAX_WIDTH, "an implausibly wide drag clamps to the max rather than growing unbounded");
+}
+
+#[test]
+fn split_resize_dragged_ignores_the_sidebar_offset_while_collapsed() {
+    let mut state = State { split_resizing: true, sidebar_width: 272.0, sidebar_collapsed: true, ..State::default() };
+    let _ = update(&mut state, Message::SplitResizeDragged(600.0));
+    assert_eq!(state.split_primary_width, 600.0, "a collapsed sidebar contributes no offset, unlike sidebar_width alone");
+}
+
+#[test]
+fn split_resize_dragged_is_ignored_when_not_resizing() {
+    let mut state = State { split_resizing: false, split_primary_width: 640.0, ..State::default() };
+    let _ = update(&mut state, Message::SplitResizeDragged(1000.0));
+    assert_eq!(state.split_primary_width, 640.0);
+}
+
+#[test]
 fn chat_new_session_picks_a_fresh_id_and_clears_the_transcript() {
     let mut state = State::default();
     let old_id = state.chat_session_id.clone();
@@ -1771,6 +2065,47 @@ fn find_matches_stay_document_ordered_so_the_canvas_can_binary_search_them() {
     assert!(
         matches.windows(2).all(|w| w[0].start <= w[1].start && w[0].end <= w[1].end),
         "matches must be ascending in both start and end: {matches:?}"
+    );
+}
+
+#[test]
+fn toggle_find_reopens_with_the_last_query_when_nothing_is_selected() {
+    let files = TempFiles::new("find-last-query");
+    let root = files.a.parent().unwrap().to_path_buf();
+    let mut state = state_with_project_open(root);
+    open_or_focus_file(&mut state, files.a.clone());
+
+    let _ = update(&mut state, Message::ToggleFind);
+    let _ = update(&mut state, Message::FindQueryChanged("needle".to_string()));
+    let _ = update(&mut state, Message::CloseFind);
+    assert!(find_editor(&state, &files.a).unwrap().find.is_none());
+
+    let _ = update(&mut state, Message::ToggleFind);
+    assert_eq!(
+        find_editor(&state, &files.a).unwrap().find.as_ref().unwrap().query,
+        "needle",
+        "reopening find with nothing selected should recall the last query, not start empty"
+    );
+}
+
+#[test]
+fn toggle_find_prefers_the_active_selection_over_the_last_query() {
+    let files = TempFiles::new("find-selection-over-last-query");
+    let root = files.a.parent().unwrap().to_path_buf();
+    let mut state = state_with_project_open(root);
+    open_or_focus_file(&mut state, files.a.clone());
+    state.last_find_query = "stale".to_string();
+
+    let editor = find_editor_mut(&mut state, &files.a).unwrap();
+    editor.document = Document::from_str("hello world\n");
+    editor.cursor = CursorPos { line: 0, col: 5 };
+    editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
+
+    let _ = update(&mut state, Message::ToggleFind);
+    assert_eq!(
+        find_editor(&state, &files.a).unwrap().find.as_ref().unwrap().query,
+        "hello",
+        "an active selection must win over the remembered last query"
     );
 }
 
@@ -2348,10 +2683,10 @@ fn capture_session_records_open_tabs_active_tab_and_cursor() {
 
     let session = capture_session(&state);
     assert_eq!(session.open_tabs.len(), 3);
-    assert_eq!(session.open_tabs[0], session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 1 });
+    assert_eq!(session.open_tabs[0], session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 1, pinned: false });
     assert_eq!(session.open_tabs[1].path, files.b);
     assert!(!session.open_tabs[1].is_diff);
-    assert_eq!(session.open_tabs[2], session::SessionTab { path: files.a.clone(), is_diff: true, cursor_line: 0, cursor_col: 0 });
+    assert_eq!(session.open_tabs[2], session::SessionTab { path: files.a.clone(), is_diff: true, cursor_line: 0, cursor_col: 0, pinned: false });
     assert_eq!(session.active_tab, Some(2), "the diff tab, opened last, should be active");
 }
 
@@ -2377,11 +2712,12 @@ fn restore_session_reopens_tabs_places_cursor_and_restores_layout() {
         &root,
         &session::Session {
             open_tabs: vec![
-                session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 1 },
-                session::SessionTab { path: files.b.clone(), is_diff: false, cursor_line: 0, cursor_col: 0 },
+                session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 1, pinned: false },
+                session::SessionTab { path: files.b.clone(), is_diff: false, cursor_line: 0, cursor_col: 0, pinned: false },
             ],
             active_tab: Some(1),
             sidebar_width: 400.0,
+            split_primary_width: 640.0,
             sidebar_collapsed: true,
             collapsed_dirs: vec![root.join("target")],
             changes_panel_open: true,
@@ -2389,6 +2725,7 @@ fn restore_session_reopens_tabs_places_cursor_and_restores_layout() {
             chat_mode: "Docked".to_string(),
             chat_tab_open: false,
             chat_tab_active: false,
+            last_find_query: String::new(),
         },
     );
 
@@ -2418,9 +2755,10 @@ fn restore_session_reopens_the_chat_tab_and_makes_it_active() {
     session::save(
         &root,
         &session::Session {
-            open_tabs: vec![session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 0 }],
+            open_tabs: vec![session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 0, cursor_col: 0, pinned: false }],
             active_tab: Some(0),
             sidebar_width: 300.0,
+            split_primary_width: 640.0,
             sidebar_collapsed: false,
             collapsed_dirs: Vec::new(),
             changes_panel_open: false,
@@ -2428,6 +2766,7 @@ fn restore_session_reopens_the_chat_tab_and_makes_it_active() {
             chat_mode: "Closed".to_string(),
             chat_tab_open: true,
             chat_tab_active: true,
+            last_find_query: String::new(),
         },
     );
 
@@ -2478,9 +2817,10 @@ fn restore_session_clamps_a_cursor_past_the_files_current_end() {
     session::save(
         &root,
         &session::Session {
-            open_tabs: vec![session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 50, cursor_col: 50 }],
+            open_tabs: vec![session::SessionTab { path: files.a.clone(), is_diff: false, cursor_line: 50, cursor_col: 50, pinned: false }],
             active_tab: Some(0),
             sidebar_width: 300.0,
+            split_primary_width: 640.0,
             sidebar_collapsed: false,
             collapsed_dirs: Vec::new(),
             changes_panel_open: false,
@@ -2488,6 +2828,7 @@ fn restore_session_clamps_a_cursor_past_the_files_current_end() {
             chat_mode: String::new(),
             chat_tab_open: false,
             chat_tab_active: false,
+            last_find_query: String::new(),
         },
     );
 

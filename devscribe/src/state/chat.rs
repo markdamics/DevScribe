@@ -239,6 +239,7 @@ pub fn open_chat_as_tab(state: &mut State) {
     state.chat_tab_open = true;
     state.chat_mode = ChatMode::Closed;
     state.active_tab = Some(TabKey::Chat);
+    touch_tab_mru(state, &TabKey::Chat);
 }
 
 /// Clears `chat_tab_open` and, if the chat tab was the active one,

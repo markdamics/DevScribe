@@ -11,6 +11,8 @@ use iced::alignment::Vertical;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Style, Text};
 use iced::widget::text::{Alignment, LineHeight};
 use iced::{keyboard, mouse, Color, Pixels, Point, Rectangle, Renderer, Size, Theme};
+use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,11 @@ pub struct EditorCanvas {
     /// gutter click's `Message::RevertLine` acts on. Empty for a file with
     /// no diff (no repo, untracked, or unchanged).
     pub gutter_marks: Rc<Vec<Option<GutterMark>>>,
+    /// `EditorState::revision()` as of this frame — bumped on every buffer
+    /// mutation, and the cheapest available proxy for "has the document
+    /// changed" (comparing `document` itself would mean walking the whole
+    /// rope). Part of `CacheSig`, below.
+    pub content_revision: u64,
     pub pending_revert_line: Option<usize>,
     /// Toggled from the settings panel. Only hides the inline `// message`
     /// annotation — the wavy underline stays either way.
@@ -74,6 +81,14 @@ pub struct EditorCanvas {
     /// Index into `find_matches` of the current (more prominently
     /// highlighted) match. Meaningless when `find_matches` is empty.
     pub find_current: usize,
+    /// The bracket pair (absolute char indices, same coordinate space as
+    /// `selection`/`find_matches`) touching the cursor — see
+    /// `devscribe_core::bracket::matching_bracket_pair`, which `shell.rs`
+    /// calls fresh on every `view()` rebuild (cheap and bounded, same
+    /// reasoning as recomputing `find_matches` there rather than caching it
+    /// on `EditorState`). `None` when the cursor isn't touching a bracket,
+    /// the bracket has no partner, or one of them is inside a string/comment.
+    pub bracket_match: Option<(usize, usize)>,
     pub scroll_offset: f32,
     pub viewport_height: f32,
     /// The active GitHub Copilot inline suggestion's first line, already
@@ -90,10 +105,12 @@ pub struct EditorCanvas {
     pub pane: Pane,
 }
 
-/// Purely local interaction state — never synced back into `State` directly.
-/// Real edits flow out as `Message`s; this only tracks "does this canvas
-/// currently have focus" and "what modifiers are held", the same pattern
-/// `iced::widget::text_input` uses internally.
+/// Local interaction state, plus the tessellated-geometry cache — neither is
+/// ever synced back into `State` directly. Real edits flow out as
+/// `Message`s; the interaction fields only track "does this canvas currently
+/// have focus" and "what modifiers are held", the same pattern
+/// `iced::widget::text_input` uses internally. The cache fields exist purely
+/// as a rendering optimization (see `CacheSig`) and never affect behavior.
 #[derive(Default)]
 pub struct CanvasState {
     focused: bool,
@@ -113,9 +130,58 @@ pub struct CanvasState {
     /// change, not on every sub-pixel `CursorMoved` a stationary mouse can
     /// still generate.
     hover_cell: Option<(usize, usize)>,
+    /// Tessellated text/highlights/gutter/diagnostics geometry from the last
+    /// `draw` whose `CacheSig` still matches — everything in `draw` except
+    /// the caret and ghost-text overlay (see `draw`'s own doc comment on why
+    /// those are split out). `iced`'s `Cache` already re-tessellates for
+    /// free on a bounds/size change, so `CacheSig` only needs to track the
+    /// *content* inputs `draw_content` reads.
+    text_cache: canvas::Cache,
+    /// The `CacheSig` `text_cache` was last populated from. `RefCell` because
+    /// `canvas::Program::draw` only gets `&Self::State` — same interior-
+    /// mutability shape `canvas::Cache` itself already relies on to be
+    /// usable from behind a shared reference.
+    cached_sig: RefCell<Option<CacheSig>>,
 }
 
 const CLICK_STREAK_WINDOW: Duration = Duration::from_millis(450);
+
+/// Every input `draw_content` reads, snapshotted once per `draw` call and
+/// compared against the previous frame's — a change here is what earns a
+/// `text_cache.clear()`. Deliberately excludes anything caret-blink-only
+/// (`caret_visible`) or hover-only (`ghost_text` follows the cursor, but
+/// dwell-hover state doesn't touch `draw_content` at all): those redraw via
+/// the small, uncached overlay frame in `draw` instead, so a 530ms caret
+/// blink no longer re-tessellates every glyph in the visible viewport.
+#[derive(Clone, PartialEq)]
+struct CacheSig {
+    /// Together with `content_revision`, distinguishes one open file from
+    /// another reusing the same `CanvasState` (tab switches reuse one canvas
+    /// widget instance) — two distinct files can otherwise land on the same
+    /// revision number (e.g. both freshly opened, at 0).
+    path: Option<PathBuf>,
+    content_revision: u64,
+    highlights_ptr: usize,
+    diagnostics_ptr: usize,
+    gutter_marks_ptr: usize,
+    pending_revert_line: Option<usize>,
+    problem_lens_enabled: bool,
+    show_line_numbers: bool,
+    word_wrap: bool,
+    font_size: f32,
+    find_matches: Vec<(usize, usize)>,
+    find_current: usize,
+    bracket_match: Option<(usize, usize)>,
+    scroll_offset: f32,
+    viewport_height: f32,
+    selection: Option<(usize, usize)>,
+    /// Only the cursor's *line* — its column only ever affects the caret and
+    /// ghost text, both drawn in the uncached overlay, so plain horizontal
+    /// cursor movement no longer re-tessellates the whole viewport either.
+    cursor_line: usize,
+    palette: Palette,
+    pane: Pane,
+}
 
 impl EditorCanvas {
     fn line_height(&self) -> f32 {
@@ -124,6 +190,40 @@ impl EditorCanvas {
 
     fn char_width(&self) -> f32 {
         self.font_size * CHAR_WIDTH_RATIO
+    }
+
+    /// See `CacheSig`'s own doc comment for what this is and why each field
+    /// is (or isn't) in it. Notably absent: `wrap_offsets` — `shell.rs`
+    /// rebuilds it fresh (a new `Rc::new`) on every `view()` call rather
+    /// than storing it in `EditorState`, so its *pointer* changes every
+    /// frame regardless of content; its actual derivation (document +
+    /// `word_wrap` + pane width + `font_size`) is already covered by
+    /// `content_revision`/`path`, `word_wrap`, and `font_size` here, plus
+    /// `canvas::Cache`'s own automatic invalidation on a `bounds` (i.e. pane
+    /// width) change — so leaving it out doesn't miss anything, and keying
+    /// on the pointer instead would have made the cache never hit.
+    fn cache_signature(&self) -> CacheSig {
+        CacheSig {
+            path: self.document.path().map(std::path::Path::to_path_buf),
+            content_revision: self.content_revision,
+            highlights_ptr: Rc::as_ptr(&self.highlights) as usize,
+            diagnostics_ptr: Rc::as_ptr(&self.diagnostics) as usize,
+            gutter_marks_ptr: Rc::as_ptr(&self.gutter_marks) as usize,
+            pending_revert_line: self.pending_revert_line,
+            problem_lens_enabled: self.problem_lens_enabled,
+            show_line_numbers: self.show_line_numbers,
+            word_wrap: self.word_wrap,
+            font_size: self.font_size,
+            find_matches: self.find_matches.clone(),
+            find_current: self.find_current,
+            bracket_match: self.bracket_match,
+            scroll_offset: self.scroll_offset,
+            viewport_height: self.viewport_height,
+            selection: self.selection,
+            cursor_line: self.cursor.line,
+            palette: self.palette,
+            pane: self.pane,
+        }
     }
 
     /// `canvas_width` is `bounds.width` from whichever `canvas::Event`
@@ -320,212 +420,14 @@ impl EditorCanvas {
             _ => publish(Message::EditorInsertText { text: text.to_string(), pane }),
         }
     }
-}
 
-impl canvas::Program<Message> for EditorCanvas {
-    type State = CanvasState;
-
-    fn update(
-        &self,
-        state: &mut Self::State,
-        event: &canvas::Event,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> Option<canvas::Action<Message>> {
-        match event {
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                // A press outside this canvas hands focus away. Nothing used
-                // to clear `focused` at all, and `handle_key` captures every
-                // keystroke while it is set — so after one click in the
-                // editor, typing into the chat panel's input (which sits
-                // *after* `code_area` in the shell's row, and so only sees
-                // events this canvas declines) went into the source file
-                // instead. Focus has to be released explicitly, because an
-                // outside click is exactly the event that never reaches the
-                // branch below.
-                let Some(position) = cursor.position_in(bounds) else {
-                    state.focused = false;
-                    return None;
-                };
-                state.focused = true;
-                let (line, col) = self.hit_test(position, bounds.width);
-
-                // Ctrl/Cmd+Click jumps to the symbol's definition instead of
-                // placing the cursor or starting a drag-select — the same
-                // modifier VS Code uses for this gesture. Checked before the
-                // gutter/revert handling below since it's meant to apply
-                // anywhere over the text, not just plain clicks. Primary-pane
-                // only (see `Pane`) — in the split pane this just falls
-                // through to a plain click below.
-                if state.modifiers.command() && self.pane == Pane::Primary {
-                    return Some(canvas::Action::publish(Message::GoToDefinition { line, col }).and_capture());
-                }
-
-                // A click on a changed line's gutter marker arms that line
-                // for revert instead of placing the cursor or starting a
-                // drag-select — the marker itself is the affordance (unlike
-                // a Changes-panel row, a changed line's bar is always
-                // visible, so there's no separate hover-reveal step
-                // needed). A second click on the same already-armed marker
-                // confirms and actually reverts it (drawn as a "Revert"
-                // label in place of the line number — see `draw`), so a
-                // stray click can't silently discard edits. Unmarked-line
-                // gutter clicks fall through unchanged, to today's
-                // cursor-to-column-0. Primary-pane only, same as go to
-                // definition above.
-                if self.pane == Pane::Primary
-                    && position.x < GUTTER_WIDTH
-                    && self.gutter_marks.get(line).and_then(Option::as_ref).is_some()
-                {
-                    let message = if self.pending_revert_line == Some(line) {
-                        Message::RevertLine { line }
-                    } else {
-                        Message::PromptRevertLine { line }
-                    };
-                    return Some(canvas::Action::publish(message).and_capture());
-                }
-
-                // Any other click while a revert is armed just dismisses the
-                // prompt, the same "click away to cancel" shape as a context
-                // menu — a stray click can't both cancel the prompt and move
-                // the cursor/selection in one motion, so the next click
-                // always lands where the user actually meant it to.
-                if self.pending_revert_line.is_some() {
-                    return Some(canvas::Action::publish(Message::CancelRevertLine).and_capture());
-                }
-                state.dragging = true;
-                let pane = self.pane;
-
-                // Shift-click always just extends, same as shift+arrow —
-                // doesn't participate in double/triple-click detection.
-                if state.modifiers.shift() {
-                    state.last_click = None;
-                    state.click_streak = 0;
-                    return Some(
-                        canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane })
-                            .and_capture(),
-                    );
-                }
-
-                let now = Instant::now();
-                let repeats_last = state.last_click.is_some_and(|(at, l, c)| {
-                    l == line && c == col && now.duration_since(at) < CLICK_STREAK_WINDOW
-                });
-                state.click_streak = if repeats_last { state.click_streak % 3 + 1 } else { 1 };
-                state.last_click = Some((now, line, col));
-
-                let message = match state.click_streak {
-                    2 => Message::EditorSelectWord { line, col, pane },
-                    3 => Message::EditorSelectLine { line, pane },
-                    _ => Message::EditorClick { line, col, extend: false, pane },
-                };
-                Some(canvas::Action::publish(message).and_capture())
-            }
-            // Drag-select: every cursor move while the button is still down
-            // extends the selection from wherever it started, the same way
-            // shift-click does. Computed from the cursor's absolute
-            // position (not `position_in`, which is `None` once the cursor
-            // strays outside the canvas's own bounds) so a drag past either
-            // edge still keeps extending rather than freezing — `hit_test`
-            // already clamps whatever it's given to a valid line/col.
-            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
-                let position = cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))?;
-                let (line, col) = self.hit_test(position, bounds.width);
-                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane: self.pane }).and_capture())
-            }
-            // Passive hover tracking (dwell-based `textDocument/hover`) —
-            // only published on an actual cell change, so a stationary
-            // mouse's sub-pixel `CursorMoved` noise doesn't restart the
-            // dwell timer or force a `view()` rebuild every frame.
-            // Primary-pane only, same as go to definition above — the split
-            // pane never requests hover info.
-            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if !state.dragging && self.pane == Pane::Primary => {
-                match cursor.position_in(bounds) {
-                    Some(position) => {
-                        let cell = self.hit_test(position, bounds.width);
-                        if state.hover_cell == Some(cell) {
-                            None
-                        } else {
-                            state.hover_cell = Some(cell);
-                            Some(canvas::Action::publish(Message::EditorHoverMove {
-                                line: cell.0,
-                                col: cell.1,
-                            }))
-                        }
-                    }
-                    None if state.hover_cell.take().is_some() => {
-                        Some(canvas::Action::publish(Message::EditorHoverLeave))
-                    }
-                    None => None,
-                }
-            }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                state.dragging = false;
-                None
-            }
-            // A right-click over the text opens the code-actions context
-            // menu (Rename Symbol, Go to Definition, Find All References,
-            // Search Symbol in Project) at the click position — primary
-            // pane only, same as the other LSP-assisted interactions (see
-            // `Pane`'s own doc comment). One outside the canvas, or over the
-            // split pane, falls through to the generic case right below,
-            // same "outside click releases focus" behavior as a left-click.
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
-                if self.pane == Pane::Primary && cursor.position_in(bounds).is_some() =>
-            {
-                let position = cursor.position_in(bounds)?;
-                let (line, col) = self.hit_test(position, bounds.width);
-                let screen = cursor.position()?;
-                state.focused = true;
-                Some(
-                    canvas::Action::publish(Message::OpenEditorContext {
-                        line,
-                        col,
-                        x: screen.x,
-                        y: screen.y,
-                    })
-                    .and_capture(),
-                )
-            }
-            // Right/middle presses outside the canvas give focus away too —
-            // same reason as the left-button case above (a right-click into
-            // the sidebar opens its context menu, and shouldn't leave this
-            // canvas still eating the keyboard).
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(_)) => {
-                if cursor.position_in(bounds).is_none() {
-                    state.focused = false;
-                }
-                None
-            }
-            canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                state.modifiers = *modifiers;
-                None
-            }
-            canvas::Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                modifiers,
-                text,
-                ..
-            }) => {
-                state.modifiers = *modifiers;
-                if !state.focused {
-                    return None;
-                }
-                self.handle_key(key, *modifiers, text.as_deref())
-            }
-            _ => None,
-        }
-    }
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
+    /// Everything `draw` shows *except* the caret and ghost-text overlay —
+    /// text, syntax highlights, selection, find matches, the gutter, and
+    /// diagnostics. Split out so `draw` can run this behind `CanvasState`'s
+    /// `text_cache`: this is the expensive part (one `fill_text` per syntax
+    /// span, per visible row), and unlike the caret it never needs to redraw
+    /// just because 530ms passed.
+    fn draw_content(&self, frame: &mut Frame, bounds: Rectangle) {
         let p = self.palette;
         let font_size = self.font_size;
         let line_height = self.line_height();
@@ -744,6 +646,37 @@ impl canvas::Program<Message> for EditorCanvas {
                     }
                 }
 
+                // Bracket-pair match: an outline (not a fill, unlike
+                // selection/find above) around each half, so it reads as its
+                // own distinct kind of highlight rather than a third flavor
+                // of the same filled-rectangle look.
+                if let Some((a, b)) = self.bracket_match {
+                    for pos in [a, b] {
+                        let pos_end = pos + 1;
+                        if pos >= row_end_idx || pos_end <= row_start_idx {
+                            continue;
+                        }
+                        let col = pos.saturating_sub(row_start_idx);
+                        let x0 = text_x0 + col as f32 * char_width;
+                        if x0 > bounds.width {
+                            continue;
+                        }
+                        let x1 = clamp_x(x0 + char_width);
+                        let rect = Path::rectangle(
+                            Point::new(x0, y + 1.0),
+                            Size::new((x1 - x0).max(char_width * 0.4), line_height - 2.0),
+                        );
+                        frame.stroke(
+                            &rect,
+                            Stroke {
+                                style: Style::Solid(color(p.accent_solid)),
+                                width: 1.2,
+                                ..Stroke::default()
+                            },
+                        );
+                    }
+                }
+
                 // The gutter's per-line git-diff marker and line number only
                 // belong on a line's first visual row — both are per-buffer-
                 // line concepts (`update()`'s gutter click handling reverts
@@ -906,7 +839,7 @@ impl canvas::Program<Message> for EditorCanvas {
                         // `PERIOD`-wide segment at a time.
                         let x1 = clamp_x(text_x0 + (clip_end - row_start_char) as f32 * char_width);
                         if x0 <= bounds.width {
-                            draw_wavy_underline(&mut frame, x0, x1, y + line_height - 5.0, color(sev_color));
+                            draw_wavy_underline(frame, x0, x1, y + line_height - 5.0, color(sev_color));
                         }
                     }
 
@@ -939,43 +872,292 @@ impl canvas::Program<Message> for EditorCanvas {
                     }
                 }
 
-                let cursor_in_row = is_cursor_line
-                    && self.cursor.col >= row_start_char
-                    && (self.cursor.col < row_end_char || (row_is_last && self.cursor.col <= row_end_char));
-
-                if cursor_in_row && self.caret_visible {
-                    let x = text_x0 + (self.cursor.col - row_start_char) as f32 * char_width;
-                    if x <= bounds.width {
-                        frame.fill(
-                            &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
-                            color(p.accent_solid),
-                        );
-                    }
-                }
-                // Ghost text steadily shown (not gated on `caret_visible`) —
-                // VS Code's own inline suggestions don't blink either, only the
-                // caret drawn in front of them does.
-                if cursor_in_row
-                    && let Some(ghost) = &self.ghost_text
-                {
-                    let x = text_x0 + (self.cursor.col - row_start_char) as f32 * char_width;
-                    if x <= bounds.width {
-                        frame.fill_text(Text {
-                            content: ghost.clone(),
-                            position: Point::new(x, y),
-                            color: tint(p.text_muted, 0.6),
-                            size: Pixels(font_size),
-                            line_height: LineHeight::Absolute(Pixels(line_height)),
-                            font: mono,
-                            align_y: Vertical::Top,
-                            ..Text::default()
-                        });
-                    }
-                }
             }
         }
+    }
 
-        vec![frame.into_geometry()]
+    /// The caret and ghost-text suggestion — the only parts of the editor
+    /// that change on their own (the 530ms `CaretTick` blink) without any
+    /// other input changing, so they're drawn fresh every `draw` call
+    /// instead of through `CanvasState`'s `text_cache`. Only ever one line
+    /// (the cursor's), so recomputing its wrap row from scratch here rather
+    /// than reusing `draw_content`'s loop is cheap and keeps the two passes
+    /// independent.
+    fn draw_caret_and_ghost(&self, frame: &mut Frame, bounds: Rectangle) {
+        if !self.caret_visible && self.ghost_text.is_none() {
+            return;
+        }
+        let line = self.cursor.line;
+        if line >= self.document.line_count() {
+            return;
+        }
+        let p = self.palette;
+        let font_size = self.font_size;
+        let line_height = self.line_height();
+        let char_width = self.char_width();
+        let text_x0 = GUTTER_WIDTH + TEXT_INSET;
+
+        let (row_in_line, row_start_char, base_row) = if self.word_wrap {
+            let text = self.document.line_text_capped(line, crate::state::MAX_RENDERED_LINE_CHARS);
+            let wrap_cols = wrap_cols_for(bounds.width - text_x0, char_width);
+            let row_starts = wrap_row_starts(&text, wrap_cols);
+            let col_byte = char_to_byte(&text, self.cursor.col);
+            let row_in_line = row_starts.partition_point(|&b| b <= col_byte).saturating_sub(1).min(row_starts.len() - 1);
+            let row_start_char = byte_to_char(&text, row_starts[row_in_line]);
+            (row_in_line, row_start_char, self.wrap_offsets[line] as usize)
+        } else {
+            (0, 0, line)
+        };
+
+        let y = TOP_PAD + (base_row + row_in_line) as f32 * line_height;
+        let x = text_x0 + (self.cursor.col - row_start_char) as f32 * char_width;
+        if x > bounds.width {
+            return;
+        }
+
+        if self.caret_visible {
+            frame.fill(
+                &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
+                color(p.accent_solid),
+            );
+        }
+        // Ghost text steadily shown (not gated on `caret_visible`) — VS
+        // Code's own inline suggestions don't blink either, only the caret
+        // drawn in front of them does.
+        if let Some(ghost) = &self.ghost_text {
+            frame.fill_text(Text {
+                content: ghost.clone(),
+                position: Point::new(x, y),
+                color: tint(p.text_muted, 0.6),
+                size: Pixels(font_size),
+                line_height: LineHeight::Absolute(Pixels(line_height)),
+                font: fonts::mono(iced::font::Weight::Normal),
+                align_y: Vertical::Top,
+                ..Text::default()
+            });
+        }
+    }
+}
+
+impl canvas::Program<Message> for EditorCanvas {
+    type State = CanvasState;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: &canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<Message>> {
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // A press outside this canvas hands focus away. Nothing used
+                // to clear `focused` at all, and `handle_key` captures every
+                // keystroke while it is set — so after one click in the
+                // editor, typing into the chat panel's input (which sits
+                // *after* `code_area` in the shell's row, and so only sees
+                // events this canvas declines) went into the source file
+                // instead. Focus has to be released explicitly, because an
+                // outside click is exactly the event that never reaches the
+                // branch below.
+                let Some(position) = cursor.position_in(bounds) else {
+                    state.focused = false;
+                    return None;
+                };
+                state.focused = true;
+                let (line, col) = self.hit_test(position, bounds.width);
+
+                // Ctrl/Cmd+Click jumps to the symbol's definition instead of
+                // placing the cursor or starting a drag-select — the same
+                // modifier VS Code uses for this gesture. Checked before the
+                // gutter/revert handling below since it's meant to apply
+                // anywhere over the text, not just plain clicks. Primary-pane
+                // only (see `Pane`) — in the split pane this just falls
+                // through to a plain click below.
+                if state.modifiers.command() && self.pane == Pane::Primary {
+                    return Some(canvas::Action::publish(Message::GoToDefinition { line, col }).and_capture());
+                }
+
+                // A click on a changed line's gutter marker arms that line
+                // for revert instead of placing the cursor or starting a
+                // drag-select — the marker itself is the affordance (unlike
+                // a Changes-panel row, a changed line's bar is always
+                // visible, so there's no separate hover-reveal step
+                // needed). A second click on the same already-armed marker
+                // confirms and actually reverts it (drawn as a "Revert"
+                // label in place of the line number — see `draw`), so a
+                // stray click can't silently discard edits. Unmarked-line
+                // gutter clicks fall through unchanged, to today's
+                // cursor-to-column-0. Primary-pane only, same as go to
+                // definition above.
+                if self.pane == Pane::Primary
+                    && position.x < GUTTER_WIDTH
+                    && self.gutter_marks.get(line).and_then(Option::as_ref).is_some()
+                {
+                    let message = if self.pending_revert_line == Some(line) {
+                        Message::RevertLine { line }
+                    } else {
+                        Message::PromptRevertLine { line }
+                    };
+                    return Some(canvas::Action::publish(message).and_capture());
+                }
+
+                // Any other click while a revert is armed just dismisses the
+                // prompt, the same "click away to cancel" shape as a context
+                // menu — a stray click can't both cancel the prompt and move
+                // the cursor/selection in one motion, so the next click
+                // always lands where the user actually meant it to.
+                if self.pending_revert_line.is_some() {
+                    return Some(canvas::Action::publish(Message::CancelRevertLine).and_capture());
+                }
+                state.dragging = true;
+                let pane = self.pane;
+
+                // Shift-click always just extends, same as shift+arrow —
+                // doesn't participate in double/triple-click detection.
+                if state.modifiers.shift() {
+                    state.last_click = None;
+                    state.click_streak = 0;
+                    return Some(
+                        canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane })
+                            .and_capture(),
+                    );
+                }
+
+                let now = Instant::now();
+                let repeats_last = state.last_click.is_some_and(|(at, l, c)| {
+                    l == line && c == col && now.duration_since(at) < CLICK_STREAK_WINDOW
+                });
+                state.click_streak = if repeats_last { state.click_streak % 3 + 1 } else { 1 };
+                state.last_click = Some((now, line, col));
+
+                let message = match state.click_streak {
+                    2 => Message::EditorSelectWord { line, col, pane },
+                    3 => Message::EditorSelectLine { line, pane },
+                    _ => Message::EditorClick { line, col, extend: false, pane },
+                };
+                Some(canvas::Action::publish(message).and_capture())
+            }
+            // Drag-select: every cursor move while the button is still down
+            // extends the selection from wherever it started, the same way
+            // shift-click does. Computed from the cursor's absolute
+            // position (not `position_in`, which is `None` once the cursor
+            // strays outside the canvas's own bounds) so a drag past either
+            // edge still keeps extending rather than freezing — `hit_test`
+            // already clamps whatever it's given to a valid line/col.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
+                let position = cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))?;
+                let (line, col) = self.hit_test(position, bounds.width);
+                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane: self.pane }).and_capture())
+            }
+            // Passive hover tracking (dwell-based `textDocument/hover`) —
+            // only published on an actual cell change, so a stationary
+            // mouse's sub-pixel `CursorMoved` noise doesn't restart the
+            // dwell timer or force a `view()` rebuild every frame.
+            // Primary-pane only, same as go to definition above — the split
+            // pane never requests hover info.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if !state.dragging && self.pane == Pane::Primary => {
+                match cursor.position_in(bounds) {
+                    Some(position) => {
+                        let cell = self.hit_test(position, bounds.width);
+                        if state.hover_cell == Some(cell) {
+                            None
+                        } else {
+                            state.hover_cell = Some(cell);
+                            Some(canvas::Action::publish(Message::EditorHoverMove {
+                                line: cell.0,
+                                col: cell.1,
+                            }))
+                        }
+                    }
+                    None if state.hover_cell.take().is_some() => {
+                        Some(canvas::Action::publish(Message::EditorHoverLeave))
+                    }
+                    None => None,
+                }
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.dragging = false;
+                None
+            }
+            // A right-click over the text opens the code-actions context
+            // menu (Rename Symbol, Go to Definition, Find All References,
+            // Search Symbol in Project) at the click position — primary
+            // pane only, same as the other LSP-assisted interactions (see
+            // `Pane`'s own doc comment). One outside the canvas, or over the
+            // split pane, falls through to the generic case right below,
+            // same "outside click releases focus" behavior as a left-click.
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+                if self.pane == Pane::Primary && cursor.position_in(bounds).is_some() =>
+            {
+                let position = cursor.position_in(bounds)?;
+                let (line, col) = self.hit_test(position, bounds.width);
+                let screen = cursor.position()?;
+                state.focused = true;
+                Some(
+                    canvas::Action::publish(Message::OpenEditorContext {
+                        line,
+                        col,
+                        x: screen.x,
+                        y: screen.y,
+                    })
+                    .and_capture(),
+                )
+            }
+            // Right/middle presses outside the canvas give focus away too —
+            // same reason as the left-button case above (a right-click into
+            // the sidebar opens its context menu, and shouldn't leave this
+            // canvas still eating the keyboard).
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(_)) => {
+                if cursor.position_in(bounds).is_none() {
+                    state.focused = false;
+                }
+                None
+            }
+            canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+                None
+            }
+            canvas::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                text,
+                ..
+            }) => {
+                state.modifiers = *modifiers;
+                if !state.focused {
+                    return None;
+                }
+                self.handle_key(key, *modifiers, text.as_deref())
+            }
+            _ => None,
+        }
+    }
+
+    fn draw(
+        &self,
+        state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let sig = self.cache_signature();
+        if state.cached_sig.borrow().as_ref() != Some(&sig) {
+            state.text_cache.clear();
+            *state.cached_sig.borrow_mut() = Some(sig);
+        }
+        let content = state
+            .text_cache
+            .draw(renderer, bounds.size(), |frame| self.draw_content(frame, bounds));
+
+        // Uncached: recomputed every call, including the 530ms caret blink,
+        // but it's one rectangle and at most one short text fill — cheap
+        // enough that caching it would only add bookkeeping.
+        let mut overlay = Frame::new(renderer, bounds.size());
+        self.draw_caret_and_ghost(&mut overlay, bounds);
+
+        vec![content, overlay.into_geometry()]
     }
 
     fn mouse_interaction(

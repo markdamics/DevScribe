@@ -627,6 +627,15 @@ pub fn start_search(state: &mut State) -> iced::Task<Message> {
         state.search_in_progress = false;
         return iced::Task::none();
     }
+    // `search_results` already holds this exact query's answer (nothing's
+    // touched the project since — `Message::FilesChanged` clears
+    // `search_last_query` specifically to invalidate this) — walking and
+    // reading every matching file again would just re-derive the same
+    // result a moment later.
+    if state.search_query == state.search_last_query {
+        state.search_in_progress = false;
+        return iced::Task::none();
+    }
 
     let query = state.search_query.clone();
     let files: Vec<PathBuf> = fs_tree::flatten_files(&state.tree).into_iter().map(Path::to_path_buf).collect();
@@ -714,6 +723,14 @@ pub fn reset_project_scoped_state(state: &mut State) {
     state.open_tabs.clear();
     state.active_tab = None;
     state.closed_tabs.clear();
+    state.pinned_tabs.clear();
+    // Keyed by `TabKey` (which embeds a `PathBuf`), so a stale entry from the
+    // previous project would just never match anything new — cleared anyway
+    // to avoid this growing unbounded across many project switches in one
+    // session.
+    state.tab_last_activated.clear();
+    state.tab_opening.clear();
+    state.tab_closing_ghosts.clear();
     state.draft = None;
     state.ctx_menu = None;
     state.changes_panel_open = false;

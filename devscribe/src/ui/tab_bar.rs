@@ -104,6 +104,7 @@ fn tab_shell(
     select: Message,
     close: Message,
     active: bool,
+    pinned: Option<Message>,
     p: Palette,
     density: Density,
     content: Element<'static, Message>,
@@ -136,11 +137,23 @@ fn tab_shell(
             }
         });
 
-    let close = button(widgets::center_fill(text("\u{2715}").size(crate::text_scale::px(13.0))))
+    // A pinned tab swaps its close (X) button for a pin icon: clicking it
+    // unpins rather than closing outright, so getting rid of a pinned tab
+    // always takes two deliberate clicks (unpin, then the now-restored X) —
+    // never one, which is the whole point of pinning it (see
+    // `close_tab_unless_pinned`'s own doc comment). `widgets::pin_icon`
+    // rather than a Unicode pin glyph — see its own doc comment for why a
+    // glyph risks either a missing-glyph box or a stray splash of color in
+    // an otherwise monochrome icon set.
+    let (close_content, close_message, close_tip): (Element<'static, Message>, Message, &'static str) = match pinned {
+        Some(unpin) => (widgets::pin_icon(color(p.text_muted), 10.0), unpin, "Pinned \u{2014} click to unpin"),
+        None => (text("\u{2715}").size(crate::text_scale::px(13.0)).into(), close, "Close tab"),
+    };
+    let close = button(widgets::center_fill(close_content))
         .padding(0.0)
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(tab_h))
-        .on_press(close)
+        .on_press(close_message)
         .style(move |_theme, status| {
             let hovered = status == button::Status::Hovered;
             button::Style {
@@ -149,6 +162,11 @@ fn tab_shell(
                 } else {
                     None
                 },
+                // Only affects the close-X text (`text_color` inherits into
+                // a `Text` child, not `pin_icon`'s own fixed-color shapes) —
+                // the pin icon stays a flat, non-hover-reactive color, an
+                // accepted trade-off for not needing per-frame hover state
+                // threaded into `pin_icon`'s construction.
                 text_color: if hovered {
                     color(p.text_strong)
                 } else {
@@ -157,7 +175,7 @@ fn tab_shell(
                 ..button::Style::default()
             }
         });
-    let close = widgets::tooltip(close, "Close tab", p);
+    let close = widgets::tooltip(close, close_tip, p);
 
     let inner = container(row![select, close].align_y(Alignment::Center))
         .height(Length::Fixed(tab_h))
@@ -215,6 +233,24 @@ fn diff_tab_label(path: &std::path::Path, p: Palette) -> Element<'static, Messag
     .into()
 }
 
+/// A closed tab's label, fading out in place (`State::tab_closing_ghosts`)
+/// — plain text, no button/close/pin affordance of its own, since there's
+/// nothing left underneath it to act on.
+fn closing_ghost_view(ghost: &state::ClosingTabGhost, bar_h: f32, p: Palette) -> Element<'static, Message> {
+    let progress = (ghost.started_at.elapsed().as_secs_f32() / state::TAB_ANIM_DURATION.as_secs_f32()).min(1.0);
+    let alpha = 1.0 - progress;
+    container(
+        text(ghost.label.clone())
+            .font(fonts::sans(Weight::Medium))
+            .size(crate::text_scale::px(15.0))
+            .color(Color { a: alpha, ..color(p.text_muted) }),
+    )
+    .height(Length::Fixed(bar_h))
+    .align_y(Vertical::Center)
+    .padding(Padding { top: 0.0, right: 16.0, bottom: 0.0, left: 16.0 })
+    .into()
+}
+
 fn chat_tab_label(p: Palette) -> Element<'static, Message> {
     row![
         widgets::dot(color(p.accent_solid), 6.0),
@@ -237,19 +273,40 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     // however many file tabs happen to be scrolled open.
     if state.chat_tab_open {
         let active = state.active_tab.as_ref() == Some(&TabKey::Chat);
-        let shell = tab_shell(Message::ChatOpenTab, Message::ChatCloseTab, active, p, state.density, chat_tab_label(p));
+        // Never pinnable (see `State::pinned_tabs`'s own doc comment).
+        let shell = tab_shell(Message::ChatOpenTab, Message::ChatCloseTab, active, None, p, state.density, chat_tab_label(p));
         tab_elements.push(hoverable(shell, TabKey::Chat));
     }
-    tab_elements.extend(state.open_tabs.iter().map(|tab| {
+    tab_elements.extend(state.open_tabs.iter().flat_map(|tab| {
         let key = tab.key();
         let active = state.active_tab.as_ref() == Some(&key);
         let label = match tab {
             OpenTab::File(editor) => file_tab_label(editor, p),
             OpenTab::Diff(path) => diff_tab_label(path, p),
         };
-        let shell = tab_shell(Message::SelectOpenTab(key.clone()), Message::CloseTab(key.clone()), active, p, state.density, label);
-        hoverable(shell, key)
+        let pinned = state::is_tab_pinned(state, &key).then(|| Message::ToggleTabPinned(key.clone()));
+        let shell = tab_shell(Message::SelectOpenTab(key.clone()), Message::CloseTab(key.clone()), active, pinned, p, state.density, label);
+
+        let mut items: Vec<Element<'static, Message>> = Vec::with_capacity(2);
+        // A shrinking leading spacer stands in for a real slide-in: the tab
+        // itself renders at full size from frame one (no clipping/reflow
+        // tricks needed), while the gap it's sliding out of collapses to 0
+        // over `TAB_ANIM_DURATION`. See `TabAnimTick`'s own doc comment for
+        // why this needs its own tick instead of piggybacking on
+        // `TabPreviewTick`.
+        if let Some(started) = state.tab_opening.get(&key) {
+            let progress = (started.elapsed().as_secs_f32() / state::TAB_ANIM_DURATION.as_secs_f32()).min(1.0);
+            let width = state::TAB_SLIDE_PX * (1.0 - progress);
+            if width > 0.0 {
+                items.push(Space::new().width(Length::Fixed(width)).into());
+            }
+        }
+        items.push(hoverable(shell, key));
+        items
     }));
+    for ghost in &state.tab_closing_ghosts {
+        tab_elements.push(closing_ghost_view(ghost, bar_h, p));
+    }
 
     let tabs = scrollable(row(tab_elements).height(Length::Fixed(bar_h)))
         .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default().width(0.0).scroller_width(0.0)))
@@ -334,10 +391,17 @@ pub fn overflow_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
         return None;
     }
 
+    let mut rows: Vec<Element<'static, Message>> =
+        vec![overflow_row("Close all other tabs", "\u{2325}\u{2318}W", Message::CloseOtherTabs, p)];
+    // Only a `File` tab is pinnable (see `State::pinned_tabs`) — omitted
+    // entirely rather than shown disabled when the active tab is
+    // `Diff`/`Search`/`Chat`/nothing.
+    if let Some(key @ TabKey::File(_)) = state.active_tab.clone() {
+        let label = if state::is_tab_pinned(state, &key) { "Unpin tab" } else { "Pin tab" };
+        rows.push(overflow_row(label, "", Message::ToggleTabPinned(key), p));
+    }
     let menu = container(
-        column![
-            overflow_row("Close all other tabs", "\u{2325}\u{2318}W", Message::CloseOtherTabs, p),
-        ]
+        column(rows)
         .spacing(2.0)
         .padding(6.0),
     )
