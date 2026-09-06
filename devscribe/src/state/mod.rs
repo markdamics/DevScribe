@@ -1504,6 +1504,10 @@ pub enum Message {
     CloseOtherTabs,
     RevealActiveInTree,
     ReopenClosedTab,
+    /// The sidebar EXPLORER header's terminal button — opens a real,
+    /// external terminal rooted at `State::root`. See
+    /// `sidebar::launch_terminal_in_dir`.
+    OpenTerminal,
     /// "Open folder…" — welcome screen or the sidebar projects dropdown.
     OpenFolderDialog,
     /// "New project" — same picker as `OpenFolderDialog`, but the result
@@ -3137,6 +3141,13 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ReopenClosedTab => {
             state.overflow_open = false;
             reopen_closed_tab(state);
+        }
+        Message::OpenTerminal => {
+            if sidebar::launch_terminal_in_dir(&state.root) {
+                push_toast(state, ToastKind::Success, "Opened a terminal in the project folder.");
+            } else {
+                push_toast(state, ToastKind::Warning, "Couldn't open a terminal automatically \u{2014} no known terminal emulator found.");
+            }
         }
         Message::OpenFolderDialog => {
             state.projects_open = false;

@@ -477,6 +477,19 @@ pub fn focus_search(state: &mut State) {
     state.active_tab = Some(TabKey::Search);
 }
 
+/// Best-effort: tries a handful of common Linux terminal emulators in turn,
+/// launching each rooted at `dir` via `current_dir`, stopping at the first
+/// one that actually spawns. Same shape (and same "no portable API" reason)
+/// as `chat::launch_terminal_running_claude`, minus the `-e claude` payload
+/// — this just opens a plain shell. `Command::spawn` here is a detached,
+/// fire-and-forget launch (the new terminal process runs independently of
+/// DevScribe), so no `iced_runtime::task::blocking` is needed.
+pub fn launch_terminal_in_dir(dir: &Path) -> bool {
+    const CANDIDATES: &[&str] =
+        &["x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "alacritty", "kitty", "xterm"];
+    CANDIDATES.iter().any(|terminal| std::process::Command::new(terminal).current_dir(dir).spawn().is_ok())
+}
+
 /// Computes the sidebar's "CHANGES" panel contents: every file `repo`
 /// reports as differing from `HEAD`, with insertion/deletion counts from
 /// `devscribe_core::diff::diff_lines` run against `HEAD`'s blob and the

@@ -866,10 +866,10 @@ fn header_icon_button(label: &'static str, message: Message, p: Palette) -> Elem
 }
 
 /// The tree's "EXPLORER" header row: New file (⌘N) / New folder (⇧⌘N) /
-/// Collapse all. Deliberately doesn't include the mockup's "More actions ⋯"
-/// menu (New window/Open folder/Save as/…) — that needs a native
-/// folder-picker dependency DevScribe doesn't have yet, tracked separately
-/// (see the roadmap's Phase 9).
+/// Open terminal / Collapse all. Deliberately doesn't include the mockup's
+/// "More actions ⋯" menu (New window/Open folder/Save as/…) — that needs a
+/// native folder-picker dependency DevScribe doesn't have yet, tracked
+/// separately (see the roadmap's Phase 9).
 fn explorer_header(p: Palette) -> Element<'static, Message> {
     row![
         text("EXPLORER")
@@ -879,6 +879,7 @@ fn explorer_header(p: Palette) -> Element<'static, Message> {
             .width(Length::Fill),
         header_icon_button("+F", Message::BeginDraft(DraftKind::NewFile), p),
         header_icon_button("+D", Message::BeginDraft(DraftKind::NewFolder), p),
+        header_icon_button(">_", Message::OpenTerminal, p),
         header_icon_button("\u{21b1}", Message::CollapseAllDirs, p),
     ]
     .spacing(5.0)
