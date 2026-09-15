@@ -521,6 +521,15 @@ pub struct State {
     /// every diagnostic across all open files. Toggled by clicking the
     /// status bar's Problems indicator — see `status_bar.rs`.
     pub problems_panel_open: bool,
+    /// Height of the Problems dock panel in logical pixels — same
+    /// drag-handle idiom as `sidebar_width`/`chat_panel_width`, clamped to
+    /// `[DOCK_PANEL_MIN_HEIGHT, DOCK_PANEL_MAX_HEIGHT]`. Persisted via
+    /// `Settings` (see `chat_panel_width`'s own doc comment for why there
+    /// rather than the per-project `Session`).
+    pub problems_panel_height: f32,
+    /// `true` while the Problems panel's resize handle is being dragged —
+    /// mirrors `chat_resizing`.
+    pub problems_panel_resizing: bool,
     /// `true` while the status bar's "Background Tasks" popover is open —
     /// a roll-up of the language server's status/progress, the file
     /// watcher, and git, for the visual-feedback pass (roadmap item 8).
@@ -549,6 +558,13 @@ pub struct State {
     /// guess which of the two actions populated it.
     pub references_label: String,
     pub references_results: Vec<LocationEntry>,
+    /// Height of the References/Locations dock panel — same idiom as
+    /// `problems_panel_height`, its own `[DOCK_PANEL_MIN_HEIGHT,
+    /// DOCK_PANEL_MAX_HEIGHT]`-clamped, `Settings`-persisted sibling.
+    pub references_panel_height: f32,
+    /// `true` while the References panel's resize handle is being dragged —
+    /// mirrors `problems_panel_resizing`.
+    pub references_panel_resizing: bool,
     /// When the most recent edit landed, or `None` when nothing is pending.
     /// Drives the `EditSettleTick` subscription, which only exists while
     /// this is `Some` — an unconditional tick would rebuild the entire view
@@ -896,6 +912,8 @@ impl Default for State {
             changes_panel_open: false,
             pending_discard: None,
             problems_panel_open: false,
+            problems_panel_height: settings.problems_panel_height,
+            problems_panel_resizing: false,
             background_tasks_open: false,
             eol_picker_open: false,
             language_picker_open: false,
@@ -903,6 +921,8 @@ impl Default for State {
             references_open: false,
             references_label: String::new(),
             references_results: Vec::new(),
+            references_panel_height: settings.references_panel_height,
+            references_panel_resizing: false,
             edit_settled_at: None,
             pending_edits: Vec::new(),
             search_query: String::new(),
@@ -1019,6 +1039,16 @@ pub enum Message {
     /// Clicked the status bar's Problems indicator — see
     /// `State::problems_panel_open`.
     ToggleProblemsPanel,
+    /// Pressed the Problems dock panel's own top-edge resize handle.
+    ProblemsPanelResizeStarted,
+    /// Cursor moved while resizing — carries the cursor's raw window-space Y
+    /// position, which the handler turns into a panel height by subtracting
+    /// it from wherever the panel's own bottom edge sits (the status bar,
+    /// or the References panel's own current height on top of that if it's
+    /// also open beneath this one) — this handle doesn't sit flush against
+    /// any window edge, same reasoning as `SplitResizeDragged`'s own.
+    ProblemsPanelResizeDragged(f32),
+    ProblemsPanelResizeEnded,
     /// Clicked the status bar's language-server indicator — opens the
     /// "Background Tasks" popover (`State::background_tasks_open`).
     ToggleBackgroundTasks,
@@ -1185,6 +1215,15 @@ pub enum Message {
     /// (see `chat_panel::input_bar`'s `key_binding`) to submit instead of
     /// inserting a newline; Shift+Enter falls through to here as normal.
     ChatInputAction(iced::widget::text_editor::Action),
+    /// Mouse/keyboard selection inside a transcript bubble's
+    /// `ChatThread::message_content` slot (see `chat_panel::selectable_text`)
+    /// — `usize` is that message's index into both `ChatThread::messages`
+    /// and `message_content`, kept in lockstep by
+    /// `chat::sync_message_content`. Only ever applies non-`is_edit()`
+    /// actions (selection/cursor motion/copy) — see this message's own
+    /// handler — since a transcript bubble is read-only, not a second
+    /// composer.
+    ChatMessageSelect(usize, iced::widget::text_editor::Action),
     /// Opens (or focuses) a diff tab for `path`, from a sidebar Changes row.
     /// Distinct from `PaletteAction::ViewDiffOfActiveFile`, which only ever
     /// targets the currently active tab.
@@ -1562,14 +1601,34 @@ pub enum Message {
     /// subscribed to while some editor actually has a pending hover
     /// position, same shape as `SearchDebounceTick`.
     HoverDebounceTick,
-    /// Ctrl/Cmd+Click on `(line, col)`, or `F12` on the cursor's own
-    /// position — "Go to Definition". A single result jumps there directly;
-    /// more than one opens the Locations panel (`apply_locations`).
+    /// `F12` on the cursor's own position — "Go to Definition". A single
+    /// result jumps there directly; more than one opens the Locations panel
+    /// (`apply_locations`).
     GoToDefinition { line: usize, col: usize },
-    /// `Shift+F12` on the cursor's position — "Find All References" across
-    /// the whole project.
+    /// `Shift+F12` on the cursor's own position, or the context menu's
+    /// "Find All References" row — "Find All References" across the whole
+    /// project. Same `apply_locations` landing as `GoToDefinition`: a
+    /// single reference jumps there directly, more than one opens the
+    /// Locations panel. Not what Ctrl/Cmd+Click does — see
+    /// `EditorCanvas::update`'s `ButtonPressed` arm for that gesture's own,
+    /// LSP-independent "jump to first occurrence in this file" behavior.
     FindReferences { line: usize, col: usize },
+    /// Ctrl/Cmd+Click's jump-to-first-occurrence — moves the cursor like
+    /// `EditorClick`, but (unlike an ordinary click, which is always
+    /// somewhere already on screen) also scrolls the target into view,
+    /// since the first occurrence of a name used far from its declaration
+    /// is easily off-screen above wherever was clicked.
+    JumpToFirstOccurrence { line: usize, col: usize, pane: Pane },
     ToggleReferencesPanel,
+    /// Pressed the References dock panel's own top-edge resize handle.
+    ReferencesPanelResizeStarted,
+    /// Cursor moved while resizing — same "subtract from wherever the
+    /// panel's own bottom edge sits" math `ProblemsPanelResizeDragged`
+    /// uses, just simpler: the References panel is always the bottommost
+    /// dock panel (pushed after Problems in `shell.rs`'s `view`), so its
+    /// bottom edge is always exactly the status bar's top edge.
+    ReferencesPanelResizeDragged(f32),
+    ReferencesPanelResizeEnded,
     /// A row in the Locations dock panel was clicked.
     JumpToLocation(PathBuf, CursorPos),
     /// A right-click on the primary pane's editor canvas — opens the
@@ -1812,6 +1871,13 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             persist_session(state);
         }
         Message::ChatInputAction(action) => state.chat.input.perform(action),
+        Message::ChatMessageSelect(index, action) => {
+            if !action.is_edit()
+                && let Some(content) = state.chat.message_content.get_mut(index)
+            {
+                content.perform(action);
+            }
+        }
         Message::ChatSubmit => {
             submit_chat_prompt(state);
             // `submit_chat_prompt` (via `send_chat_text`) already re-pins
@@ -2068,6 +2134,22 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             state.problems_panel_open = !state.problems_panel_open;
             persist_session(state);
         }
+        Message::ProblemsPanelResizeStarted => state.problems_panel_resizing = true,
+        Message::ProblemsPanelResizeDragged(y) => {
+            if state.problems_panel_resizing {
+                // The References panel (if open) sits directly beneath this
+                // one, so its height counts as part of the distance down to
+                // the status bar — see `Message::ProblemsPanelResizeDragged`'s
+                // own doc comment.
+                let references_extra = if state.references_open { state.references_panel_height } else { 0.0 };
+                let bottom = state.window_height - state.density.status_bar_h() - references_extra;
+                state.problems_panel_height = (bottom - y).clamp(DOCK_PANEL_MIN_HEIGHT, DOCK_PANEL_MAX_HEIGHT);
+            }
+        }
+        Message::ProblemsPanelResizeEnded => {
+            state.problems_panel_resizing = false;
+            persist_settings(state);
+        }
         Message::ToggleBackgroundTasks => {
             let opening = !state.background_tasks_open;
             close_status_bar_popovers(state);
@@ -2321,6 +2403,17 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.clear_hover();
                 editor.click(line, col, extend);
             }
+        }
+        Message::JumpToFirstOccurrence { line, col, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.close_completions();
+                editor.close_snippet();
+                editor.clear_hover();
+                editor.click(line, col, false);
+            }
+            return scroll_cursor_into_view(state, pane);
         }
         Message::EditorSelectWord { line, col, pane } => {
             if let Some(path) = pane_file_path(state, pane)
@@ -3430,6 +3523,17 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ToggleReferencesPanel => {
             state.references_open = !state.references_open;
         }
+        Message::ReferencesPanelResizeStarted => state.references_panel_resizing = true,
+        Message::ReferencesPanelResizeDragged(y) => {
+            if state.references_panel_resizing {
+                let bottom = state.window_height - state.density.status_bar_h();
+                state.references_panel_height = (bottom - y).clamp(DOCK_PANEL_MIN_HEIGHT, DOCK_PANEL_MAX_HEIGHT);
+            }
+        }
+        Message::ReferencesPanelResizeEnded => {
+            state.references_panel_resizing = false;
+            persist_settings(state);
+        }
         Message::JumpToLocation(path, pos) => {
             // Left open, same as the Problems panel's `OpenDiagnosticAt` —
             // browsing several results one after another is the common case
@@ -3591,6 +3695,8 @@ fn persist_settings(state: &State) {
         copilot_inline_enabled: state.copilot_inline_enabled,
         chat_mode: state.chat_mode,
         chat_panel_width: state.chat_panel_width,
+        problems_panel_height: state.problems_panel_height,
+        references_panel_height: state.references_panel_height,
         tab_size: state.tab_size,
         show_line_numbers: state.show_line_numbers,
         word_wrap: state.word_wrap,
@@ -4105,6 +4211,28 @@ fn window_events((id, event): (iced::window::Id, iced::window::Event)) -> Messag
     }
 }
 
+/// Same window-wide cursor tracking as `sidebar_resize_events`, for the
+/// Problems dock panel's own top-edge drag handle. Only subscribed while
+/// `state.problems_panel_resizing`.
+fn problems_panel_resize_events(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::ProblemsPanelResizeDragged(position.y)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(_)) => Some(Message::ProblemsPanelResizeEnded),
+        _ => None,
+    }
+}
+
+/// Same window-wide cursor tracking as `sidebar_resize_events`, for the
+/// References dock panel's own top-edge drag handle. Only subscribed while
+/// `state.references_panel_resizing`.
+fn references_panel_resize_events(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::ReferencesPanelResizeDragged(position.y)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(_)) => Some(Message::ReferencesPanelResizeEnded),
+        _ => None,
+    }
+}
+
 pub fn subscription(state: &State) -> iced::Subscription<Message> {
     let mut subs = vec![
         iced::time::every(std::time::Duration::from_millis(530)).map(|_| Message::CaretTick),
@@ -4200,6 +4328,12 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
     }
     if state.split_resizing {
         subs.push(iced::event::listen_with(split_resize_events));
+    }
+    if state.problems_panel_resizing {
+        subs.push(iced::event::listen_with(problems_panel_resize_events));
+    }
+    if state.references_panel_resizing {
+        subs.push(iced::event::listen_with(references_panel_resize_events));
     }
     iced::Subscription::batch(subs)
 }

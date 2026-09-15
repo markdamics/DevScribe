@@ -1876,6 +1876,56 @@ fn split_resize_dragged_is_ignored_when_not_resizing() {
 }
 
 #[test]
+fn references_panel_resize_dragged_computes_height_from_the_status_bar_and_clamps() {
+    let mut state = State { references_panel_resizing: true, window_height: 800.0, ..State::default() };
+    // Comfortable density (the default) has a 28px status bar, so the
+    // panel's bottom edge sits at 800 - 28 == 772.
+    let _ = update(&mut state, Message::ReferencesPanelResizeDragged(472.0));
+    assert_eq!(state.references_panel_height, 300.0, "772 - 472 == 300, within bounds");
+
+    let _ = update(&mut state, Message::ReferencesPanelResizeDragged(772.0 - DOCK_PANEL_MAX_HEIGHT - 50.0));
+    assert_eq!(state.references_panel_height, DOCK_PANEL_MAX_HEIGHT, "dragging far up exceeds the max, so it clamps");
+
+    let _ = update(&mut state, Message::ReferencesPanelResizeDragged(772.0 - DOCK_PANEL_MIN_HEIGHT + 50.0));
+    assert_eq!(state.references_panel_height, DOCK_PANEL_MIN_HEIGHT, "dragging past the bottom would go under the min, so it clamps");
+}
+
+#[test]
+fn references_panel_resize_dragged_is_ignored_when_not_resizing() {
+    let mut state = State { references_panel_resizing: false, window_height: 800.0, references_panel_height: 250.0, ..State::default() };
+    let _ = update(&mut state, Message::ReferencesPanelResizeDragged(400.0));
+    assert_eq!(state.references_panel_height, 250.0);
+}
+
+#[test]
+fn problems_panel_resize_dragged_accounts_for_an_open_references_panel_beneath_it() {
+    let mut state = State {
+        problems_panel_resizing: true,
+        window_height: 800.0,
+        references_open: true,
+        references_panel_height: 200.0,
+        ..State::default()
+    };
+    // Bottom edge is the status bar (28) plus the open References panel
+    // (200) stacked directly beneath this one, so 800 - 28 - 200 == 572.
+    let _ = update(&mut state, Message::ProblemsPanelResizeDragged(372.0));
+    assert_eq!(state.problems_panel_height, 200.0, "572 - 372 == 200, within bounds");
+}
+
+#[test]
+fn problems_panel_resize_dragged_ignores_the_references_panel_when_it_is_closed() {
+    let mut state = State {
+        problems_panel_resizing: true,
+        window_height: 800.0,
+        references_open: false,
+        references_panel_height: 200.0, // stale/irrelevant while closed
+        ..State::default()
+    };
+    let _ = update(&mut state, Message::ProblemsPanelResizeDragged(472.0));
+    assert_eq!(state.problems_panel_height, 300.0, "772 - 472 == 300, same as if References had never been open");
+}
+
+#[test]
 fn chat_new_session_picks_a_fresh_id_and_clears_the_transcript() {
     let mut state = State::default();
     let old_id = state.chat_session_id.clone();
@@ -2525,6 +2575,52 @@ fn word_at_is_none_over_whitespace_or_punctuation() {
     let editor = EditorState::new(Document::from_str("let foo_bar = 1;\n"), PathBuf::from("t.rs"));
     assert_eq!(editor.word_at(0, 3), None, "the space after \"let\"");
     assert_eq!(editor.word_at(0, 12), None, "the \"=\" itself");
+}
+
+#[test]
+fn word_occurrences_finds_every_reference_to_the_identifier_under_the_cursor() {
+    let editor = EditorState::new(Document::from_str("let foo = 1;\nlet bar = foo + foo;\n"), PathBuf::from("t.rs"));
+    // Cursor on the declaration's `foo` (chars 4..7 on line 0).
+    let occurrences = editor.word_occurrences(0, 5);
+    let text = editor.document.text();
+    let words: Vec<String> = occurrences.iter().map(|&(s, e)| text.slice(s..e).to_string()).collect();
+    assert_eq!(words, vec!["foo", "foo", "foo"], "the declaration plus both later reads");
+}
+
+#[test]
+fn word_occurrences_does_not_match_a_longer_identifier_sharing_the_same_prefix() {
+    let editor = EditorState::new(Document::from_str("let foo = 1;\nlet foobar = 2;\n"), PathBuf::from("t.rs"));
+    let occurrences = editor.word_occurrences(0, 5);
+    assert_eq!(occurrences.len(), 1, "foobar is a different identifier, not another occurrence of foo");
+}
+
+#[test]
+fn word_occurrences_is_empty_when_the_cursor_is_not_on_an_identifier() {
+    let editor = EditorState::new(Document::from_str("let foo = 1;\n"), PathBuf::from("t.rs"));
+    assert_eq!(editor.word_occurrences(0, 3), Vec::new(), "the space after \"let\"");
+}
+
+#[test]
+fn first_word_occurrence_finds_the_earliest_match_regardless_of_where_it_is_clicked() {
+    let document = Document::from_str("let foo = 1;\nlet bar = foo + foo;\n");
+    // Clicking any of the three usages should resolve to the same
+    // declaration-site range (chars 4..7 on line 0).
+    assert_eq!(first_word_occurrence(&document, "foo"), Some((4, 7)));
+}
+
+#[test]
+fn first_word_occurrence_does_not_match_a_longer_identifier_sharing_the_same_prefix() {
+    let document = Document::from_str("let foobar = 1;\nlet foo = 2;\n");
+    // "foo" doesn't occur at all until line 1 — "foobar" on line 0 isn't a match.
+    let (start, end) = first_word_occurrence(&document, "foo").unwrap();
+    assert_eq!(document.line_col(start), (1, 4));
+    assert_eq!(document.line_col(end), (1, 7));
+}
+
+#[test]
+fn first_word_occurrence_is_none_for_a_word_that_never_occurs() {
+    let document = Document::from_str("let foo = 1;\n");
+    assert_eq!(first_word_occurrence(&document, "bar"), None);
 }
 
 #[test]
@@ -3367,6 +3463,32 @@ fn scroll_cursor_into_view_is_a_no_op_when_already_visible() {
     let editor = find_editor(&state, &files.a).unwrap();
     assert_eq!(editor.scroll_offset_x, 0.0);
     assert_eq!(editor.scroll_offset, 0.0);
+}
+
+#[test]
+fn jump_to_first_occurrence_scrolls_the_target_into_view() {
+    // Unlike an ordinary click (always somewhere already on screen), the
+    // target of a Ctrl+Click jump can easily be off-screen above wherever
+    // was actually clicked — this is the regression `JumpToFirstOccurrence`
+    // exists to fix over just reusing plain `EditorClick`, which never
+    // scrolled.
+    let files = TempFiles::new("jump-scroll");
+    let contents: String = (0..200).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(&files.a, &contents).unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.viewport_width = 800.0;
+        editor.viewport_height = 400.0;
+    }
+
+    let task = update(&mut state, Message::JumpToFirstOccurrence { line: 150, col: 0, pane: Pane::Primary });
+
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert_eq!(editor.cursor, CursorPos { line: 150, col: 0 }, "cursor must land on the jump target");
+    assert!(task.units() > 0, "a target far below the viewport must produce a scroll task");
+    assert!(editor.scroll_offset > 0.0, "the view must actually scroll down to reveal line 150");
 }
 
 fn completion_item(label: &str) -> CompletionItem {

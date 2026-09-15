@@ -166,6 +166,15 @@ pub struct ChatThread {
     /// id rather than a bool on `ToolActivity` itself since this is pure
     /// presentation state, not something the wire protocol ever reports.
     pub expanded_tools: std::collections::HashSet<String>,
+    /// One `text_editor::Content` per entry in `messages`, aligned 1:1 by
+    /// index — the backing store `chat_panel::selectable_text` renders an
+    /// `Operator`/`Assistant` bubble's text through, so the transcript is
+    /// mouse-selectable and `Ctrl+C`-copyable like a real text area rather
+    /// than a plain `text()` label. Kept in sync by `sync_message_content`,
+    /// called after every place `messages` is pushed to or cleared, rather
+    /// than updated at each call site individually — see that function's
+    /// own doc comment.
+    pub message_content: Vec<iced::widget::text_editor::Content>,
 }
 
 impl ChatThread {
@@ -283,12 +292,39 @@ pub fn submit_chat_prompt(state: &mut State) {
 /// check first) simply shouldn't call this — there's nothing to forward to.
 pub fn send_chat_text(state: &mut State, text: String) {
     state.chat.messages.push(ChatMessage::Operator(text.clone()));
+    sync_message_content(&mut state.chat);
     // Sending is always an explicit "take me to the bottom" action, the same
     // convention every other chat client follows, regardless of whether the
     // user had scrolled up to reread something first.
     state.chat_pinned_to_bottom = true;
     if let Some(sender) = state.chat.sender.as_mut() {
         state.chat.sending = sender.try_send(ClaudeCommand::SendPrompt(text)).is_ok();
+    }
+}
+
+/// Keeps `ChatThread::message_content` aligned 1:1 with `messages` by index
+/// — see that field's own doc comment. Rebuilds whichever slots don't
+/// already hold the matching message's text rather than tracking every
+/// `messages` mutation site individually: a length mismatch (a fresh push,
+/// or `Message::ChatFullHistoryLoaded`'s `messages.clear()`) and a stale
+/// slot (a finalized `AssistantText` overwriting what streamed deltas had
+/// built up) both just self-correct here. Whatever selection/cursor state
+/// a rebuilt slot held is lost, but that only ever happens to a slot whose
+/// *text* just changed anyway, so there's nothing worth preserving there.
+fn sync_message_content(chat: &mut ChatThread) {
+    chat.message_content.truncate(chat.messages.len());
+    while chat.message_content.len() < chat.messages.len() {
+        chat.message_content.push(iced::widget::text_editor::Content::new());
+    }
+    for (slot, msg) in chat.message_content.iter_mut().zip(chat.messages.iter()) {
+        let text = match msg {
+            ChatMessage::Operator(text) => text.as_str(),
+            ChatMessage::Assistant { text, .. } => text.as_str(),
+            ChatMessage::Tool(_) => continue,
+        };
+        if slot.text() != text {
+            *slot = iced::widget::text_editor::Content::with_text(text);
+        }
     }
 }
 
@@ -556,6 +592,7 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
         }
         ClaudeEvent::HistoryTruncated => state.chat.history_truncated = true,
     }
+    sync_message_content(&mut state.chat);
     // Follow new output only while the user hasn't scrolled away from the
     // bottom to read earlier messages — see `State::chat_pinned_to_bottom`'s
     // own doc comment. Re-snapping unconditionally here would yank the view

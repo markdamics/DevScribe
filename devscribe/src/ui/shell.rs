@@ -45,6 +45,15 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
         &highlights,
         document.char_index(cursor.line, cursor.col),
     );
+    // Only computed with no active selection — while dragging/extending a
+    // selection, occurrence highlighting would otherwise flicker over
+    // whatever identifier the selection's moving end happens to land on,
+    // competing visually with the selection itself.
+    let occurrences = if selection.is_none() {
+        editor.word_occurrences(cursor.line, cursor.col)
+    } else {
+        Vec::new()
+    };
     let diagnostics = editor.diagnostics.clone();
     let gutter_marks = editor.gutter_marks.clone();
     let content_revision = editor.revision();
@@ -102,6 +111,7 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
             find_matches: find_matches.clone(),
             find_current,
             bracket_match,
+            occurrences: occurrences.clone(),
             scroll_offset,
             viewport_height: size.height,
             ghost_text: ghost_text.clone(),

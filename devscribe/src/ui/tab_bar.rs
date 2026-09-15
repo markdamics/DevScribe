@@ -309,7 +309,30 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     }
 
     let tabs = scrollable(row(tab_elements).height(Length::Fixed(bar_h)))
-        .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default().width(0.0).scroller_width(0.0)))
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::default().width(4.0).margin(0.0).scroller_width(4.0),
+        ))
+        .style(move |theme, status| {
+            let dragged = matches!(status, scrollable::Status::Dragged { .. });
+            let hovered = matches!(status, scrollable::Status::Hovered { .. }) || dragged;
+            let scroller_color = if dragged {
+                color(p.text_muted)
+            } else if hovered {
+                color(p.text_muted)
+            } else {
+                color(p.border_hairline)
+            };
+            let rail = scrollable::Rail {
+                background: None,
+                border: Border::default(),
+                scroller: scrollable::Scroller { background: scroller_color.into(), border: Border::default() },
+            };
+            scrollable::Style {
+                horizontal_rail: rail,
+                vertical_rail: rail,
+                ..scrollable::default(theme, status)
+            }
+        })
         .width(Length::Fill)
         .height(Length::Fixed(bar_h));
 

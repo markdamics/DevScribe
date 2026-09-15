@@ -238,7 +238,25 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-pub(crate) const PROBLEMS_PANEL_H: f32 = 196.0;
+/// A thin drag handle on the panel's own top edge — pressing it starts a
+/// resize (`Message::ProblemsPanelResizeStarted`); the actual drag is then
+/// driven by the window-wide cursor subscription in `state::subscription`,
+/// same reasoning as `sidebar::resize_handle`'s own doc comment (this
+/// handle is far narrower than the mouse can move between frames).
+fn resize_handle(p: Palette) -> Element<'static, Message> {
+    mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fixed(4.0)))
+            .width(Length::Fill)
+            .height(Length::Fixed(4.0))
+            .style(move |_theme| container::Style {
+                background: Some(color(p.border_hairline).into()),
+                ..container::Style::default()
+            }),
+    )
+    .interaction(iced::mouse::Interaction::ResizingVertically)
+    .on_press(Message::ProblemsPanelResizeStarted)
+    .into()
+}
 
 fn diagnostic_row(path: &Path, root: &Path, d: &EditorDiagnostic, p: Palette) -> Element<'static, Message> {
     let severity_color = match d.severity {
@@ -317,15 +335,16 @@ pub fn dock_panel(state: &State, p: Palette) -> Element<'static, Message> {
         scrollable(column(rows)).width(Length::Fill).height(Length::Fill).into()
     };
 
-    container(column![header, widgets::hline(color(p.border_hairline)), list].width(Length::Fill).height(Length::Fill))
+    let panel = container(column![header, widgets::hline(color(p.border_hairline)), list].width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
-        .height(Length::Fixed(PROBLEMS_PANEL_H))
+        .height(Length::Fixed(state.problems_panel_height))
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_base).into()),
             border: Border { color: color(p.border_hairline), width: 1.0, radius: 0.0.into() },
             ..container::Style::default()
-        })
-        .into()
+        });
+
+    column![resize_handle(p), panel].width(Length::Fill).into()
 }
 
 /// One row of the "Background Tasks" popover — a status dot, a label, and

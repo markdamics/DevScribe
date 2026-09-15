@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{CursorPos, Direction, EditorDiagnostic, Message, Pane};
+use crate::state::{first_word_occurrence, word_range_at, word_text_at, CursorPos, Direction, EditorDiagnostic, Message, Pane};
 
 /// The font-size-to-`line_height`/`char_width` ratios the original static
 /// design used (22/13 and 0.6 respectively) — kept fixed so the editor's
@@ -89,6 +89,12 @@ pub struct EditorCanvas {
     /// on `EditorState`). `None` when the cursor isn't touching a bracket,
     /// the bracket has no partner, or one of them is inside a string/comment.
     pub bracket_match: Option<(usize, usize)>,
+    /// Every occurrence of the identifier under the cursor, as absolute char
+    /// ranges — same coordinate space as `selection`/`find_matches`. Empty
+    /// whenever the cursor isn't on an identifier, or a selection is active
+    /// (see `code_area`'s own call site for why). See
+    /// `EditorState::word_occurrences`.
+    pub occurrences: Vec<(usize, usize)>,
     pub scroll_offset: f32,
     pub viewport_height: f32,
     /// The active GitHub Copilot inline suggestion's first line, already
@@ -172,6 +178,7 @@ struct CacheSig {
     find_matches: Vec<(usize, usize)>,
     find_current: usize,
     bracket_match: Option<(usize, usize)>,
+    occurrences: Vec<(usize, usize)>,
     scroll_offset: f32,
     viewport_height: f32,
     selection: Option<(usize, usize)>,
@@ -217,6 +224,7 @@ impl EditorCanvas {
             find_matches: self.find_matches.clone(),
             find_current: self.find_current,
             bracket_match: self.bracket_match,
+            occurrences: self.occurrences.clone(),
             scroll_offset: self.scroll_offset,
             viewport_height: self.viewport_height,
             selection: self.selection,
@@ -275,6 +283,18 @@ impl EditorCanvas {
         };
         let col = col.min(self.document.line_len_chars(line));
         (line, col)
+    }
+
+    /// The `HighlightKind` of the syntax span covering `char_idx`, if any —
+    /// used by Ctrl+Click to tell "this looks like a function/type/macro
+    /// name" apart from everything else (see `update`'s `ButtonPressed`
+    /// arm). `self.highlights` is sorted and non-overlapping in byte
+    /// offsets, so this is a binary search — the same `partition_point`
+    /// pattern `draw_content`'s own per-line span lookup uses.
+    fn highlight_kind_at(&self, char_idx: usize) -> Option<HighlightKind> {
+        let byte = self.document.text().char_to_byte(char_idx);
+        let idx = self.highlights.partition_point(|s| s.end <= byte);
+        self.highlights.get(idx).filter(|s| s.start <= byte).map(|s| s.kind)
     }
 
     fn handle_key(
@@ -535,6 +555,16 @@ impl EditorCanvas {
             .partition_point(|(start, _)| *start < drawn_end_idx)
             .max(find_base);
         let find_visible = &self.find_matches[find_base..find_end];
+        // `occurrences` is document-ordered too (built by a single
+        // left-to-right scan) — same windowing as `find_matches` above.
+        let occ_base = self
+            .occurrences
+            .partition_point(|(_, end)| *end <= drawn_start_idx);
+        let occ_end = self
+            .occurrences
+            .partition_point(|(start, _)| *start < drawn_end_idx)
+            .max(occ_base);
+        let occ_visible = &self.occurrences[occ_base..occ_end];
         // Diagnostics arrive in whatever order the server sent them, so
         // filter rather than slice.
         let diags_visible: Vec<&EditorDiagnostic> = self
@@ -675,6 +705,37 @@ impl EditorCanvas {
                             },
                         );
                     }
+                }
+
+                // Occurrences of the identifier under the cursor: a subtle
+                // outlined box around each match (including the one the
+                // caret itself sits on), distinct from selection's solid
+                // fill and find's warm fill so it doesn't read as either of
+                // those.
+                for (start, end) in occ_visible {
+                    if *start >= row_end_idx || *end <= row_start_idx {
+                        continue;
+                    }
+                    let match_start_col = start.saturating_sub(row_start_idx);
+                    if text_x0 + match_start_col as f32 * char_width > bounds.width {
+                        continue;
+                    }
+                    let match_end_col = (end.saturating_sub(row_start_idx)).min(row_end_char - row_start_char);
+                    let x0 = text_x0 + match_start_col as f32 * char_width;
+                    let x1 = clamp_x(text_x0 + match_end_col as f32 * char_width);
+                    let rect = Path::rectangle(
+                        Point::new(x0, y + 1.0),
+                        Size::new((x1 - x0).max(char_width * 0.4), line_height - 2.0),
+                    );
+                    frame.fill(&rect, tint(p.text_muted, 0.16));
+                    frame.stroke(
+                        &rect,
+                        Stroke {
+                            style: Style::Solid(tint(p.text_muted, 0.55)),
+                            width: 1.0,
+                            ..Stroke::default()
+                        },
+                    );
                 }
 
                 // The gutter's per-line git-diff marker and line number only
@@ -967,15 +1028,39 @@ impl canvas::Program<Message> for EditorCanvas {
                 state.focused = true;
                 let (line, col) = self.hit_test(position, bounds.width);
 
-                // Ctrl/Cmd+Click jumps to the symbol's definition instead of
-                // placing the cursor or starting a drag-select — the same
-                // modifier VS Code uses for this gesture. Checked before the
-                // gutter/revert handling below since it's meant to apply
-                // anywhere over the text, not just plain clicks. Primary-pane
-                // only (see `Pane`) — in the split pane this just falls
-                // through to a plain click below.
-                if state.modifiers.command() && self.pane == Pane::Primary {
-                    return Some(canvas::Action::publish(Message::GoToDefinition { line, col }).and_capture());
+                // Ctrl/Cmd+Click's behavior depends on what's under it: a
+                // function/type/macro name is worth seeing every reference
+                // of (`Message::FindReferences`, a real project-wide LSP
+                // lookup — same as its own doc comment reasons), while a
+                // plain variable (or anything the syntax highlighter didn't
+                // specifically classify — no grammar wired up, say) instead
+                // jumps straight to its own first occurrence in this file,
+                // no LSP round trip needed (`first_word_occurrence`).
+                // Checked before the gutter/revert handling below since
+                // it's meant to apply anywhere over the text, not just
+                // plain clicks. Primary-pane only (see `Pane`). Clicking
+                // punctuation/whitespace falls through to a plain click
+                // below — same as the split pane always does.
+                if state.modifiers.command()
+                    && self.pane == Pane::Primary
+                    && let Some(word) = word_text_at(&self.document, line, col)
+                {
+                    let char_idx = self.document.char_index(line, col);
+                    let is_function_or_type = matches!(
+                        self.highlight_kind_at(char_idx),
+                        Some(HighlightKind::Function | HighlightKind::Type | HighlightKind::Macro)
+                    );
+                    let action = if is_function_or_type {
+                        Some(Message::FindReferences { line, col })
+                    } else {
+                        first_word_occurrence(&self.document, &word).map(|(start, _)| {
+                            let (line, col) = self.document.line_col(start);
+                            Message::JumpToFirstOccurrence { line, col, pane: self.pane }
+                        })
+                    };
+                    if let Some(action) = action {
+                        return Some(canvas::Action::publish(action).and_capture());
+                    }
                 }
 
                 // A click on a changed line's gutter marker arms that line
@@ -1162,10 +1247,27 @@ impl canvas::Program<Message> for EditorCanvas {
 
     fn mouse_interaction(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
+        // Ctrl/Cmd-hovering an identifier previews the same jump-to-first-
+        // occurrence-or-find-references gesture Ctrl/Cmd+Click acts on
+        // (`update`'s `ButtonPressed` arm, above — either behavior is
+        // "clickable", so this doesn't need to know which one applies) — a
+        // pointer cursor is the usual affordance editors use to signal
+        // "this is clickable" before the click actually happens.
+        // Primary-pane only, same restriction that gesture itself has.
+        if self.pane == Pane::Primary
+            && state.modifiers.command()
+            && let Some(position) = cursor.position_in(bounds)
+        {
+            let (line, col) = self.hit_test(position, bounds.width);
+            if word_range_at(&self.document, line, col).is_some() {
+                return mouse::Interaction::Pointer;
+            }
+        }
+
         if cursor.is_over(bounds) {
             mouse::Interaction::Text
         } else {

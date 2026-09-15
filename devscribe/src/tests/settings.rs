@@ -83,6 +83,8 @@ fn sample_settings() -> Settings {
         copilot_inline_enabled: true,
         chat_mode: ChatMode::Collapsed,
         chat_panel_width: 420.0,
+        problems_panel_height: 260.0,
+        references_panel_height: 310.0,
         tab_size: 2,
         show_line_numbers: false,
         word_wrap: true,

@@ -5,7 +5,7 @@
 //! the status bar (see `shell.rs`) while `state.references_open`.
 use devscribe_core::theme::Palette;
 use iced::font::Weight;
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
 use iced::{Alignment, Border, Element, Length};
 
 use crate::color::color;
@@ -13,7 +13,26 @@ use crate::fonts;
 use crate::state::{CursorPos, LocationEntry, Message, State};
 use crate::widgets;
 
-pub(crate) const PANEL_HEIGHT: f32 = 196.0;
+/// A thin drag handle on the panel's own top edge — pressing it starts a
+/// resize (`Message::ReferencesPanelResizeStarted`); the actual drag is
+/// then driven by the window-wide cursor subscription in
+/// `state::subscription`, same reasoning as `sidebar::resize_handle`'s own
+/// doc comment (this handle is far narrower than the mouse can move
+/// between frames).
+fn resize_handle(p: Palette) -> Element<'static, Message> {
+    mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fixed(4.0)))
+            .width(Length::Fill)
+            .height(Length::Fixed(4.0))
+            .style(move |_theme| container::Style {
+                background: Some(color(p.border_hairline).into()),
+                ..container::Style::default()
+            }),
+    )
+    .interaction(iced::mouse::Interaction::ResizingVertically)
+    .on_press(Message::ReferencesPanelResizeStarted)
+    .into()
+}
 
 fn location_row(entry: &LocationEntry, root: &std::path::Path, p: Palette) -> Element<'static, Message> {
     let location = format!(
@@ -79,13 +98,14 @@ pub fn dock_panel(state: &State, p: Palette) -> Element<'static, Message> {
         scrollable(column(rows)).width(Length::Fill).height(Length::Fill).into()
     };
 
-    container(column![header, widgets::hline(color(p.border_hairline)), list].width(Length::Fill).height(Length::Fill))
+    let panel = container(column![header, widgets::hline(color(p.border_hairline)), list].width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
-        .height(Length::Fixed(PANEL_HEIGHT))
+        .height(Length::Fixed(state.references_panel_height))
         .style(move |_theme| container::Style {
             background: Some(color(p.bg_base).into()),
             border: Border { color: color(p.border_hairline), width: 1.0, radius: 0.0.into() },
             ..container::Style::default()
-        })
-        .into()
+        });
+
+    column![resize_handle(p), panel].width(Length::Fill).into()
 }

@@ -527,6 +527,10 @@ pub const MAX_UNDO_ENTRIES: usize = 500;
 /// case is what the cap actually bites.
 pub const MAX_RENDERED_LINE_CHARS: usize = 2000;
 
+/// Cap on `EditorState::word_occurrences` — see that method's own doc
+/// comment for why.
+const MAX_WORD_OCCURRENCES: usize = 500;
+
 /// A one-time full scan for `EditorState::new` — every other call site
 /// updates `max_line_chars` incrementally (grow-only in the hot path,
 /// reconciled at settle) rather than rescanning, per its own doc comment.
@@ -1630,24 +1634,52 @@ impl EditorState {
     /// "Rename Symbol" prompt with whatever's actually under the click,
     /// rather than starting it blank.
     pub fn word_at(&self, line: usize, col: usize) -> Option<String> {
-        let len = self.document.line_len_chars(line);
-        if len == 0 {
-            return None;
+        word_text_at(&self.document, line, col)
+    }
+
+    /// Every occurrence of the identifier at `(line, col)` across the whole
+    /// buffer, as absolute char ranges — same coordinate space as
+    /// `selection`/`find_matches` (`EditorCanvas`'s own fields). Empty
+    /// whenever `word_at` is `None` (cursor not on an identifier). Drives the
+    /// occurrences-highlight overlay (`EditorCanvas::occurrences`): every
+    /// reference to the identifier under the caret lights up, the caret's
+    /// own occurrence included, the same "highlight matching identifiers"
+    /// behavior most editors give for free without needing a real LSP
+    /// find-references round trip.
+    pub fn word_occurrences(&self, line: usize, col: usize) -> Vec<(usize, usize)> {
+        let Some(word) = self.word_at(line, col) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        let mut run_start: Option<usize> = None;
+        let mut run = String::new();
+        for (i, c) in self.document.text().chars().enumerate() {
+            if char_class(c) == CharClass::Word {
+                if run_start.is_none() {
+                    run_start = Some(i);
+                    run.clear();
+                }
+                run.push(c);
+            } else if let Some(start) = run_start.take() {
+                if run == word {
+                    hits.push((start, i));
+                    // A safety net against a one- or two-character identifier
+                    // (or, worse, a word that happens to match a comment/
+                    // string full of prose) turning every cursor move into an
+                    // unbounded scan *and* an unbounded draw — not a limit
+                    // any real identifier is expected to hit.
+                    if hits.len() >= MAX_WORD_OCCURRENCES {
+                        return hits;
+                    }
+                }
+            }
         }
-        let idx = col.min(len - 1);
-        let class_at = |i: usize| self.document.line_char(line, i).map(char_class);
-        if class_at(idx) != Some(CharClass::Word) {
-            return None;
+        if let Some(start) = run_start
+            && run == word
+        {
+            hits.push((start, self.document.text().len_chars()));
         }
-        let mut start = idx;
-        while start > 0 && class_at(start - 1) == Some(CharClass::Word) {
-            start -= 1;
-        }
-        let mut end = idx + 1;
-        while end < len && class_at(end) == Some(CharClass::Word) {
-            end += 1;
-        }
-        Some((start..end).filter_map(|i| self.document.line_char(line, i)).collect())
+        hits
     }
 
     /// Triple-click line selection: the whole line including its trailing
@@ -2006,6 +2038,83 @@ pub fn char_class(c: char) -> CharClass {
     }
 }
 
+/// The `[start, end)` column range of the identifier run at `(line, col)` on
+/// `document`, if any — the word-boundary primitive behind `EditorState::
+/// word_at`/`word_occurrences` (both need `self` for their own reasons —
+/// `word_at` to materialize the text, `word_occurrences` to scan the whole
+/// buffer) and, taking a bare `&Document` rather than `&EditorState`, also
+/// directly usable from `EditorCanvas` (which only ever holds a `Document`
+/// clone, not a full `EditorState`) to hit-test the mouse for the
+/// Ctrl-hover pointer cursor.
+pub fn word_range_at(document: &Document, line: usize, col: usize) -> Option<(usize, usize)> {
+    let len = document.line_len_chars(line);
+    if len == 0 {
+        return None;
+    }
+    let idx = col.min(len - 1);
+    let class_at = |i: usize| document.line_char(line, i).map(char_class);
+    if class_at(idx) != Some(CharClass::Word) {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 && class_at(start - 1) == Some(CharClass::Word) {
+        start -= 1;
+    }
+    let mut end = idx + 1;
+    while end < len && class_at(end) == Some(CharClass::Word) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// The identifier text at `(line, col)` on `document`, if any —
+/// `word_range_at` plus materializing the run it finds into a `String`.
+/// Bare-`&Document` for the same reason `word_range_at` is: usable directly
+/// from `EditorCanvas` (Ctrl+Click's jump-to-first-occurrence, below) as
+/// well as `EditorState::word_at`.
+pub fn word_text_at(document: &Document, line: usize, col: usize) -> Option<String> {
+    let (start, end) = word_range_at(document, line, col)?;
+    Some((start..end).filter_map(|i| document.line_char(line, i)).collect())
+}
+
+/// The absolute char range of the *first* occurrence of `word` in
+/// `document`, scanning from the very start of the buffer — same
+/// identifier-run definition (`char_class`) `word_range_at`/
+/// `EditorState::word_occurrences` use. Stops at the first match rather
+/// than collecting every one (unlike `word_occurrences`, which needs them
+/// all for the highlight overlay): Ctrl+Click's jump-to-first-occurrence
+/// only ever wants the earliest, so there's no reason to keep scanning a
+/// large file past it. `None` only for an empty `word` — never reached via
+/// `word_at`/`word_text_at`, which never return one.
+pub fn first_word_occurrence(document: &Document, word: &str) -> Option<(usize, usize)> {
+    if word.is_empty() {
+        return None;
+    }
+    let mut run_start: Option<usize> = None;
+    let mut run = String::new();
+    for (i, c) in document.text().chars().enumerate() {
+        if char_class(c) == CharClass::Word {
+            if run_start.is_none() {
+                run_start = Some(i);
+                run.clear();
+            }
+            run.push(c);
+            continue;
+        }
+        if let Some(start) = run_start.take()
+            && run == word
+        {
+            return Some((start, i));
+        }
+    }
+    if let Some(start) = run_start
+        && run == word
+    {
+        return Some((start, document.text().len_chars()));
+    }
+    None
+}
+
 /// The closing half of an auto-paired opener — `None` for anything that
 /// isn't one, in particular the closers themselves (`)` doesn't open a pair
 /// of its own). See `EditorState::type_char`.
@@ -2052,6 +2161,17 @@ pub const CHAT_DEFAULT_WIDTH: f32 = 340.0;
 pub const SPLIT_MIN_WIDTH: f32 = 320.0;
 pub const SPLIT_MAX_WIDTH: f32 = 2400.0;
 pub const SPLIT_DEFAULT_WIDTH: f32 = 640.0;
+
+/// Bottom dock panel (Problems, References/Locations) height bounds — same
+/// drag-handle idiom as the sidebar/chat panel's own resize, just anchored
+/// to whatever sits directly below the panel being dragged (the status bar,
+/// or — for the Problems panel specifically, when the References panel is
+/// also open beneath it — the References panel's own current height)
+/// instead of a window edge. See `Message::ProblemsPanelResizeDragged`/
+/// `ReferencesPanelResizeDragged`.
+pub const DOCK_PANEL_MIN_HEIGHT: f32 = 100.0;
+pub const DOCK_PANEL_MAX_HEIGHT: f32 = 640.0;
+pub const DOCK_PANEL_DEFAULT_HEIGHT: f32 = 196.0;
 
 /// Moves the active file's cursor to the start of `line` (1-based, clamped
 /// to the document's own line count) and scrolls it into view — the

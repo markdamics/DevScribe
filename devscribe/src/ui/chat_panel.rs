@@ -34,7 +34,6 @@ use crate::state::{
     ChatProvider, ChatStatus, Message, PermissionState, State, TabKey, ToolActivity, CONTINUE_PROMPT, REGENERATE_PROMPT,
     SUMMARIZE_PROJECT_PROMPT,
 };
-use crate::ui::status_bar;
 use crate::widgets;
 
 /// `panel_header`'s own fixed height — pulled out to a constant since
@@ -187,8 +186,38 @@ fn context_chips(text_content: &str, p: Palette) -> Option<Element<'static, Mess
     Some(row(chips).spacing(6.0).into())
 }
 
-fn operator_row(text_content: &str, p: Palette) -> Element<'static, Message> {
-    let mut content = column![
+/// A transcript bubble's text, rendered through a read-only
+/// `text_editor` rather than a plain `text()` label — the only way to get
+/// mouse-drag selection and `Ctrl+C` copy out of iced 0.14 (there's no
+/// selectable `text()`; see `iced::widget::text_editor`'s own doc comment
+/// on the pattern). "Read-only" means letting every non-editing `Action`
+/// (click, drag, select, copy) through to `content` as normal and
+/// dropping every editing one (typed insert, backspace, paste, ...) on the
+/// floor — see `Action::is_edit` and this widget's `on_action` handler,
+/// `Message::ChatMessageSelect`.
+fn selectable_text<'a>(content: &'a text_editor::Content, index: usize, font: Option<iced::Font>, size: f32, text_color: Rgba, p: Palette) -> Element<'a, Message> {
+    let mut editor = text_editor(content).size(crate::text_scale::px(size)).padding(0.0);
+    if let Some(font) = font {
+        editor = editor.font(font);
+    }
+    editor
+        .on_action(move |action| Message::ChatMessageSelect(index, action))
+        .style(move |_theme, _status| text_editor::Style {
+            background: Color::TRANSPARENT.into(),
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() },
+            placeholder: color(text_color),
+            value: color(text_color),
+            selection: {
+                let mut c = p.accent_solid;
+                c.a = 0.35;
+                color(c)
+            },
+        })
+        .into()
+}
+
+fn operator_row<'a>(text_content: &str, content: &'a text_editor::Content, index: usize, p: Palette) -> Element<'a, Message> {
+    let mut column_content = column![
         row![
             widgets::micro("OPERATOR", color(p.text_muted)),
             Space::new().width(Length::Fill),
@@ -197,32 +226,31 @@ fn operator_row(text_content: &str, p: Palette) -> Element<'static, Message> {
         ]
         .spacing(10.0)
         .align_y(Alignment::Center),
-        container(
-            text(text_content.to_string())
-                .font(fonts::sans(Weight::Medium))
-                .size(crate::text_scale::px(15.0))
-                .color(color(p.text_strong))
-        )
-        .padding([8.0, 10.0])
-        .width(Length::Fill)
-        .style(move |_theme| container::Style {
-            background: Some(color(p.surface_inset).into()),
-            border: Border { color: color(p.border_hairline), width: 1.0, radius: 3.0.into() },
-            ..container::Style::default()
-        }),
+        container(selectable_text(content, index, Some(fonts::sans(Weight::Medium)), 15.0, p.text_strong, p))
+            .padding([8.0, 10.0])
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(color(p.surface_inset).into()),
+                border: Border { color: color(p.border_hairline), width: 1.0, radius: 3.0.into() },
+                ..container::Style::default()
+            }),
     ]
     .spacing(6.0);
     if let Some(chips) = context_chips(text_content, p) {
-        content = content.push(chips);
+        column_content = column_content.push(chips);
     }
-    content.into()
+    column_content.into()
 }
 
 /// `caret_visible` (state.rs's existing ~530ms blink tick) only ever
 /// applies while `streaming` is true — a finalized bubble never shows the
-/// live-typing caret, matching VS Code's own streaming indicator.
-fn assistant_row(text_content: &str, streaming: bool, caret_visible: bool, provider: ChatProvider, p: Palette) -> Element<'static, Message> {
-    let shown = if streaming && caret_visible { format!("{text_content}\u{258c}") } else { text_content.to_string() };
+/// live-typing caret, matching VS Code's own streaming indicator. The
+/// caret itself now renders as a trailing line below the body rather than
+/// appended inline to the last word: the body is a `selectable_text`
+/// bound to `content`, which holds the message's actual text with no
+/// caret glyph mixed in (`chat::sync_message_content` keeps it that way),
+/// so there's nowhere inline left to splice a blinking character into.
+fn assistant_row<'a>(text_content: &str, content: &'a text_editor::Content, index: usize, streaming: bool, caret_visible: bool, provider: ChatProvider, p: Palette) -> Element<'a, Message> {
     let mut header = row![widgets::dot(color(p.accent_solid), 5.0), widgets::micro(provider.label(), color(p.text_muted))]
         .spacing(7.0)
         .align_y(Alignment::Center);
@@ -234,12 +262,15 @@ fn assistant_row(text_content: &str, streaming: bool, caret_visible: bool, provi
         header = header.push(Space::new().width(Length::Fill));
         header = header.push(link_button("Copy", Message::ChatCopyText(text_content.to_string()), p));
     }
-    column![
-        header,
-        text(shown).size(crate::text_scale::px(15.0)).color(color(p.text_body)),
-    ]
-    .spacing(6.0)
-    .into()
+    let mut body = column![header, selectable_text(content, index, None, 15.0, p.text_body, p)].spacing(6.0);
+    if streaming {
+        body = body.push(
+            text(if caret_visible { "\u{258c}" } else { " " })
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.text_body)),
+        );
+    }
+    body.into()
 }
 
 /// The gap between "sent" and "the first token/tool call landed" — see
@@ -479,10 +510,21 @@ fn tool_activity_row(tool: &ToolActivity, caret_visible: bool, p: Palette) -> El
 /// pulls every settled `Tool` message out into a `ThreadRow::ToolGroup`
 /// instead (see its own doc comment): a decision that's still open is
 /// primary content, not metadata to recede below it.
-fn message_row(msg: &ChatMessage, caret_visible: bool, provider: ChatProvider, expanded_tools: &HashSet<String>, p: Palette) -> Element<'static, Message> {
+/// `content` is `state.chat.message_content[index]` — only `Operator`/
+/// `Assistant` bubbles use it (see `selectable_text`); a `Tool` row still
+/// renders its own way and ignores both.
+fn message_row<'a>(
+    msg: &'a ChatMessage,
+    content: &'a text_editor::Content,
+    index: usize,
+    caret_visible: bool,
+    provider: ChatProvider,
+    expanded_tools: &HashSet<String>,
+    p: Palette,
+) -> Element<'a, Message> {
     match msg {
-        ChatMessage::Operator(text_content) => operator_row(text_content, p),
-        ChatMessage::Assistant { text, streaming } => assistant_row(text, *streaming, caret_visible, provider, p),
+        ChatMessage::Operator(text_content) => operator_row(text_content, content, index, p),
+        ChatMessage::Assistant { text, streaming } => assistant_row(text, content, index, *streaming, caret_visible, provider, p),
         ChatMessage::Tool(tool) if tool.permission == Some(PermissionState::Pending) => {
             permission_card(tool, expanded_tools.contains(&tool.id), p)
         }
@@ -492,8 +534,11 @@ fn message_row(msg: &ChatMessage, caret_visible: bool, provider: ChatProvider, e
 
 /// One printable unit of the transcript, after `group_thread` has clustered
 /// consecutive settled tool calls together — see its own doc comment.
+/// `Message`'s `usize` is the row's index into both `ChatThread::messages`
+/// and `message_content` — see `message_row`'s own doc comment on why it
+/// needs it.
 enum ThreadRow<'a> {
-    Message(&'a ChatMessage),
+    Message(usize, &'a ChatMessage),
     ToolGroup(Vec<&'a ToolActivity>),
 }
 
@@ -508,7 +553,7 @@ enum ThreadRow<'a> {
 /// of the chat-panel UX pass (item 2).
 fn group_thread(messages: &[ChatMessage]) -> Vec<ThreadRow<'_>> {
     let mut rows: Vec<ThreadRow> = Vec::new();
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         match msg {
             ChatMessage::Tool(tool) if tool.permission != Some(PermissionState::Pending) => {
                 if let Some(ThreadRow::ToolGroup(group)) = rows.last_mut() {
@@ -517,7 +562,7 @@ fn group_thread(messages: &[ChatMessage]) -> Vec<ThreadRow<'_>> {
                     rows.push(ThreadRow::ToolGroup(vec![tool]));
                 }
             }
-            other => rows.push(ThreadRow::Message(other)),
+            other => rows.push(ThreadRow::Message(index, other)),
         }
     }
     rows
@@ -833,7 +878,13 @@ pub fn actions_menu(state: &State, p: Palette) -> Option<Element<'static, Messag
             }
         }
     };
-    let bottom = state.density.status_bar_h() + if state.problems_panel_open { status_bar::PROBLEMS_PANEL_H } else { 0.0 };
+    let mut bottom = state.density.status_bar_h();
+    if state.problems_panel_open {
+        bottom += state.problems_panel_height;
+    }
+    if state.references_open {
+        bottom += state.references_panel_height;
+    }
 
     let menu = container(column(actions_menu_items(state, p)).spacing(2.0).padding(6.0))
     .width(Length::Fixed(280.0))
@@ -1278,24 +1329,27 @@ fn session_list_view(state: &State, p: Palette) -> Element<'static, Message> {
 /// The message list + input bar shared by docked/window/tab presentation
 /// — or, while `state.chat_sessions_open`, the session picker in their
 /// place (see `session_list_view`).
-pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
+pub fn thread_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     if state.chat_sessions_open {
         return session_list_view(state, p);
     }
 
     let thread_rows = group_thread(&state.chat.messages);
-    let mut rows: Vec<Element<'static, Message>> = Vec::with_capacity(thread_rows.len() + 2);
+    let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(thread_rows.len() + 2);
     for (i, row) in thread_rows.into_iter().enumerate() {
         // A divider ahead of every turn but the first — an Operator message
         // is what starts a new turn (see `group_thread`'s own doc comment
         // on what a "turn" is here) — so the transcript reads as a sequence
         // of exchanges rather than one undifferentiated stream of bubbles
         // (chat-panel UX pass, item 7's "message threading").
-        if i > 0 && matches!(row, ThreadRow::Message(ChatMessage::Operator(_))) {
+        if i > 0 && matches!(row, ThreadRow::Message(_, ChatMessage::Operator(_))) {
             rows.push(widgets::hline(color(p.border_hairline)));
         }
         rows.push(match row {
-            ThreadRow::Message(msg) => message_row(msg, state.caret_visible, state.chat_provider, &state.chat.expanded_tools, p),
+            ThreadRow::Message(index, msg) => {
+                let content = &state.chat.message_content[index];
+                message_row(msg, content, index, state.caret_visible, state.chat_provider, &state.chat.expanded_tools, p)
+            }
             ThreadRow::ToolGroup(tools) => tool_group_view(&tools, state.caret_visible, p),
         });
     }
@@ -1316,7 +1370,7 @@ pub fn thread_view(state: &State, p: Palette) -> Element<'_, Message> {
         rows.push(row);
     }
 
-    let list: Element<'static, Message> = if rows.is_empty() { empty_state(state, p) } else {
+    let list: Element<'a, Message> = if rows.is_empty() { empty_state(state, p) } else {
         scrollable(column(rows).spacing(12.0).padding(16.0).width(Length::Fill))
             .id(crate::state::chat_scroll_id())
             .width(Length::Fill)
