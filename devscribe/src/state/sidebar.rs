@@ -490,6 +490,16 @@ pub fn launch_terminal_in_dir(dir: &Path) -> bool {
     CANDIDATES.iter().any(|terminal| std::process::Command::new(terminal).current_dir(dir).spawn().is_ok())
 }
 
+/// Opens `dir` in the OS's default file manager (Nautilus/Finder/Explorer/…)
+/// via `opener` — the same crate `editor::open_externally` uses for
+/// markdown links, since `opener::open` already knows how to hand a plain
+/// directory path to whatever the desktop registers for that on each
+/// platform, with no per-file-manager candidate list needed (unlike
+/// `launch_terminal_in_dir`, which has no such portable API to lean on).
+pub fn open_project_in_file_manager(dir: &Path) -> Result<(), opener::OpenError> {
+    opener::open(dir)
+}
+
 /// Computes the sidebar's "CHANGES" panel contents: every file `repo`
 /// reports as differing from `HEAD`, with insertion/deletion counts from
 /// `devscribe_core::diff::diff_lines` run against `HEAD`'s blob and the

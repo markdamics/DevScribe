@@ -35,6 +35,17 @@ pub enum ClaudeCommand {
         approve: bool,
         reason: Option<String>,
     },
+    /// Aborts whatever turn is currently in flight — a `stream-json`
+    /// `control_request`/`interrupt` on stdin, confirmed against the real
+    /// CLI (v2.1.269): it acks with a `control_response`, then the turn
+    /// ends with a synthetic `"[Request interrupted by user]"` `user` entry
+    /// followed by its normal `result` line (`terminal_reason:
+    /// "aborted_streaming"`, zeroed cost/usage) — both already handled by
+    /// `parse_event_line`'s existing `"user"`/`"result"` arms, so no new
+    /// `ClaudeEvent` variant is needed on the way back out. `copilot_agent`
+    /// has no equivalent (see its own `run`'s doc comment) and just ignores
+    /// this like it already ignores `RespondPermission`.
+    Interrupt,
 }
 
 /// An event a running session reports back to the app. Tool-related
@@ -733,6 +744,16 @@ pub async fn run(root: PathBuf, binary: PathBuf, devscribe_exe: PathBuf, options
                     Some(ClaudeCommand::RespondPermission { id, approve, reason }) => {
                         if let Some(slot) = pending.lock().unwrap().remove(&id) {
                             let _ = slot.decide.send(Decision { approve, reason });
+                        }
+                    }
+                    Some(ClaudeCommand::Interrupt) => {
+                        let line = json!({"type": "control_request", "request_id": "interrupt", "request": {"subtype": "interrupt"}}).to_string();
+                        if child_stdin.write_all(line.as_bytes()).await.is_err()
+                            || child_stdin.write_all(b"\n").await.is_err()
+                            || child_stdin.flush().await.is_err()
+                        {
+                            let _ = output.send(ClaudeEvent::Unavailable("couldn't send the interrupt to claude".into())).await;
+                            break;
                         }
                     }
                     None => break, // app dropped its command sender — session over

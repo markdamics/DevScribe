@@ -1095,6 +1095,10 @@ pub enum Message {
     /// Enter (or the input bar's send action) — submits `state.chat.input`
     /// as a new turn and clears the draft.
     ChatSubmit,
+    /// The composer's Stop button, shown in place of Send while
+    /// `ChatThread::turn_active` — asks the running session to abort the
+    /// in-flight turn. See `stop_chat_turn`.
+    ChatStop,
     /// Sends `String` as a complete new turn, bypassing the draft entirely —
     /// the empty thread's starter prompts (`ask_about_file_prompt`,
     /// `SUMMARIZE_PROJECT_PROMPT`, `fix_bug_prompt`) and the continuation
@@ -1547,6 +1551,10 @@ pub enum Message {
     /// external terminal rooted at `State::root`. See
     /// `sidebar::launch_terminal_in_dir`.
     OpenTerminal,
+    /// The sidebar EXPLORER header's folder button — reveals `State::root`
+    /// in the OS's default file manager. See
+    /// `sidebar::open_project_in_file_manager`.
+    OpenProjectFolder,
     /// "Open folder…" — welcome screen or the sidebar projects dropdown.
     OpenFolderDialog,
     /// "New project" — same picker as `OpenFolderDialog`, but the result
@@ -1583,12 +1591,8 @@ pub enum Message {
     /// A background server install (`start_server_install`) finished.
     /// `Ok(())` = installed successfully; `Err(msg)` = failed with reason.
     ServerInstallComplete(Result<(), String>),
-    /// Arrow-key navigation inside the completion popup: +1 down, -1 up.
-    CompletionMove(i32),
     /// Tab/Enter while the completion popup is open — inserts the selected item.
     CompletionSelect,
-    /// Closes the completion popup without inserting.
-    CloseCompletion,
     /// The mouse (not dragging) moved onto a new `(line, col)` cell of the
     /// active editor's canvas — starts/restarts the hover dwell timer. Only
     /// published on an actual cell change (`editor_canvas::CanvasState`
@@ -1886,6 +1890,9 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             // snap here too so sending doesn't wait on the worker's next
             // event to visibly jump to the bottom.
             return iced::Task::batch([iced::widget::operation::snap_to_end(chat_scroll_id()), focus_chat_input()]);
+        }
+        Message::ChatStop => {
+            stop_chat_turn(state);
         }
         Message::ChatSendPrompt(text) => {
             if state.chat.sender.is_some() {
@@ -3245,6 +3252,12 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 push_toast(state, ToastKind::Warning, "Couldn't open a terminal automatically \u{2014} no known terminal emulator found.");
             }
         }
+        Message::OpenProjectFolder => {
+            if let Err(err) = sidebar::open_project_in_file_manager(&state.root) {
+                crate::logging::error(format!("failed to open project folder externally: {err}"));
+                push_toast(state, ToastKind::Warning, "Couldn't open the project folder.");
+            }
+        }
         Message::OpenFolderDialog => {
             state.projects_open = false;
             if state.loading_project.is_some() {
@@ -3398,18 +3411,6 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
             }
         }
-        Message::CompletionMove(delta) => {
-            if let Some(path) = active_file_path(state)
-                && let Some(editor) = find_editor_mut(state, &path)
-                && editor.completions.is_some()
-            {
-                let len = editor.completions.as_ref().map_or(0, Vec::len);
-                if len > 0 {
-                    let sel = editor.completion_selected as i32 + delta;
-                    editor.completion_selected = sel.clamp(0, (len - 1) as i32) as usize;
-                }
-            }
-        }
         Message::CompletionSelect => {
             if let Some(path) = active_file_path(state) {
                 let selected = find_editor(state, &path).and_then(|editor| {
@@ -3455,13 +3456,6 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     mark_edited(state, &path);
                     return scroll_cursor_into_view(state, Pane::Primary);
                 }
-            }
-        }
-        Message::CloseCompletion => {
-            if let Some(path) = active_file_path(state)
-                && let Some(editor) = find_editor_mut(state, &path)
-            {
-                editor.close_completions();
             }
         }
         Message::EditorHoverMove { line, col } => {

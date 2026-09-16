@@ -372,6 +372,7 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
     // during the handshake. root_uri is deprecated in favour of
     // workspaceFolders but jdtls still reads it to locate the project.
     let init = {
+        #[allow(deprecated)] // jdtls still reads root_uri — see the comment above.
         let init_fut = server
             .initialize(InitializeParams {
                 root_uri: Some(root_uri.clone()),

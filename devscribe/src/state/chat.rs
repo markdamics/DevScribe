@@ -161,6 +161,14 @@ pub struct ChatThread {
     /// point of this flag is just "is the input still in flight," not
     /// "has the whole turn finished."
     pub sending: bool,
+    /// `true` from the moment a prompt is forwarded to the worker until its
+    /// matching `ClaudeEvent::TurnResult` (or `Unavailable`) comes back —
+    /// unlike `sending`, this stays `true` through the whole turn (streaming
+    /// text, tool calls, everything up to the final `result` line), which is
+    /// exactly the window the chat panel's Stop button needs to know about.
+    /// Also cleared, same as `sending`, by `ChatThread::default()` on a
+    /// fresh worker spawn.
+    pub turn_active: bool,
     /// Tool ids whose `permission_card` diff preview has been expanded past
     /// its truncated default — see `chat_panel::permission_card`. Keyed by
     /// id rather than a bool on `ToolActivity` itself since this is pure
@@ -299,6 +307,25 @@ pub fn send_chat_text(state: &mut State, text: String) {
     state.chat_pinned_to_bottom = true;
     if let Some(sender) = state.chat.sender.as_mut() {
         state.chat.sending = sender.try_send(ClaudeCommand::SendPrompt(text)).is_ok();
+        state.chat.turn_active = state.chat.sending;
+    }
+}
+
+/// The chat panel's Stop button — asks the running session to abort
+/// whatever turn is currently in flight (see `ClaudeCommand::Interrupt`'s
+/// own doc comment for the wire-level details). A no-op with no live
+/// session or no turn actually in flight. Doesn't clear `turn_active`/
+/// `sending`/the streaming bubble itself: the interrupt round-trips back as
+/// ordinary events (a `result` line at minimum), and `handle_chat_event`
+/// already clears all three from there — going through the same path a
+/// natural finish would keeps this a single source of truth instead of a
+/// second, optimistic one that could drift from it.
+pub fn stop_chat_turn(state: &mut State) {
+    if !state.chat.turn_active {
+        return;
+    }
+    if let Some(sender) = state.chat.sender.as_mut() {
+        let _ = sender.try_send(ClaudeCommand::Interrupt);
     }
 }
 
@@ -585,10 +612,20 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
             state.chat.cost_usd += cost_usd;
             state.chat.input_tokens = input_tokens;
             state.chat.output_tokens = output_tokens;
+            state.chat.turn_active = false;
+            // A `Stop`-interrupted turn ends here with no final
+            // `AssistantText` to flip a still-`streaming` bubble's caret
+            // off (see `ClaudeCommand::Interrupt`'s own doc comment) — a
+            // normal turn's own `AssistantText` already did this, so this
+            // is a no-op for it.
+            if let Some(ChatMessage::Assistant { streaming, .. }) = state.chat.messages.last_mut() {
+                *streaming = false;
+            }
         }
         ClaudeEvent::Unavailable(reason) => {
             state.chat.status = ChatStatus::Unavailable(reason);
             state.chat.sender = None;
+            state.chat.turn_active = false;
         }
         ClaudeEvent::HistoryTruncated => state.chat.history_truncated = true,
     }

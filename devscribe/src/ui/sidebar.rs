@@ -2,7 +2,7 @@ use devscribe_core::git::ChangeKind;
 use devscribe_core::theme::{Palette, Rgba};
 use iced::alignment::Vertical;
 use iced::font::Weight;
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, svg, text, text_input, Space};
 use iced::{Alignment, Border, Color, Element, Length, Padding};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -836,15 +836,30 @@ fn collapsed_rail(p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-/// A small text-glyph header button (New file / New folder / Collapse all).
-/// Deliberately doesn't use `widgets::lang_badge` — that widget bakes its
-/// foreground color into the inner `text()` at construction time, which
-/// would make the hover-color swap below inert (a `button::Style`'s
-/// `text_color` only takes effect when the content doesn't already set its
-/// own color).
-fn header_icon_button(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+/// Raw SVG bytes for the EXPLORER header's icon buttons, embedded the same
+/// way as the window icon (`main.rs`'s `ICON_RGBA`) — no filesystem lookup
+/// at runtime. Single-color outline glyphs: `svg::Handle`'s rasterized
+/// alpha mask is what the color-filter in `header_icon_button` recolors, so
+/// the stroke color baked into these files is irrelevant to how they render.
+const NEW_FILE_ICON: &[u8] = include_bytes!("../../assets/icons/explorer/new-file.svg");
+const NEW_FOLDER_ICON: &[u8] = include_bytes!("../../assets/icons/explorer/new-folder.svg");
+const TERMINAL_ICON: &[u8] = include_bytes!("../../assets/icons/explorer/terminal.svg");
+const OPEN_FOLDER_ICON: &[u8] = include_bytes!("../../assets/icons/explorer/open-folder.svg");
+const COLLAPSE_ALL_ICON: &[u8] = include_bytes!("../../assets/icons/explorer/collapse-all.svg");
+
+/// A small SVG-icon header button (New file / New folder / Open terminal /
+/// Open project folder / Collapse all). The `svg` widget tracks its own
+/// hover [`svg::Status`] independent of the wrapping `button` (both derive
+/// it from the same cursor-over-bounds check), so its color-filter style
+/// swaps in lockstep with the button's own hover background below.
+fn header_icon_button(icon: &'static [u8], message: Message, p: Palette) -> Element<'static, Message> {
     button(widgets::center_fill(
-        text(label).font(fonts::mono(Weight::Bold)).size(crate::text_scale::px(15.0)),
+        svg(svg::Handle::from_memory(icon))
+            .width(Length::Fixed(16.0))
+            .height(Length::Fixed(16.0))
+            .style(move |_theme, status| svg::Style {
+                color: Some(if status == svg::Status::Hovered { color(p.accent_solid) } else { color(p.text_muted) }),
+            }),
     ))
     .width(Length::Fixed(34.0))
     .height(Length::Fixed(30.0))
@@ -858,7 +873,6 @@ fn header_icon_button(label: &'static str, message: Message, p: Palette) -> Elem
             } else {
                 None
             },
-            text_color: if hovered { color(p.accent_solid) } else { color(p.text_muted) },
             ..button::Style::default()
         }
     })
@@ -866,10 +880,11 @@ fn header_icon_button(label: &'static str, message: Message, p: Palette) -> Elem
 }
 
 /// The tree's "EXPLORER" header row: New file (⌘N) / New folder (⇧⌘N) /
-/// Open terminal / Collapse all. Deliberately doesn't include the mockup's
-/// "More actions ⋯" menu (New window/Open folder/Save as/…) — that needs a
-/// native folder-picker dependency DevScribe doesn't have yet, tracked
-/// separately (see the roadmap's Phase 9).
+/// Open terminal / Open project folder (in the OS file manager) / Collapse
+/// all. Deliberately doesn't include the mockup's "More actions ⋯" menu (New
+/// window/Open folder/Save as/…) — that needs a native folder-picker
+/// dependency DevScribe doesn't have yet, tracked separately (see the
+/// roadmap's Phase 9).
 fn explorer_header(p: Palette) -> Element<'static, Message> {
     row![
         text("EXPLORER")
@@ -877,10 +892,11 @@ fn explorer_header(p: Palette) -> Element<'static, Message> {
             .size(crate::text_scale::px(15.0))
             .color(color(p.text_muted))
             .width(Length::Fill),
-        header_icon_button("+F", Message::BeginDraft(DraftKind::NewFile), p),
-        header_icon_button("+D", Message::BeginDraft(DraftKind::NewFolder), p),
-        header_icon_button(">_", Message::OpenTerminal, p),
-        header_icon_button("\u{21b1}", Message::CollapseAllDirs, p),
+        header_icon_button(NEW_FILE_ICON, Message::BeginDraft(DraftKind::NewFile), p),
+        header_icon_button(NEW_FOLDER_ICON, Message::BeginDraft(DraftKind::NewFolder), p),
+        header_icon_button(TERMINAL_ICON, Message::OpenTerminal, p),
+        header_icon_button(OPEN_FOLDER_ICON, Message::OpenProjectFolder, p),
+        header_icon_button(COLLAPSE_ALL_ICON, Message::CollapseAllDirs, p),
     ]
     .spacing(5.0)
     .align_y(Alignment::Center)

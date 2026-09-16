@@ -987,6 +987,31 @@ fn send_button(enabled: bool, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
+/// The composer's Stop affordance — takes `send_button`'s exact slot and
+/// styling (same size, same accent fill) so the one button in that spot
+/// simply morphs between "Send" and "Stop" as a turn starts/ends, the same
+/// convention chat UIs generally follow, rather than two differently-styled
+/// buttons competing for the same space. Always enabled: it only ever
+/// renders while `ChatThread::turn_active` is already true (see
+/// `input_bar`), so there's always something live to interrupt.
+fn stop_button(p: Palette) -> Element<'static, Message> {
+    button(widgets::center_fill(text("\u{25a0}").font(fonts::mono(Weight::Bold)).size(crate::text_scale::px(13.0))))
+        .width(Length::Fixed(32.0))
+        .height(Length::Fixed(32.0))
+        .padding(0.0)
+        .on_press(Message::ChatStop)
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: Some(if hovered { color(p.accent_solid_hover) } else { color(p.accent_solid) }.into()),
+                text_color: color(p.accent_on),
+                border: Border { color: Color::TRANSPARENT, width: 1.0, radius: 3.0.into() },
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
 /// The multi-line draft editor — a real `text_editor`, not a single-line
 /// `text_input`, specifically so cursor movement, click/drag text
 /// selection, and multi-line prompts (Shift+Enter) all work the way
@@ -1043,8 +1068,18 @@ fn input_bar(state: &State, p: Palette) -> Element<'_, Message> {
         input = input.on_action(Message::ChatInputAction);
     }
 
-    let send_enabled = enabled && !state.chat.input.text().trim().is_empty();
-    let input_row = row![actions_menu_button(state.chat_actions_open, p), input, send_button(send_enabled, p)]
+    // Copilot has no turn to interrupt (`copilot_agent::run` never sends a
+    // `TurnResult`/`Unavailable` to clear `turn_active` once set — see
+    // `ClaudeCommand::Interrupt`'s own doc comment on Copilot having no
+    // equivalent), so Stop only ever replaces Send for the `claude` CLI —
+    // same "don't show a control that silently does nothing" rule
+    // `mode_selector`/"Design Login…" already follow for Copilot.
+    let action_button = if state.chat.turn_active && state.chat_provider.is_claude_cli() {
+        stop_button(p)
+    } else {
+        send_button(enabled && !state.chat.input.text().trim().is_empty(), p)
+    };
+    let input_row = row![actions_menu_button(state.chat_actions_open, p), input, action_button]
         .spacing(8.0)
         .align_y(Alignment::End);
 

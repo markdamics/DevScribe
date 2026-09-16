@@ -50,13 +50,9 @@ pub enum InstallMethod {
         url: &'static str,
         binary_relative: &'static str,
     },
-    /// Cannot be auto-installed; surface `hint` as the error so the user knows
-    /// what to run manually.
-    Manual { hint: &'static str },
 }
 
 pub struct ServerSpec {
-    pub language: LspLanguage,
     /// Bare binary name used for PATH lookup (e.g. `"clangd"`).
     pub binary_name: &'static str,
     pub method: InstallMethod,
@@ -65,12 +61,10 @@ pub struct ServerSpec {
 pub fn spec_for(language: LspLanguage) -> ServerSpec {
     match language {
         LspLanguage::Rust => ServerSpec {
-            language,
             binary_name: "rust-analyzer",
             method: InstallMethod::Rustup,
         },
         LspLanguage::Java => ServerSpec {
-            language,
             binary_name: "jdtls",
             // Eclipse's "latest" snapshot URL always resolves to the newest build.
             // The archive extracts flat (no top-level wrapper dir) so bin/jdtls
@@ -81,12 +75,10 @@ pub fn spec_for(language: LspLanguage) -> ServerSpec {
             },
         },
         LspLanguage::Python => ServerSpec {
-            language,
             binary_name: "pyright-langserver",
             method: InstallMethod::Pip { package: "pyright" },
         },
         LspLanguage::JavaScript | LspLanguage::TypeScript => ServerSpec {
-            language,
             binary_name: "typescript-language-server",
             method: InstallMethod::Npm {
                 // typescript@7+ (Go rewrite) has no tsserver.js — pin to 5.x
@@ -95,7 +87,6 @@ pub fn spec_for(language: LspLanguage) -> ServerSpec {
             },
         },
         LspLanguage::Cpp => ServerSpec {
-            language,
             binary_name: "clangd",
             method: InstallMethod::GithubRelease {
                 url_template: "https://github.com/clangd/clangd/releases/download/{version}/clangd-linux-{version}.zip",
@@ -113,7 +104,7 @@ pub fn spec_for(language: LspLanguage) -> ServerSpec {
 /// - Rustup → `~/.cargo/bin/<binary>` (rustup's own proxy location, not a
 ///   DevScribe-managed dir — there is nothing for us to manage, this is just
 ///   where to look for what rustup already installed)
-/// - Download/Manual → `~/.local/share/devscribe/servers/<binary>`
+/// - Download → `~/.local/share/devscribe/servers/<binary>`
 pub fn managed_binary_path(spec: &ServerSpec) -> Option<PathBuf> {
     match &spec.method {
         InstallMethod::Pip { package } => Some(
@@ -138,7 +129,7 @@ pub fn managed_binary_path(spec: &ServerSpec) -> Option<PathBuf> {
         InstallMethod::TarGzDirectory { .. } => {
             Some(dirs::data_dir()?.join("devscribe").join("servers").join(spec.binary_name))
         }
-        InstallMethod::GithubRelease { .. } | InstallMethod::Manual { .. } => {
+        InstallMethod::GithubRelease { .. } => {
             Some(dirs::data_dir()?.join("devscribe").join("servers").join(spec.binary_name))
         }
     }
@@ -175,7 +166,6 @@ pub fn install(spec: &ServerSpec) -> Result<(), String> {
         InstallMethod::TarGzDirectory { url, binary_relative } => {
             install_tar_gz_directory(spec, url, binary_relative)
         }
-        InstallMethod::Manual { hint } => Err((*hint).to_string()),
         InstallMethod::Pip { package } => install_via_pip(package),
         InstallMethod::Npm { packages } => install_via_npm(packages),
         InstallMethod::GithubRelease { url_template, binary_in_archive, version } => {
