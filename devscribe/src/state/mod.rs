@@ -3020,6 +3020,9 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 && let Some(editor) = find_editor_mut(state, &path)
             {
                 editor.find = None;
+                let task = hold_scroll_position(editor, Pane::Primary);
+                persist_session(state);
+                return task;
             }
             persist_session(state);
         }
@@ -3347,6 +3350,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     && let Some(editor) = find_editor_mut(state, &path)
                 {
                     editor.find = None;
+                    return hold_scroll_position(editor, Pane::Primary);
                 }
             } else if revert_line_armed {
                 if let Some(path) = active_file_path(state)

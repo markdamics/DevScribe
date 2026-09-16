@@ -2139,6 +2139,29 @@ fn toggle_find_reopens_with_the_last_query_when_nothing_is_selected() {
 }
 
 #[test]
+fn close_find_holds_the_current_scroll_position() {
+    let files = TempFiles::new("close-find-scroll");
+    let contents: String = (0..200).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(&files.a, &contents).unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.viewport_width = 800.0;
+        editor.viewport_height = 400.0;
+        editor.scroll_offset = 500.0;
+    }
+
+    let _ = update(&mut state, Message::ToggleFind);
+    let task = update(&mut state, Message::CloseFind);
+
+    assert!(task.units() > 0, "closing find must re-pin the scroll rather than leaving it to iced");
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert_eq!(editor.scroll_offset, 500.0, "closing find must not move the recorded scroll position");
+    assert_eq!(editor.cursor, CursorPos::default(), "sanity: the cursor never moved off the top");
+}
+
+#[test]
 fn toggle_find_prefers_the_active_selection_over_the_last_query() {
     let files = TempFiles::new("find-selection-over-last-query");
     let root = files.a.parent().unwrap().to_path_buf();

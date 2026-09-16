@@ -257,14 +257,6 @@ pub struct FindState {
     pub just_wrapped: bool,
 }
 
-/// `Tab`-to-next-placeholder tracking for a snippet completion, from the
-/// moment it's inserted (`EditorState::begin_snippet`) until every stop has
-/// been visited (`advance_snippet`). `stops` are absolute char ranges into
-/// the *live* document — kept correct across the one stop currently being
-/// edited via the delta computed in `advance_snippet`, not by re-deriving
-/// them from the buffer, so a same-length or different-length retype of the
-/// current placeholder both leave every later stop pointing at the right
-/// place.
 #[derive(Debug, Clone)]
 struct ActiveSnippet {
     stops: Vec<(usize, usize)>,
@@ -281,56 +273,18 @@ pub struct EditorState {
     pub cursor: CursorPos,
     pub selection_anchor: Option<CursorPos>,
     pub language: Option<syntax::Language>,
-    /// `Rc` because `shell.rs` clones this into the canvas program on every
-    /// `view()` — and again per layout pass inside `responsive`. A large
-    /// file's span list runs to hundreds of thousands of entries, so a real
-    /// clone there was megabytes of copying several times a second (the
-    /// caret-blink subscription alone redraws 2x/sec).
     pub highlights: Rc<Vec<Span>>,
     highlighter: syntax::Highlighter,
-    /// A second, independent parse of the same buffer — see
-    /// `devscribe_core::outline`'s module doc for why `highlighter` above
-    /// can't supply this itself. `None` for a file with no landmark table
-    /// wired for its language, or one that hasn't parsed successfully.
-    /// Recomputed alongside `highlights` at settle time; while
-    /// `needs_reparse` is set, `breadcrumbs()` doesn't read it — a tree
-    /// this stale could point past the live buffer's own end.
     tree: Option<outline::Tree>,
-    /// `Rc` for the same reason as `highlights`.
     pub diagnostics: Rc<Vec<EditorDiagnostic>>,
-    /// `Some(Ok(_))`/`Some(Err(parse_message))` for `.json` files, `None`
-    /// otherwise. Recomputed on every edit, like `highlights`.
     pub json: Option<Result<serde_json::Value, String>>,
-    /// Collapsed node paths in the JSON tree view (e.g. `"root.foo[2]"`).
     pub json_collapsed: HashSet<String>,
-    /// `.json` files default to the read-only tree view (`json_view.rs`);
-    /// this flips a single tab over to the normal editable `code_area` so
-    /// the tree view doesn't have to grow its own editing UI. Ignored for
-    /// non-JSON files, which never look at it.
     pub json_text_mode: bool,
-    /// `Some(_)` for `.md`/`.markdown` files, `None` otherwise — the source
-    /// for the read-only preview panel (`markdown_view.rs`). Recomputed at
-    /// settle time alongside `tree`/`json`, not on every keystroke; see
-    /// `reparse_now`.
     pub markdown: Option<iced::widget::markdown::Content>,
-    /// Same idea as `json_text_mode`, one field over: `.md`/`.markdown`
-    /// files default to the rendered preview; this flips a single tab back
-    /// to the normal editable `code_area`. Ignored for non-Markdown files.
     pub markdown_text_mode: bool,
-    /// Headings harvested from `markdown`, in document order — the source
-    /// for the preview's table-of-contents panel and for resolving
-    /// `#anchor` links (both in-document and cross-file). Recomputed
-    /// alongside `markdown`, empty for non-Markdown files.
     pub markdown_headings: Vec<MarkdownHeading>,
-    /// Whether the preview's table-of-contents panel is expanded. Ignored
-    /// for non-Markdown files, same as `markdown_text_mode`.
     pub markdown_toc_open: bool,
-    /// This file's content at `HEAD` diffed against the live buffer.
     pub diff: DiffStatus,
-    /// One entry per buffer line, derived from `diff` — the editor gutter's
-    /// per-line added/modified/removed indicator, and what `revert_line`
-    /// acts on. Empty when `diff` isn't `Changed`. `Rc` for the same reason
-    /// as `highlights`: cloned into the canvas program on every `view()`.
     pub gutter_marks: Rc<Vec<Option<GutterMark>>>,
     /// Same grouping as `gutter_marks`, kept as hunks rather than flattened
     /// per-line — what the diff view's "revert selected changes" selects
@@ -347,48 +301,13 @@ pub struct EditorState {
     /// is waiting on its confirm/cancel step — same two-step shape as the
     /// sidebar's `State::pending_discard`.
     pub pending_hunk_revert: bool,
-    /// The buffer line whose gutter marker was clicked once and is now
-    /// armed, waiting for a confirming second click (`Message::RevertLine`)
-    /// — same two-step shape as `pending_hunk_revert`, but for the canvas
-    /// gutter's single-line revert rather than the diff view's multi-hunk
-    /// one. A click anywhere else, or Escape, disarms it without reverting.
     pub pending_revert_line: Option<usize>,
-    /// Set by every edit, cleared by `reparse_now`. The expensive derived
-    /// views (tree-sitter spans, the JSON tree) are recomputed once the
-    /// buffer settles rather than on every keystroke — see `EDIT_SETTLE`.
     pub needs_reparse: bool,
-    /// `Some` while this tab's find widget (Ctrl+F) is open.
     pub find: Option<FindState>,
-    /// Vertical scroll offset (px from the top) of this tab's editor
-    /// canvas, last reported by the `scrollable`'s `on_scroll`. Used to
-    /// virtualize `EditorCanvas::draw` (skip lines outside the visible
-    /// range) and, together with `viewport_height`, to decide whether a
-    /// Find match is already on-screen before scrolling to it.
     pub scroll_offset: f32,
-    /// Height (px) of this tab's editor scroll viewport, last reported
-    /// alongside `scroll_offset`. `0.0` until the first `on_scroll` fires
-    /// (e.g. a fresh tab that hasn't been scrolled or resized yet) —
-    /// `find_step` falls back to an assumed height in that case rather
-    /// than refusing to scroll.
     pub viewport_height: f32,
-    /// Horizontal scroll offset (px from the left) — the same idea as
-    /// `scroll_offset`, one axis over, now that the canvas is sized to the
-    /// document's widest line (`max_line_chars`) rather than always filling
-    /// the pane, so long lines scroll into view instead of being clipped.
     pub scroll_offset_x: f32,
-    /// Width (px) of the horizontal scroll viewport — the `viewport_height`
-    /// of this axis.
     pub viewport_width: f32,
-    /// The char length of the document's longest line, capped at
-    /// `MAX_RENDERED_LINE_CHARS` — sizes the canvas horizontally (see
-    /// `editor_canvas::content_width`). Kept only *grow*-accurate between
-    /// settles: `resync_after_edit` bumps it the moment a line gets longer
-    /// (so typing past the current edge doesn't visibly clip before the
-    /// canvas catches up), but never shrinks it — a shrink (e.g. deleting
-    /// the longest line) only self-corrects at the next `reparse_now`, same
-    /// EDIT_SETTLE lag `highlights`/`tree` already accept. A full rescan on
-    /// every keystroke would put an O(line count) pass back on the hot path
-    /// this file has otherwise gone to some lengths to keep O(1).
     max_line_chars: usize,
     /// Active completion popup: `None` = closed, `Some(items)` = showing.
     /// This is the currently *displayed* (fuzzy-filtered, re-sorted) subset —
@@ -404,17 +323,7 @@ pub struct EditorState {
     completions_all: Option<Vec<CompletionItem>>,
     /// Keyboard-navigation index into `completions`.
     pub completion_selected: usize,
-    /// Cursor position when the completion request was sent, used to discard
-    /// stale responses that arrive after the cursor moved elsewhere, and as
-    /// the start of the prefix `refilter_completions` matches against.
     pub completion_anchor: CursorPos,
-    /// The current GitHub Copilot inline ("ghost text") suggestion, if any —
-    /// independent of `completions`/`completions_all` above (that's the LSP
-    /// dot-completion popup; this is `copilot_completion`'s single always-
-    /// as-you-type suggestion, and the two can't both be showing at once in
-    /// practice since either one dismisses the other on the same triggers).
-    /// See `GhostCompletion`'s own doc comment for why this doesn't attempt
-    /// local prefix-narrowing the way `completions`/`completions_all` do.
     pub ghost_completion: Option<GhostCompletion>,
     /// Active `textDocument/signatureHelp` popup, shown while typing a
     /// call's argument list — independent of `completions`/`ghost_completion`
@@ -433,13 +342,6 @@ pub struct EditorState {
     /// an arrow key, undo, ...) makes the recorded stop positions no longer
     /// trustworthy.
     active_snippet: Option<ActiveSnippet>,
-    /// Where the mouse is currently resting (not dragging) over this
-    /// editor's canvas, and since when — set by `Message::EditorHoverMove`
-    /// (only on an actual cell change, see `editor_canvas::CanvasState`),
-    /// cleared by `Message::EditorHoverLeave` and by `clear_hover`. The
-    /// subscription's debounce tick (`due_hover_request`) fires the actual
-    /// `LspCommand::Hover` request once this has held still for
-    /// `HOVER_DWELL`.
     hover_pending: Option<(CursorPos, Instant)>,
     /// The position `hover_pending` was last turned into an actual request
     /// for — keeps the debounce tick from re-sending the same request every
@@ -2752,6 +2654,18 @@ pub fn scroll_cursor_into_view(state: &mut State, pane: Pane) -> iced::Task<Mess
     iced::widget::operation::scroll_to(
         scroll_id,
         iced::widget::scrollable::AbsoluteOffset { x: target_x, y: target_y },
+    )
+}
+
+pub fn hold_scroll_position(editor: &EditorState, pane: Pane) -> iced::Task<Message> {
+    let scroll_id = match pane {
+        Pane::Primary => editor_scroll_id(),
+        Pane::Split => split_editor_scroll_id(),
+        Pane::Solo(id) => solo_editor_scroll_id(id),
+    };
+    iced::widget::operation::scroll_to(
+        scroll_id,
+        iced::widget::scrollable::AbsoluteOffset { x: editor.scroll_offset_x, y: editor.scroll_offset },
     )
 }
 
