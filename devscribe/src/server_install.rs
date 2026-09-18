@@ -50,6 +50,22 @@ pub enum InstallMethod {
         url: &'static str,
         binary_relative: &'static str,
     },
+    /// Download a `.zip` and unpack the entire archive into a managed
+    /// subdirectory — same shape as `TarGzDirectory` but for servers
+    /// (e.g. kotlin-language-server) whose release asset is a zip. Unlike
+    /// `TarGzDirectory`, `managed_binary_path` points straight at
+    /// `binary_relative` inside that directory rather than the directory
+    /// itself, since there's no jdtls-style special launch command to build
+    /// — the unpacked script can be spawned directly.
+    ZipDirectory {
+        url: &'static str,
+        binary_relative: &'static str,
+    },
+    /// No automatic install — the server ships as part of a larger toolchain
+    /// install this app doesn't manage (e.g. sourcekit-lsp comes with the
+    /// Swift toolchain). `resolve_binary` only ever finds this on PATH;
+    /// `install` fails with `instructions` so the user knows what to do.
+    Manual { instructions: &'static str },
 }
 
 pub struct ServerSpec {
@@ -94,6 +110,26 @@ pub fn spec_for(language: LspLanguage) -> ServerSpec {
                 version: "18.1.3",
             },
         },
+        LspLanguage::Kotlin => ServerSpec {
+            binary_name: "kotlin-language-server",
+            // Asset is always `server.zip` (no per-platform or per-version
+            // name changes); unpacks to a top-level `server/` dir.
+            method: InstallMethod::ZipDirectory {
+                url: "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip",
+                binary_relative: "server/bin/kotlin-language-server",
+            },
+        },
+        LspLanguage::Swift => ServerSpec {
+            binary_name: "sourcekit-lsp",
+            // sourcekit-lsp ships inside the Swift toolchain (swift.org
+            // install, swiftly, or Xcode on macOS) rather than as a
+            // standalone release — nothing sensible for this app to
+            // download and manage on its own.
+            method: InstallMethod::Manual {
+                instructions: "sourcekit-lsp not found — install the Swift toolchain \
+                    from https://swift.org/install (or Xcode on macOS) so it's on PATH",
+            },
+        },
     }
 }
 
@@ -132,6 +168,17 @@ pub fn managed_binary_path(spec: &ServerSpec) -> Option<PathBuf> {
         InstallMethod::GithubRelease { .. } => {
             Some(dirs::data_dir()?.join("devscribe").join("servers").join(spec.binary_name))
         }
+        // Unlike `TarGzDirectory`, this points straight at the executable
+        // inside the extracted tree — lsp.rs spawns it directly, no
+        // jdtls-style command building needed.
+        InstallMethod::ZipDirectory { binary_relative, .. } => Some(
+            dirs::data_dir()?
+                .join("devscribe")
+                .join("servers")
+                .join(spec.binary_name)
+                .join(binary_relative),
+        ),
+        InstallMethod::Manual { .. } => None,
     }
 }
 
@@ -171,6 +218,10 @@ pub fn install(spec: &ServerSpec) -> Result<(), String> {
         InstallMethod::GithubRelease { url_template, binary_in_archive, version } => {
             install_binary_release(spec, url_template, binary_in_archive, version)
         }
+        InstallMethod::ZipDirectory { url, binary_relative } => {
+            install_zip_directory(spec, url, binary_relative)
+        }
+        InstallMethod::Manual { instructions } => Err(instructions.to_string()),
     }
 }
 
@@ -364,6 +415,54 @@ fn install_tar_gz_directory(
     let mut archive = tar::Archive::new(gz);
     archive
         .unpack(&dest_dir)
+        .map_err(|e| format!("extract failed: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dest_dir.join(binary_relative);
+        if binary.exists() {
+            let mut perms = std::fs::metadata(&binary)
+                .map_err(|e| format!("stat failed: {e}"))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&binary, perms)
+                .map_err(|e| format!("chmod failed: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Downloads a `.zip` archive and unpacks its entire contents into
+/// `<devscribe_data>/servers/<binary_name>/`, preserving the directory tree —
+/// the zip counterpart of `install_tar_gz_directory`, for servers (e.g.
+/// kotlin-language-server) whose launch script needs sibling `lib/` jars
+/// present at known relative paths.
+fn install_zip_directory(spec: &ServerSpec, url: &str, binary_relative: &str) -> Result<(), String> {
+    let dest_dir = dirs::data_dir()
+        .ok_or_else(|| "no data directory available".to_string())?
+        .join("devscribe")
+        .join("servers")
+        .join(spec.binary_name);
+
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("cannot create install dir: {e}"))?;
+
+    let mut body = ureq::get(url)
+        .call()
+        .map_err(|e| format!("download failed: {e}"))?
+        .into_body();
+
+    let mut bytes = Vec::new();
+    body.as_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("download read error: {e}"))?;
+
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("zip open failed: {e}"))?;
+    archive
+        .extract(&dest_dir)
         .map_err(|e| format!("extract failed: {e}"))?;
 
     #[cfg(unix)]

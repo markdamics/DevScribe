@@ -44,19 +44,23 @@ pub enum LspLanguage {
     JavaScript,
     TypeScript,
     Cpp,
+    Kotlin,
+    Swift,
 }
 
 impl LspLanguage {
     /// Every language this crate talks to a server for — for the settings
     /// panel's per-language inline-type-hints toggles (roadmap item 13).
     /// Mirrors `syntax::Language::ALL`.
-    pub const ALL: [LspLanguage; 6] = [
+    pub const ALL: [LspLanguage; 8] = [
         LspLanguage::Rust,
         LspLanguage::Java,
         LspLanguage::Python,
         LspLanguage::JavaScript,
         LspLanguage::TypeScript,
         LspLanguage::Cpp,
+        LspLanguage::Kotlin,
+        LspLanguage::Swift,
     ];
 
     /// Display name for the settings panel's per-language toggles.
@@ -68,6 +72,8 @@ impl LspLanguage {
             Self::JavaScript => "JavaScript",
             Self::TypeScript => "TypeScript",
             Self::Cpp => "C/C++",
+            Self::Kotlin => "Kotlin",
+            Self::Swift => "Swift",
         }
     }
 
@@ -79,6 +85,8 @@ impl LspLanguage {
             "js" | "mjs" | "cjs" => Some(Self::JavaScript),
             "ts" | "mts" | "cts" | "tsx" => Some(Self::TypeScript),
             "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" => Some(Self::Cpp),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "swift" => Some(Self::Swift),
             _ => None,
         }
     }
@@ -90,6 +98,8 @@ impl LspLanguage {
             Self::Python => "pyright-langserver",
             Self::JavaScript | Self::TypeScript => "typescript-language-server",
             Self::Cpp => "clangd",
+            Self::Kotlin => "kotlin-language-server",
+            Self::Swift => "sourcekit-lsp",
         }
     }
 
@@ -111,6 +121,8 @@ impl LspLanguage {
             Self::JavaScript => "javascript",
             Self::TypeScript => "typescript",
             Self::Cpp => "cpp",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
         }
     }
 }

@@ -10,8 +10,8 @@ use crate::state::{self, ChatMode, EditorState, Message, Pane, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
     breadcrumb_bar, chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash,
-    hover_popup, json_view, markdown_view, overview_ruler, quick_open, references_panel, search_view,
-    settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
+    hover_popup, json_view, markdown_view, open_project_prompt, overview_ruler, quick_open, references_panel,
+    search_view, settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
 
@@ -541,6 +541,7 @@ pub fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
     layers.extend(tab_bar::hover_preview(state, p));
     layers.extend(tab_bar::switcher_view(state, p));
     layers.extend(sidebar::projects_menu(state, p));
+    layers.extend(open_project_prompt::view(state, p));
     layers.extend(context_menu::view(state, p));
     layers.extend(context_menu::editor_menu_view(state, p));
     layers.extend(context_menu::rename_prompt_view(state, p));

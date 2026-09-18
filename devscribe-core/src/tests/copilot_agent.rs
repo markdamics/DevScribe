@@ -261,3 +261,114 @@ fn extract_progress_delta_ignores_a_plain_end_with_no_error() {
     let params = json!({"token": "t1", "value": {"kind": "end"}});
     assert_eq!(delta("t1", &params, true), None);
 }
+
+// -----------------------------------------------------------------------
+// DevScribe-owned session history
+// -----------------------------------------------------------------------
+
+/// A scratch project root plus its matching Copilot-session directory
+/// under the real data dir (`dirs::data_dir()/devscribe/copilot_sessions/`)
+/// — same "no injectable data dir to fake this with, so use a PID-suffixed
+/// unique project path instead" reasoning as `claude_agent`'s own
+/// `FakeProject`, cleaned up on drop.
+struct FakeCopilotProject {
+    root: PathBuf,
+    sessions_dir: PathBuf,
+}
+
+impl FakeCopilotProject {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("devscribe-copilot-session-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sessions_dir = copilot_sessions_dir(&root).expect("data dir must resolve on any machine running these tests");
+        let _ = std::fs::remove_dir_all(&sessions_dir);
+        Self { root, sessions_dir }
+    }
+}
+
+impl Drop for FakeCopilotProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.sessions_dir);
+    }
+}
+
+#[test]
+fn copilot_session_round_trips_through_save_and_load() {
+    let project = FakeCopilotProject::new("round-trip");
+    let turns = vec![
+        (CopilotSessionRole::Operator, "what does this do?".to_string()),
+        (CopilotSessionRole::Assistant, "it does the thing.".to_string()),
+    ];
+    assert!(!copilot_session_exists(&project.root, "s1"));
+    save_copilot_session(&project.root, "s1", &turns);
+    assert!(copilot_session_exists(&project.root, "s1"));
+
+    let events = load_copilot_session_history(&project.root, "s1");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[0], ClaudeEvent::OperatorText(t) if t == "what does this do?"));
+    assert!(matches!(&events[1], ClaudeEvent::AssistantText(t) if t == "it does the thing."));
+}
+
+#[test]
+fn save_copilot_session_is_a_no_op_for_an_empty_transcript() {
+    let project = FakeCopilotProject::new("empty");
+    save_copilot_session(&project.root, "s1", &[]);
+    assert!(!copilot_session_exists(&project.root, "s1"), "an empty turn list shouldn't create a file");
+}
+
+#[test]
+fn save_copilot_session_overwrites_rather_than_appends() {
+    let project = FakeCopilotProject::new("overwrite");
+    save_copilot_session(&project.root, "s1", &[(CopilotSessionRole::Operator, "first".to_string())]);
+    save_copilot_session(
+        &project.root,
+        "s1",
+        &[(CopilotSessionRole::Operator, "first".to_string()), (CopilotSessionRole::Assistant, "second".to_string())],
+    );
+    let events = load_copilot_session_history(&project.root, "s1");
+    assert_eq!(events.len(), 2, "the second save should replace, not append to, the first");
+}
+
+#[test]
+fn list_copilot_sessions_is_empty_for_a_project_that_never_had_one() {
+    let root = std::env::temp_dir().join(format!("devscribe-copilot-session-test-nonexistent-{}", std::process::id()));
+    assert!(list_copilot_sessions(&root).is_empty());
+}
+
+#[test]
+fn list_copilot_sessions_sorts_most_recently_active_first_and_titles_from_the_first_operator_message() {
+    let project = FakeCopilotProject::new("list-sort");
+    save_copilot_session(&project.root, "older", &[(CopilotSessionRole::Operator, "first one".to_string())]);
+    std::thread::sleep(Duration::from_millis(20)); // ensure a distinct, later mtime
+    save_copilot_session(&project.root, "newer", &[(CopilotSessionRole::Operator, "second one".to_string())]);
+
+    let sessions = list_copilot_sessions(&project.root);
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].id, "newer");
+    assert_eq!(sessions[0].title, "second one");
+    assert_eq!(sessions[1].id, "older");
+    assert_eq!(sessions[1].title, "first one");
+}
+
+#[test]
+fn list_copilot_sessions_defaults_to_new_session_with_no_operator_message() {
+    // Shouldn't normally happen (`save_copilot_session` is a no-op for an
+    // empty transcript) but a session that somehow only ever got an
+    // assistant turn shouldn't panic or show a blank title.
+    let project = FakeCopilotProject::new("no-operator");
+    save_copilot_session(&project.root, "s1", &[(CopilotSessionRole::Assistant, "hello".to_string())]);
+    let sessions = list_copilot_sessions(&project.root);
+    assert_eq!(sessions[0].title, "New session");
+}
+
+#[test]
+fn list_copilot_sessions_truncates_a_long_first_message() {
+    let project = FakeCopilotProject::new("title-truncate");
+    let long = "x".repeat(200);
+    save_copilot_session(&project.root, "s1", &[(CopilotSessionRole::Operator, long)]);
+    let sessions = list_copilot_sessions(&project.root);
+    assert!(sessions[0].title.ends_with('\u{2026}'), "a truncated title should end with an ellipsis, got {:?}", sessions[0].title);
+    assert!(sessions[0].title.chars().count() <= 61, "should be capped near 60 chars, got {} chars", sessions[0].title.chars().count());
+}

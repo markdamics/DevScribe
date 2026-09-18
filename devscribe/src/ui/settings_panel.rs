@@ -755,6 +755,8 @@ fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
         (LspLanguage::Python,     "PYRIGHT",                    "python"),
         (LspLanguage::TypeScript, "TYPESCRIPT-LANGUAGE-SERVER", "ts/js"),
         (LspLanguage::Cpp,        "CLANGD",                     "c/c++"),
+        (LspLanguage::Kotlin,     "KOTLIN-LANGUAGE-SERVER",     "kotlin"),
+        (LspLanguage::Swift,      "SOURCEKIT-LSP",              "swift"),
     ];
 
     let rows: Vec<Element<'static, Message>> = all_langs

@@ -22,7 +22,7 @@
 //! relocate the guesswork into types that look more authoritative than they
 //! are.
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_lsp::lsp_types::notification::Notification;
@@ -196,13 +196,19 @@ fn pick_model_id(models: &Value) -> Option<&str> {
 /// don't need to know which provider produced them at all.
 ///
 /// Scope, deliberately: plain conversational chat only (the server's default
-/// "Ask" `chatMode`), one conversation per worker spawn — no resume-across-
-/// restarts (unlike Claude, whose sessions are resumed from saved transcript
-/// files; Copilot's own `conversation/persistence` is a separate, equally
+/// "Ask" `chatMode`), one *live* conversation per worker spawn — no
+/// resuming the actual LSP conversation across restarts (unlike Claude,
+/// whose sessions are resumed from saved transcript files via `--resume`;
+/// Copilot's own `conversation/persistence` is a separate, equally
 /// undocumented mechanism not implemented here), and no tool-call/agent-mode
 /// support (`ClaudeCommand::RespondPermission` is a no-op — nothing here ever
 /// produces a `PermissionRequest` to answer). Extending either is future work,
 /// not a limitation of the protocol itself.
+///
+/// What *is* implemented, below this function: DevScribe-owned session
+/// history — a read-only list/replay of past conversations, persisted by
+/// DevScribe itself rather than resumed from the server (see that section's
+/// own doc comment).
 ///
 /// `binary` is the resolved path (or bare name) of `copilot-language-server`;
 /// callers (see `devscribe`'s `chat_worker`) are responsible for locating it
@@ -518,6 +524,159 @@ pub async fn run(root: PathBuf, binary: PathBuf, mut output: mpsc::Sender<Claude
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// DevScribe-owned session history
+// ---------------------------------------------------------------------
+//
+// `copilot-language-server` keeps no cross-restart session state of its own
+// that this module relies on — every `run` spawn is one throwaway
+// conversation (see `run`'s own doc comment). To still offer a past-
+// sessions list and history view in the chat panel, mirroring
+// `claude_agent`'s real, CLI-backed one, DevScribe persists its own record
+// of each conversation's messages here — keyed by the same `session_id`
+// scheme `chat_worker` already generates for every provider
+// (`claude_agent::new_session_id`), *not* the ephemeral `conversationId` a
+// spawn gets back from `ConversationCreate`, which means nothing once the
+// process exits.
+//
+// This is read-only history, not real resume: `devscribe`'s `chat_worker`
+// replays a matching session's saved turns as ordinary `ClaudeEvent`s
+// before handing off to `run` (the same mechanism `claude_agent`'s own
+// `load_session_history` uses, just from a different file) — sending a new
+// message afterward starts a brand-new Copilot conversation under the
+// hood, since there's nothing here to actually reconnect the live LSP
+// session to.
+//
+// Stored as a plain `serde_json::Value` array rather than a typed struct,
+// same reasoning as `Params`/`Result` above: this is DevScribe's own
+// format so there's no drifting external shape to guard against, but a
+// two-field `{role, text}` record isn't worth a `serde` dependency for.
+
+fn copilot_sessions_dir(root: &Path) -> Option<PathBuf> {
+    let encoded = root.to_string_lossy().replace('/', "-");
+    Some(dirs::data_dir()?.join("devscribe").join("copilot_sessions").join(encoded))
+}
+
+fn copilot_session_file(root: &Path, session_id: &str) -> Option<PathBuf> {
+    Some(copilot_sessions_dir(root)?.join(format!("{session_id}.json")))
+}
+
+/// Who said one saved turn — `save_session`'s callers already know this
+/// (an `Operator` push vs. a finalized `Assistant` reply), so it's plumbed
+/// through as a small enum rather than a raw string at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopilotSessionRole {
+    Operator,
+    Assistant,
+}
+
+impl CopilotSessionRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            CopilotSessionRole::Operator => "operator",
+            CopilotSessionRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// Whether `session_id` has a saved DevScribe-owned history file —
+/// `chat_worker`'s cue to replay it before spawning `run`, same role
+/// `claude_agent::session_exists` plays for a real `claude` transcript.
+pub fn copilot_session_exists(root: &Path, session_id: &str) -> bool {
+    copilot_session_file(root, session_id).is_some_and(|p| p.exists())
+}
+
+/// Mirrors `claude_agent::truncate_for_title` — not shared since that one
+/// is private to its own module and this is the only other caller.
+fn truncate_for_title(text: &str, max_chars: usize) -> String {
+    let truncated: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars { format!("{truncated}\u{2026}") } else { truncated }
+}
+
+/// Past Copilot sessions for `root`, most recently active first — the
+/// `ChatProvider::Copilot` counterpart to `claude_agent::list_sessions`,
+/// returning the very same `SessionSummary` type so the chat panel's
+/// session picker doesn't need to know which provider produced a row.
+pub fn list_copilot_sessions(root: &Path) -> Vec<crate::claude_agent::SessionSummary> {
+    let Some(dir) = copilot_sessions_dir(root) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+
+    let mut sessions: Vec<crate::claude_agent::SessionSummary> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path.file_stem()?.to_str()?.to_string();
+            let last_active = entry.metadata().ok()?.modified().ok()?;
+            let bytes = std::fs::read(&path).ok()?;
+            let turns: Value = serde_json::from_slice(&bytes).ok()?;
+            let title = turns
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| t.get("role").and_then(Value::as_str) == Some("operator"))
+                .and_then(|t| t.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| truncate_for_title(t, 60))
+                .unwrap_or_else(|| "New session".to_string());
+            Some(crate::claude_agent::SessionSummary { id, title, last_active })
+        })
+        .collect();
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active));
+    sessions
+}
+
+/// Reconstructs `session_id`'s saved history as the same `ClaudeEvent`s
+/// live streaming would have produced — `chat_worker`'s replay source
+/// before spawning `run`, the Copilot counterpart to
+/// `claude_agent::load_session_history` (unlike that one, there's no
+/// truncation here: a Copilot session realistically never grows large
+/// enough for it to matter, since nothing here ever replays tool activity).
+pub fn load_copilot_session_history(root: &Path, session_id: &str) -> Vec<ClaudeEvent> {
+    let Some(path) = copilot_session_file(root, session_id) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(&path) else { return Vec::new() };
+    let Ok(turns) = serde_json::from_slice::<Value>(&bytes) else { return Vec::new() };
+    turns
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let text = t.get("text").and_then(Value::as_str)?.to_string();
+            match t.get("role").and_then(Value::as_str) {
+                Some("operator") => Some(ClaudeEvent::OperatorText(text)),
+                Some("assistant") => Some(ClaudeEvent::AssistantText(text)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Overwrites `session_id`'s saved history with `turns` in full — called by
+/// `devscribe`'s chat-state reducer after every Operator push and every
+/// finalized Assistant reply, rather than appended incrementally: a
+/// Copilot session's whole transcript is only ever a few dozen short
+/// messages, so re-writing it each time is simpler than tracking a byte
+/// offset to append at, and self-corrects if an earlier write was ever
+/// interrupted half-done. A no-op for an empty `turns` — nothing worth
+/// creating a file for yet (a session that opened but never actually sent
+/// a first message).
+pub fn save_copilot_session(root: &Path, session_id: &str, turns: &[(CopilotSessionRole, String)]) {
+    if turns.is_empty() {
+        return;
+    }
+    let Some(path) = copilot_session_file(root, session_id) else { return };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let json = Value::Array(turns.iter().map(|(role, text)| json!({"role": role.as_str(), "text": text})).collect());
+    if let Ok(bytes) = serde_json::to_vec(&json) {
+        let _ = std::fs::write(&path, bytes);
     }
 }
 

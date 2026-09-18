@@ -1121,6 +1121,63 @@ fn close_project_returns_to_the_welcome_screen() {
 }
 
 #[test]
+fn recent_project_picked_prompts_instead_of_replacing_an_already_open_project() {
+    let mut state = State { welcome_open: false, root: PathBuf::from("/some/project"), ..State::default() };
+
+    let _ = update(&mut state, Message::RecentProjectPicked(PathBuf::from("/other/project")));
+
+    // Still on the original project — no load kicked off — and the choice
+    // is now pending instead.
+    assert_eq!(state.root, PathBuf::from("/some/project"));
+    assert!(state.loading_project.is_none());
+    match state.pending_project_open {
+        Some(PendingProjectOpen::Recent(ref path)) => assert_eq!(path, &PathBuf::from("/other/project")),
+        ref other => panic!("expected a pending Recent pick, got {other:?}"),
+    }
+}
+
+#[test]
+fn recent_project_picked_loads_straight_through_from_the_welcome_screen() {
+    let mut state = State { welcome_open: true, ..State::default() };
+
+    let _ = update(&mut state, Message::RecentProjectPicked(PathBuf::from("/other/project")));
+
+    assert!(state.pending_project_open.is_none());
+    assert!(state.loading_project.is_some());
+}
+
+#[test]
+fn confirming_this_window_loads_the_pending_project_and_clears_the_prompt() {
+    let mut state = State {
+        welcome_open: false,
+        root: PathBuf::from("/some/project"),
+        pending_project_open: Some(PendingProjectOpen::Recent(PathBuf::from("/other/project"))),
+        ..State::default()
+    };
+
+    let _ = update(&mut state, Message::OpenPendingProjectInThisWindow);
+
+    assert!(state.pending_project_open.is_none());
+    assert!(state.loading_project.is_some());
+}
+
+#[test]
+fn escape_dismisses_the_pending_project_open_prompt_without_loading_anything() {
+    let mut state = State {
+        welcome_open: false,
+        root: PathBuf::from("/some/project"),
+        pending_project_open: Some(PendingProjectOpen::Recent(PathBuf::from("/other/project"))),
+        ..State::default()
+    };
+
+    let _ = update(&mut state, Message::EscapePressed);
+
+    assert!(state.pending_project_open.is_none());
+    assert!(state.loading_project.is_none());
+    assert_eq!(state.root, PathBuf::from("/some/project"));
+}
+
+#[test]
 fn begin_untitled_buffer_gives_each_call_a_distinct_name_and_focuses_it() {
     let mut state = State::default();
 
@@ -2099,6 +2156,90 @@ fn chat_sessions_loaded_replaces_the_list() {
     }];
     let _ = update(&mut state, Message::ChatSessionsLoaded(sessions.clone()));
     assert_eq!(state.chat_sessions, sessions);
+}
+
+/// A scratch project root for tests that exercise Copilot session
+/// persistence, which writes real files under `dirs::data_dir()` keyed by
+/// this path (see `copilot_agent`'s own session-history section) — no
+/// injectable data dir to fake this with, so a PID/thread-suffixed unique
+/// path avoids colliding with a real project, cleaned up on drop.
+struct FakeCopilotChatProject {
+    root: PathBuf,
+}
+
+impl FakeCopilotChatProject {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "devscribe-copilot-chat-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+}
+
+impl Drop for FakeCopilotChatProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+        // Mirrors `copilot_agent::copilot_sessions_dir`'s own (private)
+        // path scheme — nothing public to call instead, and duplicating
+        // one string-replace here is simpler than exposing a test-only hook.
+        if let Some(data_dir) = dirs::data_dir() {
+            let encoded = self.root.to_string_lossy().replace('/', "-");
+            let _ = std::fs::remove_dir_all(data_dir.join("devscribe").join("copilot_sessions").join(encoded));
+        }
+    }
+}
+
+#[test]
+fn chat_submit_persists_the_operator_message_for_the_copilot_provider() {
+    let project = FakeCopilotChatProject::new("submit");
+    let mut state = State { root: project.root.clone(), chat_provider: ChatProvider::Copilot, ..State::default() };
+    state.chat_session_id = "s1".to_string();
+    let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.input = iced::widget::text_editor::Content::with_text("what does this do?");
+
+    let _ = update(&mut state, Message::ChatSubmit);
+
+    assert!(devscribe_core::copilot_agent::copilot_session_exists(&project.root, "s1"));
+    let sessions = devscribe_core::copilot_agent::list_copilot_sessions(&project.root);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].title, "what does this do?");
+}
+
+#[test]
+fn chat_assistant_text_persists_the_finalized_reply_for_the_copilot_provider() {
+    let project = FakeCopilotChatProject::new("assistant");
+    let mut state = State { root: project.root.clone(), chat_provider: ChatProvider::Copilot, ..State::default() };
+    state.chat_session_id = "s1".to_string();
+    state.chat.messages.push(ChatMessage::Operator("hi".to_string()));
+
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::AssistantText("hello there".to_string())));
+
+    let events = devscribe_core::copilot_agent::load_copilot_session_history(&project.root, "s1");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[0], ClaudeEvent::OperatorText(t) if t == "hi"));
+    assert!(matches!(&events[1], ClaudeEvent::AssistantText(t) if t == "hello there"));
+}
+
+#[test]
+fn chat_submit_does_not_persist_anything_for_the_claude_provider() {
+    // `ChatProvider::Claude` persists its own transcripts via the `claude`
+    // CLI — `persist_copilot_session` must stay a no-op for it, or a Claude
+    // session would spuriously show up as a Copilot one too.
+    let project = FakeCopilotChatProject::new("claude-no-op");
+    let mut state = State { root: project.root.clone(), chat_provider: ChatProvider::Claude, ..State::default() };
+    state.chat_session_id = "s1".to_string();
+    let (tx, _rx) = mpsc::channel::<ClaudeCommand>(4);
+    state.chat.sender = Some(tx);
+    state.chat.input = iced::widget::text_editor::Content::with_text("hello");
+
+    let _ = update(&mut state, Message::ChatSubmit);
+
+    assert!(!devscribe_core::copilot_agent::copilot_session_exists(&project.root, "s1"));
 }
 
 #[test]

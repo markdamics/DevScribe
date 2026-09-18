@@ -462,6 +462,13 @@ pub struct State {
     /// is in flight — drives the welcome screen's "Loading workspace"
     /// overlay.
     pub loading_project: Option<LoadingProject>,
+    /// A project-opening action waiting on the user's "Open in New Window" /
+    /// "Open in This Window" choice — see `PendingProjectOpen` and
+    /// `ui::open_project_prompt`. Only ever set while a project is already
+    /// open (`!welcome_open`): with none open yet, there's no "this window"
+    /// project to protect, so `RecentProjectPicked`/`FolderDialogResult`
+    /// load straight through instead of asking.
+    pub pending_project_open: Option<PendingProjectOpen>,
     /// The file `Message::OpenFileDialog` picked while no project was open
     /// yet (`welcome_open`) — since a project must have a folder root,
     /// picking a file there bootstraps one from the file's own parent
@@ -926,6 +933,7 @@ impl Default for State {
             recent_projects,
             welcome_rows,
             loading_project: None,
+            pending_project_open: None,
             pending_solo_open: None,
             root,
             tree: snapshot.tree,
@@ -1670,8 +1678,19 @@ pub enum Message {
     /// cancelled it.
     FileDialogResult(Option<PathBuf>),
     /// A row in the welcome screen's recent list or the sidebar's projects
-    /// dropdown was clicked.
+    /// dropdown was clicked. Loads straight through if no project is open
+    /// yet (`welcome_open`); otherwise raises the new-window/this-window
+    /// choice instead — see `State::pending_project_open`.
     RecentProjectPicked(PathBuf),
+    /// The "Open in New Window" choice on the pending project-open prompt
+    /// (`State::pending_project_open`) — see `spawn_project_window`.
+    OpenPendingProjectInNewWindow,
+    /// The "Open in This Window" choice on the pending project-open prompt —
+    /// same as if `RecentProjectPicked`/`FolderDialogResult` had loaded
+    /// straight through.
+    OpenPendingProjectInThisWindow,
+    /// Backdrop click or Escape on the pending project-open prompt.
+    CancelPendingProjectOpen,
     /// "Close project" — returns to the welcome screen.
     CloseProject,
     /// A background project load (`start_loading_project`) finished.
@@ -3558,7 +3577,10 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::FolderDialogResult(path, init_git) => {
             if let Some(path) = path {
-                return start_loading_project(state, path, init_git);
+                if state.welcome_open {
+                    return start_loading_project(state, path, init_git);
+                }
+                state.pending_project_open = Some(PendingProjectOpen::Folder(path, init_git));
             }
         }
         Message::OpenFileDialog => {
@@ -3586,10 +3608,28 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         }
         Message::RecentProjectPicked(path) => {
             state.projects_open = false;
-            if state.loading_project.is_none() {
+            if state.loading_project.is_some() {
+                return iced::Task::none();
+            }
+            if state.welcome_open {
                 return start_loading_project(state, path, false);
             }
+            state.pending_project_open = Some(PendingProjectOpen::Recent(path));
         }
+        Message::OpenPendingProjectInNewWindow => {
+            if let Some(pending) = state.pending_project_open.take() {
+                spawn_project_window(state, pending.path().to_path_buf());
+            }
+        }
+        Message::OpenPendingProjectInThisWindow => {
+            if let Some(pending) = state.pending_project_open.take() {
+                return match pending {
+                    PendingProjectOpen::Recent(path) => start_loading_project(state, path, false),
+                    PendingProjectOpen::Folder(path, init_git) => start_loading_project(state, path, init_git),
+                };
+            }
+        }
+        Message::CancelPendingProjectOpen => state.pending_project_open = None,
         Message::CloseProject => close_project(state),
         Message::ProjectLoaded(loaded) => {
             apply_loaded_project(state, *loaded);
@@ -3676,6 +3716,8 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.editor_ctx_menu = None;
             } else if state.ctx_menu.is_some() {
                 state.ctx_menu = None;
+            } else if state.pending_project_open.is_some() {
+                state.pending_project_open = None;
             } else if state.overflow_open {
                 state.overflow_open = false;
             } else if state.projects_open {

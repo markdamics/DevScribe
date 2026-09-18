@@ -6,6 +6,9 @@ fn language_from_extension() {
     assert_eq!(LspLanguage::from_extension("rs"), Some(LspLanguage::Rust));
     assert_eq!(LspLanguage::from_extension("RS"), Some(LspLanguage::Rust));
     assert_eq!(LspLanguage::from_extension("json"), None);
+    assert_eq!(LspLanguage::from_extension("kt"), Some(LspLanguage::Kotlin));
+    assert_eq!(LspLanguage::from_extension("kts"), Some(LspLanguage::Kotlin));
+    assert_eq!(LspLanguage::from_extension("swift"), Some(LspLanguage::Swift));
 }
 
 fn sample_hint(label: InlayHintLabel, kind: Option<InlayHintKind>) -> InlayHint {

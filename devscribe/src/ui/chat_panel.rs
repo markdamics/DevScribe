@@ -1437,18 +1437,22 @@ pub fn thread_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     .into()
 }
 
-/// The header's trailing buttons, shared by both presentations.
-/// "THREADS" opens the saved-session picker, which reads `claude`'s own
-/// on-disk transcripts (`claude_agent::list_sessions`) — there are no such
-/// transcripts under Copilot, and `copilot_agent` doesn't resume sessions at
-/// all, so the button is Claude-only rather than an empty list to nowhere.
+/// The header's trailing buttons, shared by both presentations. "THREADS"
+/// opens the saved-session picker — `claude`'s own on-disk transcripts
+/// under `ChatProvider::Claude` (`claude_agent::list_sessions`), or
+/// DevScribe's own read-only saved history under `ChatProvider::Copilot`
+/// (`copilot_agent::list_copilot_sessions`; see that function's own doc
+/// comment on how it differs from a real resume). "NEW" starts a fresh
+/// session without going through the picker first — the same
+/// `Message::ChatNewSession` the picker's own "New session" row and the
+/// Actions popup's "Clear conversation" already send, just reachable in one
+/// click from the header instead of two.
 fn header_buttons(state: &State, p: Palette) -> Vec<Element<'static, Message>> {
-    let mut buttons = Vec::new();
-    if state.chat_provider.is_claude_cli() {
-        buttons.push(header_button("THREADS", Message::ChatToggleSessions, p));
-    }
-    buttons.push(view_menu_button(state.chat_view_menu_open, p));
-    buttons
+    vec![
+        header_button("NEW", Message::ChatNewSession, p),
+        header_button("THREADS", Message::ChatToggleSessions, p),
+        view_menu_button(state.chat_view_menu_open, p),
+    ]
 }
 
 fn provider_button(provider: ChatProvider, active: ChatProvider, p: Palette) -> Element<'static, Message> {

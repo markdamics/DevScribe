@@ -184,10 +184,12 @@ const CPP_LANDMARKS: &[Landmark] = landmarks! {
 
 /// `None` for languages with no meaningful "function/loop" concept
 /// (JSON/TOML/YAML/XML/INI/Markdown) — the same boundary `lsp::LspLanguage`
-/// already draws around "code with language intelligence". Private:
-/// `Landmark` itself has no reason to be public, so this stays an internal
-/// detail of `breadcrumbs_at` rather than something a caller resolves up
-/// front.
+/// already draws around "code with language intelligence" — or for a
+/// language whose landmark table just isn't written yet (Kotlin/Swift: they
+/// have syntax highlighting via `syntax::Language` but no breadcrumb support
+/// here, a separate, unstarted piece of work). Private: `Landmark` itself
+/// has no reason to be public, so this stays an internal detail of
+/// `breadcrumbs_at` rather than something a caller resolves up front.
 fn landmarks_for(language: Language) -> Option<&'static [Landmark]> {
     match language {
         Language::Rust => Some(RUST_LANDMARKS),
@@ -195,9 +197,14 @@ fn landmarks_for(language: Language) -> Option<&'static [Landmark]> {
         Language::JavaScript | Language::TypeScript | Language::Tsx => Some(JS_TS_LANDMARKS),
         Language::Java => Some(JAVA_LANDMARKS),
         Language::Cpp => Some(CPP_LANDMARKS),
-        Language::Json | Language::Toml | Language::Yaml | Language::Xml | Language::Ini | Language::Markdown => {
-            None
-        }
+        Language::Json
+        | Language::Toml
+        | Language::Yaml
+        | Language::Xml
+        | Language::Ini
+        | Language::Markdown
+        | Language::Kotlin
+        | Language::Swift => None,
     }
 }
 
@@ -210,9 +217,14 @@ fn ts_language(language: Language) -> Option<tree_sitter::Language> {
         Language::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
         Language::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
-        Language::Json | Language::Toml | Language::Yaml | Language::Xml | Language::Ini | Language::Markdown => {
-            None
-        }
+        Language::Json
+        | Language::Toml
+        | Language::Yaml
+        | Language::Xml
+        | Language::Ini
+        | Language::Markdown
+        | Language::Kotlin
+        | Language::Swift => None,
     }
 }
 

@@ -22,6 +22,9 @@ fn language_from_extension() {
     assert_eq!(Language::from_extension("properties"), Some(Language::Ini));
     assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
     assert_eq!(Language::from_extension("markdown"), Some(Language::Markdown));
+    assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
+    assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
+    assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
 }
 
 #[test]
@@ -147,4 +150,90 @@ fn highlights_markdown_heading_and_inline_code() {
     assert!(spans
         .iter()
         .any(|s| &source[s.start..s.end] == "bold" && s.kind == HighlightKind::Function));
+}
+
+#[test]
+fn highlights_kotlin_keywords_types_and_strings() {
+    let mut highlighter = Highlighter::new();
+    let source = "// hi\nclass Foo(val name: String) {\n    fun greet() = \"hi $name\"\n}\n";
+    let spans = highlighter.highlight(Language::Kotlin, source);
+
+    assert!(!spans.is_empty());
+    for pair in spans.windows(2) {
+        assert!(pair[0].end <= pair[1].start);
+    }
+
+    let comment_span = spans
+        .iter()
+        .find(|s| source[s.start..s.end].starts_with("//"))
+        .expect("comment should be highlighted");
+    assert_eq!(comment_span.kind, HighlightKind::Comment);
+
+    let class_kw = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "class")
+        .expect("`class` should be highlighted");
+    assert_eq!(class_kw.kind, HighlightKind::Keyword);
+
+    let type_span = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "Foo")
+        .expect("class name should be highlighted as a type");
+    assert_eq!(type_span.kind, HighlightKind::Type);
+
+    let string_type = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "String")
+        .expect("parameter type should be highlighted as a type");
+    assert_eq!(string_type.kind, HighlightKind::Type);
+
+    let fn_span = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "greet")
+        .expect("function name should be highlighted");
+    assert_eq!(fn_span.kind, HighlightKind::Function);
+
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].contains("hi") && s.kind == HighlightKind::String));
+}
+
+#[test]
+fn highlights_swift_keywords_types_and_strings() {
+    let mut highlighter = Highlighter::new();
+    let source = "// hi\nclass Foo {\n    func greet(name: String) -> String {\n        return \"hi\"\n    }\n}\n";
+    let spans = highlighter.highlight(Language::Swift, source);
+
+    assert!(!spans.is_empty());
+    for pair in spans.windows(2) {
+        assert!(pair[0].end <= pair[1].start);
+    }
+
+    let comment_span = spans
+        .iter()
+        .find(|s| source[s.start..s.end].starts_with("//"))
+        .expect("comment should be highlighted");
+    assert_eq!(comment_span.kind, HighlightKind::Comment);
+
+    let class_kw = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "class")
+        .expect("`class` should be highlighted");
+    assert_eq!(class_kw.kind, HighlightKind::Keyword);
+
+    let type_span = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "String")
+        .expect("`String` should be highlighted as a type");
+    assert_eq!(type_span.kind, HighlightKind::Type);
+
+    let fn_span = spans
+        .iter()
+        .find(|s| &source[s.start..s.end] == "greet")
+        .expect("function name should be highlighted");
+    assert_eq!(fn_span.kind, HighlightKind::Function);
+
+    assert!(spans
+        .iter()
+        .any(|s| source[s.start..s.end].contains("hi") && s.kind == HighlightKind::String));
 }

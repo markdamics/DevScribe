@@ -30,11 +30,13 @@ impl ChatProvider {
 
     /// Whether this provider is backed by the `claude` CLI, and so supports
     /// the Claude-specific affordances the panel offers on top of plain
-    /// chat: saved session transcripts ("THREADS"), `@`-path file mentions,
-    /// and the `/model`, `/effort`, `/usage` slash commands the Actions
-    /// popup sends as prompts. `copilot_agent` implements none of these —
-    /// see its own doc comment on scope — so surfacing them under Copilot
-    /// would be UI that looks functional but silently does nothing.
+    /// chat: `@`-path file mentions and the `/model`, `/effort`, `/usage`
+    /// slash commands the Actions popup sends as prompts. `copilot_agent`
+    /// implements none of these — see its own doc comment on scope — so
+    /// surfacing them under Copilot would be UI that looks functional but
+    /// silently does nothing. Saved-session history ("THREADS") is *not*
+    /// gated on this — both providers support it, just from different
+    /// sources (see `copilot_agent`'s own session-history section).
     pub fn is_claude_cli(self) -> bool {
         matches!(self, ChatProvider::Claude)
     }
@@ -301,6 +303,7 @@ pub fn submit_chat_prompt(state: &mut State) {
 pub fn send_chat_text(state: &mut State, text: String) {
     state.chat.messages.push(ChatMessage::Operator(text.clone()));
     sync_message_content(&mut state.chat);
+    persist_copilot_session(state);
     // Sending is always an explicit "take me to the bottom" action, the same
     // convention every other chat client follows, regardless of whether the
     // user had scrolled up to reread something first.
@@ -576,17 +579,24 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
             state.chat.session_id = Some(session_id);
             state.chat.model = Some(model);
         }
-        ClaudeEvent::AssistantText(text) => match state.chat.messages.last_mut() {
-            // Finalize the bubble the deltas were building rather than
-            // pushing a duplicate — see `ChatMessage::Assistant`'s own doc
-            // comment. `text` here is authoritative, so it replaces
-            // whatever was accumulated (a safety net against any drift).
-            Some(ChatMessage::Assistant { text: existing, streaming }) if *streaming => {
-                *existing = text;
-                *streaming = false;
+        ClaudeEvent::AssistantText(text) => {
+            match state.chat.messages.last_mut() {
+                // Finalize the bubble the deltas were building rather than
+                // pushing a duplicate — see `ChatMessage::Assistant`'s own doc
+                // comment. `text` here is authoritative, so it replaces
+                // whatever was accumulated (a safety net against any drift).
+                Some(ChatMessage::Assistant { text: existing, streaming }) if *streaming => {
+                    *existing = text;
+                    *streaming = false;
+                }
+                _ => state.chat.messages.push(ChatMessage::Assistant { text, streaming: false }),
             }
-            _ => state.chat.messages.push(ChatMessage::Assistant { text, streaming: false }),
-        },
+            // A finished reply is the natural "turn complete" checkpoint for
+            // a Copilot session (there's no `TurnResult` from that provider
+            // — see `copilot_agent::run`) — see `persist_copilot_session`'s
+            // own doc comment; a no-op under `ChatProvider::Claude`.
+            persist_copilot_session(state);
+        }
         ClaudeEvent::AssistantTextDelta(chunk) => match state.chat.messages.last_mut() {
             Some(ChatMessage::Assistant { text, streaming: true }) => text.push_str(&chunk),
             _ => state.chat.messages.push(ChatMessage::Assistant { text: chunk, streaming: true }),
@@ -651,20 +661,54 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
     }
 }
 
-/// Scans `~/.claude/projects/...` for this project's past sessions on its
-/// own OS thread (`claude_agent::list_sessions` does real filesystem
-/// I/O — a directory listing plus reading a chunk of each transcript for
-/// its title), same `iced_runtime::task::blocking` vehicle as
-/// `start_server_install`, so opening the session picker can never stall
+/// Scans this project's past sessions on its own OS thread — real
+/// filesystem I/O either way (a directory listing plus reading a chunk of
+/// each transcript for its title): `claude_agent::list_sessions` for
+/// `ChatProvider::Claude`, `copilot_agent::list_copilot_sessions` for
+/// `ChatProvider::Copilot` (DevScribe's own saved history — see that
+/// function's own doc comment). Same `iced_runtime::task::blocking` vehicle
+/// as `start_server_install`, so opening the session picker can never stall
 /// the UI even on a project with a long chat history.
 pub fn start_loading_chat_sessions(state: &State) -> iced::Task<Message> {
     let root = state.root.clone();
+    let provider = state.chat_provider;
     iced_runtime::task::blocking(move |mut sender| {
-        let sessions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_agent::list_sessions(&root)))
-            .unwrap_or_default();
+        let sessions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match provider {
+            ChatProvider::Claude => claude_agent::list_sessions(&root),
+            ChatProvider::Copilot => copilot_agent::list_copilot_sessions(&root),
+        }))
+        .unwrap_or_default();
         let _ = sender.try_send(sessions);
     })
     .map(Message::ChatSessionsLoaded)
+}
+
+/// Overwrites `state.chat_session_id`'s saved Copilot history with
+/// `state.chat`'s current Operator/Assistant messages — a no-op for
+/// `ChatProvider::Claude` (that provider persists its own transcripts via
+/// the `claude` CLI, nothing DevScribe needs to write). Called after every
+/// `Operator` push and every finalized `Assistant` reply — see
+/// `save_copilot_session`'s own doc comment on why a full rewrite each time
+/// is fine. Tool activity is skipped: `copilot_agent` never produces any
+/// (see its own doc comment on scope), so `messages` never actually holds a
+/// `ChatMessage::Tool` under this provider, but the filter is here for the
+/// same reason `ChatMessage`'s own variants exist at all — one match arm
+/// per case, not an assumption about which currently occur.
+fn persist_copilot_session(state: &State) {
+    if state.chat_provider != ChatProvider::Copilot {
+        return;
+    }
+    let turns: Vec<(copilot_agent::CopilotSessionRole, String)> = state
+        .chat
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            ChatMessage::Operator(text) => Some((copilot_agent::CopilotSessionRole::Operator, text.clone())),
+            ChatMessage::Assistant { text, streaming: false } => Some((copilot_agent::CopilotSessionRole::Assistant, text.clone())),
+            ChatMessage::Assistant { streaming: true, .. } | ChatMessage::Tool(_) => None,
+        })
+        .collect();
+    copilot_agent::save_copilot_session(&state.root, &state.chat_session_id, &turns);
 }
 
 /// Background-thread re-read of the active session's full saved transcript
@@ -772,9 +816,14 @@ pub fn chat_worker(
                 claude_agent::run(root, PathBuf::from("claude"), devscribe_exe, options, output).await;
             }
             ChatProvider::Copilot => {
-                // `mode`/`allow_bash`/`session_id` don't apply — see
-                // `copilot_agent::run`'s own doc comment on scope (no
-                // permission modes, no resume-across-restarts yet).
+                // `mode`/`allow_bash` don't apply — see `copilot_agent::run`'s
+                // own doc comment on scope (no permission modes, no live
+                // resume of the actual LSP conversation). `session_id` does:
+                // if it has a saved DevScribe-owned history (see
+                // `copilot_agent`'s own session-history section), replay it
+                // first — same shape as the Claude branch's own resume-replay
+                // above, just from a different file and read-only (the next
+                // message still starts a brand-new Copilot conversation).
                 if !crate::server_install::which_binary("copilot-language-server") {
                     let _ = output
                         .send(ClaudeEvent::Unavailable(
@@ -782,6 +831,13 @@ pub fn chat_worker(
                         ))
                         .await;
                     return;
+                }
+                if copilot_agent::copilot_session_exists(&root, &session_id) {
+                    for event in copilot_agent::load_copilot_session_history(&root, &session_id) {
+                        if output.send(event).await.is_err() {
+                            return;
+                        }
+                    }
                 }
                 copilot_agent::run(root, PathBuf::from("copilot-language-server"), output).await;
             }

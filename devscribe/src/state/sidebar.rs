@@ -74,6 +74,30 @@ pub struct LoadingProject {
     pub path: PathBuf,
 }
 
+/// A project-opening action waiting on the "Open in New Window" / "Open in
+/// This Window" choice (`ui::open_project_prompt`) — set instead of loading
+/// straight away whenever a project is already open (see
+/// `Message::RecentProjectPicked`/`FolderDialogResult`), since only then is
+/// there an existing window's project "this window" would actually replace.
+#[derive(Debug, Clone)]
+pub enum PendingProjectOpen {
+    /// A recent-projects row, from the welcome screen or the sidebar's
+    /// projects dropdown.
+    Recent(PathBuf),
+    /// An `OpenFolderDialog`/`NewProjectDialog` picker result — the `bool`
+    /// is the same "`git init` it first" flag `FolderDialogResult` carries.
+    Folder(PathBuf, bool),
+}
+
+impl PendingProjectOpen {
+    pub fn path(&self) -> &Path {
+        match self {
+            PendingProjectOpen::Recent(path) => path,
+            PendingProjectOpen::Folder(path, _) => path,
+        }
+    }
+}
+
 /// What kind of inline tree draft is open: a new file, a new folder, or an
 /// in-place rename of an existing entry. Drives both the draft row's glyph/
 /// placeholder (`sidebar.rs`) and how `commit_draft` interprets `text`.
@@ -735,6 +759,27 @@ pub fn start_loading_project(state: &mut State, path: PathBuf, init_git: bool) -
         }
     })
     .map(|loaded| Message::ProjectLoaded(Box::new(loaded)))
+}
+
+/// Opens `path` as a brand-new project in its own OS window — by launching a
+/// second copy of this same binary with `path` as its startup argument (see
+/// `main.rs`'s CLI handling), rather than trying to fit a second project
+/// into this process's single-project `State`. Best-effort: a failure to
+/// resolve/spawn the current exe surfaces as a toast instead of silently
+/// dropping the pick.
+pub fn spawn_project_window(state: &mut State, path: PathBuf) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            crate::logging::error(format!("couldn't resolve devscribe's own path: {err}"));
+            push_toast(state, ToastKind::Warning, "Couldn't open a new window.");
+            return;
+        }
+    };
+    if let Err(err) = std::process::Command::new(exe).arg(&path).spawn() {
+        crate::logging::error(format!("failed to spawn a new window for {}: {err}", path.display()));
+        push_toast(state, ToastKind::Warning, "Couldn't open a new window.");
+    }
 }
 
 /// Resets every field scoped to the *previous* project — open tabs, search,

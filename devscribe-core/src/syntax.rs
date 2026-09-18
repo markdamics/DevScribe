@@ -44,6 +44,8 @@ pub enum Language {
     Xml,
     Ini,
     Markdown,
+    Kotlin,
+    Swift,
 }
 
 impl Language {
@@ -51,7 +53,7 @@ impl Language {
     /// status bar's "Language Mode" picker (roadmap item 9), which lets
     /// this be overridden for syntax highlighting alone (see
     /// `EditorState::set_language`'s own doc comment).
-    pub const ALL: [Language; 13] = [
+    pub const ALL: [Language; 15] = [
         Language::Rust,
         Language::Json,
         Language::Toml,
@@ -65,6 +67,8 @@ impl Language {
         Language::Xml,
         Language::Ini,
         Language::Markdown,
+        Language::Kotlin,
+        Language::Swift,
     ];
 
     pub fn from_extension(ext: &str) -> Option<Self> {
@@ -82,6 +86,8 @@ impl Language {
             "xml" | "svg" | "xsd" | "xsl" | "xslt" | "plist" => Some(Language::Xml),
             "ini" | "cfg" | "properties" => Some(Language::Ini),
             "md" | "markdown" => Some(Language::Markdown),
+            "kt" | "kts" => Some(Language::Kotlin),
+            "swift" => Some(Language::Swift),
             _ => None,
         }
     }
@@ -97,7 +103,9 @@ impl Language {
             | Language::JavaScript
             | Language::TypeScript
             | Language::Tsx
-            | Language::Cpp => Some("//"),
+            | Language::Cpp
+            | Language::Kotlin
+            | Language::Swift => Some("//"),
             Language::Python | Language::Toml | Language::Yaml | Language::Ini => Some("#"),
             Language::Json | Language::Xml | Language::Markdown => None,
         }
@@ -119,6 +127,8 @@ impl Language {
             Language::Xml => "XML",
             Language::Ini => "INI",
             Language::Markdown => "Markdown",
+            Language::Kotlin => "Kotlin",
+            Language::Swift => "Swift",
         }
     }
 }
@@ -471,6 +481,107 @@ fn markdown_inline_config() -> &'static HighlightConfiguration {
     })
 }
 
+/// Hand-written — `tree-sitter-kotlin-ng` (the actively-maintained grammar
+/// compatible with our tree-sitter version; the crates.io `tree-sitter-kotlin`
+/// pins `tree-sitter <0.23`, and its own HEAD ships a `highlights.scm`
+/// written for a differently-named node set) ships no `highlights.scm` of
+/// its own at all — its release doesn't include a `queries/` directory.
+/// Node names below are verified against its `node-types.json` (e.g.
+/// `identifier` where the older grammar has `simple_identifier`,
+/// `navigation_expression` with no separate `navigation_suffix`). Ordered
+/// least-to-most specific: `tree-sitter-highlight` resolves multiple
+/// captures on the exact same node by keeping the *last* one in the query,
+/// so the blanket `(identifier) @variable` up top is overridden by the more
+/// specific patterns below it wherever they also match.
+const KOTLIN_HIGHLIGHTS_QUERY: &str = r#"
+(identifier) @variable
+
+[(line_comment) (block_comment) (shebang)] @comment
+
+[(string_literal) (multiline_string_literal) (character_literal)] @string
+(escape_sequence) @string.escape
+[(number_literal) (float_literal)] @number
+
+(user_type (identifier) @type)
+(class_declaration name: (identifier) @type)
+(object_declaration name: (identifier) @type)
+(type_alias type: (identifier) @type)
+(enum_entry (identifier) @constant)
+
+(function_declaration name: (identifier) @function)
+(call_expression . (identifier) @function)
+(call_expression (navigation_expression (identifier) @function .))
+
+(annotation) @attribute
+(file_annotation) @attribute
+
+[
+  (class_modifier)
+  (function_modifier)
+  (inheritance_modifier)
+  (member_modifier)
+  (parameter_modifier)
+  (platform_modifier)
+  (property_modifier)
+  (reification_modifier)
+  (variance_modifier)
+  (visibility_modifier)
+] @keyword
+
+[
+  "val" "var" "fun" "class" "interface" "object" "enum" "typealias" "annotation"
+  "if" "else" "when" "for" "do" "while"
+  "try" "catch" "finally" "throw"
+  "return" "return@"
+  "import" "package"
+  "is" "!is" "in" "!in" "as" "as?"
+  "constructor" "init" "get" "set" "companion" "by" "suspend"
+  "this" "this@" "super" "super@"
+  "where" "dynamic"
+] @keyword
+
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+["." "," ";" ":" "::"] @punctuation.delimiter
+"#;
+
+fn kotlin_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "kotlin",
+            KOTLIN_HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .expect("KOTLIN_HIGHLIGHTS_QUERY is valid for tree-sitter-kotlin-ng's grammar");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
+fn swift_config() -> &'static HighlightConfiguration {
+    static CONFIG: OnceLock<HighlightConfiguration> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        // Same fix as `ini_config`: the shipped query tags `(comment)` /
+        // `(multiline_comment)` with both `@comment` and `@spell` in one
+        // pattern; the second, unrecognized capture on the same node makes
+        // tree-sitter-highlight drop the highlight entirely rather than
+        // falling back to the first (see `ini_config`'s own comment).
+        let highlights_query = tree_sitter_swift::HIGHLIGHTS_QUERY.replace(" @spell", "");
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_swift::LANGUAGE.into(),
+            "swift",
+            &highlights_query,
+            tree_sitter_swift::INJECTIONS_QUERY,
+            tree_sitter_swift::LOCALS_QUERY,
+        )
+        .expect("tree-sitter-swift ships a valid highlights.scm");
+        config.configure(HIGHLIGHT_NAMES);
+        config
+    })
+}
+
 fn config_for(language: Language) -> &'static HighlightConfiguration {
     match language {
         Language::Rust => rust_config(),
@@ -486,6 +597,8 @@ fn config_for(language: Language) -> &'static HighlightConfiguration {
         Language::Xml => xml_config(),
         Language::Ini => ini_config(),
         Language::Markdown => markdown_config(),
+        Language::Kotlin => kotlin_config(),
+        Language::Swift => swift_config(),
     }
 }
 

@@ -12,6 +12,7 @@ pub mod json_view;
 pub mod logo_mark;
 pub mod markdown_view;
 pub mod modifier_icon;
+pub mod open_project_prompt;
 pub mod overview_ruler;
 pub mod quick_open;
 pub mod references_panel;
