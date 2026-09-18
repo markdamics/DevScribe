@@ -241,6 +241,13 @@ pub struct Palette {
     pub syntax_constant: Rgba,
     pub syntax_attribute: Rgba,
     pub syntax_punctuation: Rgba,
+
+    /// Rainbow bracket-pair colorization (roadmap item 15): one color per
+    /// nesting depth, wrapping via `depth % bracket_pair_colors.len()` — see
+    /// `devscribe_core::bracket::bracket_depths`. Six hues so the wrap is rare
+    /// in ordinary code, chosen to read distinctly from both each other and
+    /// the `syntax_*` token colors above rather than reusing any of them.
+    pub bracket_pair_colors: [Rgba; 6],
 }
 
 pub const fn palette(mode: ThemeMode, accent: Accent) -> Palette {
@@ -326,6 +333,15 @@ const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
             syntax_constant: Rgba::hex(0xE8C46C),
             syntax_attribute: Rgba::hex(0x8AD1C4),
             syntax_punctuation: Rgba::hex(0x9FADBD),
+
+            bracket_pair_colors: [
+                Rgba::hex(0xE0A25E),
+                Rgba::hex(0x82B8F0),
+                Rgba::hex(0x8FBF6E),
+                Rgba::hex(0xD98FD9),
+                Rgba::hex(0x4FC7B8),
+                Rgba::hex(0xE4714D),
+            ],
         },
         ThemeMode::Light => Palette {
             bg_canvas: Rgba::hex(0xE9EDF3),
@@ -372,6 +388,15 @@ const fn palette_from_ramp(mode: ThemeMode, r: Ramp) -> Palette {
             syntax_constant: Rgba::hex(0x8F6D1C),
             syntax_attribute: Rgba::hex(0x2E7A70),
             syntax_punctuation: Rgba::hex(0x4A5A6E),
+
+            bracket_pair_colors: [
+                Rgba::hex(0xAD6420),
+                Rgba::hex(0x1E7FB8),
+                Rgba::hex(0x3F7A3F),
+                Rgba::hex(0xA13FA1),
+                Rgba::hex(0x1F8880),
+                Rgba::hex(0xA84124),
+            ],
         },
     }
 }

@@ -80,6 +80,9 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
     };
     let diagnostics = editor.diagnostics.clone();
     let gutter_marks = editor.gutter_marks.clone();
+    let bracket_depths = editor.bracket_depths.clone();
+    let bracket_pair_colorization = state.bracket_pair_colorization;
+    let inlay_hints = editor.inlay_hints.clone();
     // Multi-cursor state and bookmarks only ever apply to the primary
     // pane's own editing session — the split pane is a second read/write
     // *view* of the same document (see `effective_view`), but `Ctrl+D`/
@@ -145,6 +148,9 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
             highlights: highlights.clone(),
             diagnostics: diagnostics.clone(),
             gutter_marks: gutter_marks.clone(),
+            bracket_depths: bracket_depths.clone(),
+            bracket_colorization_enabled: bracket_pair_colorization,
+            inlay_hints: inlay_hints.clone(),
             content_revision,
             pending_revert_line,
             problem_lens_enabled,

@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{first_word_occurrence, word_range_at, word_text_at, CursorPos, Direction, EditorDiagnostic, Message, Pane};
+use crate::state::{
+    first_word_occurrence, word_range_at, word_text_at, CursorPos, Direction, EditorDiagnostic, EditorInlayHint,
+    Message, Pane,
+};
 
 /// The font-size-to-`line_height`/`char_width` ratios the original static
 /// design used (22/13 and 0.6 respectively) — kept fixed so the editor's
@@ -41,6 +44,20 @@ pub struct EditorCanvas {
     /// in which case lines fall back to a single flat color.
     pub highlights: Rc<Vec<Span>>,
     pub diagnostics: Rc<Vec<EditorDiagnostic>>,
+    /// Every bracket character's nesting depth, document-ordered — see
+    /// `devscribe_core::bracket::bracket_depths`. Read only when
+    /// `bracket_colorization_enabled` is set; otherwise brackets render with
+    /// their ordinary syntax color like any other punctuation.
+    pub bracket_depths: Rc<Vec<devscribe_core::bracket::BracketDepth>>,
+    pub bracket_colorization_enabled: bool,
+    /// Inline type hints (roadmap item 13) — document-ordered by
+    /// `(line, col)`, drawn as dimmed ghost text right after each position.
+    /// Empty whenever the language server hasn't replied yet, the language
+    /// doesn't support them, or they're turned off (`EditorState::
+    /// inlay_hints`'s own doc comment covers the lifecycle; the on/off
+    /// switch happens before this ever gets populated, in
+    /// `request_inlay_hints_for`).
+    pub inlay_hints: Rc<Vec<EditorInlayHint>>,
     /// Per-buffer-line added/modified/removed marker, from `EditorState`'s
     /// diff against `HEAD` — drawn as a small colored gutter bar, and what a
     /// gutter click's `Message::RevertLine` acts on. Empty for a file with
@@ -197,6 +214,9 @@ struct CacheSig {
     highlights_ptr: usize,
     diagnostics_ptr: usize,
     gutter_marks_ptr: usize,
+    bracket_depths_ptr: usize,
+    bracket_colorization_enabled: bool,
+    inlay_hints_ptr: usize,
     pending_revert_line: Option<usize>,
     problem_lens_enabled: bool,
     show_line_numbers: bool,
@@ -245,6 +265,9 @@ impl EditorCanvas {
             highlights_ptr: Rc::as_ptr(&self.highlights) as usize,
             diagnostics_ptr: Rc::as_ptr(&self.diagnostics) as usize,
             gutter_marks_ptr: Rc::as_ptr(&self.gutter_marks) as usize,
+            bracket_depths_ptr: Rc::as_ptr(&self.bracket_depths) as usize,
+            bracket_colorization_enabled: self.bracket_colorization_enabled,
+            inlay_hints_ptr: Rc::as_ptr(&self.inlay_hints) as usize,
             pending_revert_line: self.pending_revert_line,
             problem_lens_enabled: self.problem_lens_enabled,
             show_line_numbers: self.show_line_numbers,
@@ -314,6 +337,75 @@ impl EditorCanvas {
         };
         let col = col.min(self.document.line_len_chars(line));
         (line, col)
+    }
+
+    /// Draws `content` (the exact bytes `[content_start_byte,
+    /// content_start_byte + content.len())` of the document) at `(base_x,
+    /// y)`, splitting out any bracket character `self.bracket_depths` knows
+    /// about into its own rainbow-colored `fill_text` call — everything else
+    /// keeps `base_color`. Falls back to a single `fill_text` call (no split
+    /// at all) whenever colorization is off or no bracket falls in this
+    /// segment, so an ordinary non-bracket span (the overwhelming majority)
+    /// costs exactly what it did before this existed.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_span_text(
+        &self,
+        frame: &mut Frame,
+        content: &str,
+        content_start_byte: usize,
+        base_x: f32,
+        y: f32,
+        base_color: Color,
+        font_size: f32,
+        line_height: f32,
+        mono: iced::Font,
+    ) {
+        let fill = |frame: &mut Frame, piece: &str, x: f32, color: Color| {
+            frame.fill_text(Text {
+                content: piece.to_string(),
+                position: Point::new(x, y),
+                color,
+                size: Pixels(font_size),
+                line_height: LineHeight::Absolute(Pixels(line_height)),
+                font: mono,
+                align_y: Vertical::Top,
+                ..Text::default()
+            });
+        };
+
+        if !self.bracket_colorization_enabled || self.bracket_depths.is_empty() {
+            fill(frame, content, base_x, base_color);
+            return;
+        }
+        let content_end_byte = content_start_byte + content.len();
+        let start_idx = self.bracket_depths.partition_point(|b| b.byte_idx < content_start_byte);
+        if self.bracket_depths.get(start_idx).is_none_or(|b| b.byte_idx >= content_end_byte) {
+            fill(frame, content, base_x, base_color);
+            return;
+        }
+
+        let char_width = self.char_width();
+        let palette = self.palette.bracket_pair_colors;
+        let mut cursor_byte = 0usize;
+        let mut cursor_chars = 0usize;
+        let mut i = start_idx;
+        while i < self.bracket_depths.len() && self.bracket_depths[i].byte_idx < content_end_byte {
+            let rel = self.bracket_depths[i].byte_idx - content_start_byte;
+            if rel > cursor_byte {
+                let piece = &content[cursor_byte..rel];
+                fill(frame, piece, base_x + cursor_chars as f32 * char_width, base_color);
+                cursor_chars += piece.chars().count();
+            }
+            let depth = self.bracket_depths[i].depth;
+            let bracket_color = color(palette[(depth.saturating_sub(1) as usize) % palette.len()]);
+            fill(frame, &content[rel..rel + 1], base_x + cursor_chars as f32 * char_width, bracket_color);
+            cursor_chars += 1;
+            cursor_byte = rel + 1;
+            i += 1;
+        }
+        if cursor_byte < content.len() {
+            fill(frame, &content[cursor_byte..], base_x + cursor_chars as f32 * char_width, base_color);
+        }
     }
 
     /// The `HighlightKind` of the syntax span covering `char_idx`, if any —
@@ -626,6 +718,14 @@ impl EditorCanvas {
             .iter()
             .filter(|d| d.start.line < last_line && d.end.line >= first_line)
             .collect();
+        // Inlay hints (roadmap item 13) arrive in whatever order the server
+        // sent them too — same "filter rather than slice" reasoning as
+        // diagnostics just above.
+        let inlay_hints_visible: Vec<&EditorInlayHint> = self
+            .inlay_hints
+            .iter()
+            .filter(|h| h.line >= first_line && h.line < last_line)
+            .collect();
 
         for line in first_line..last_line {
             let is_cursor_line = line == self.cursor.line;
@@ -885,16 +985,17 @@ impl EditorCanvas {
                     let row_end_byte_abs = line_start_byte + row_end_byte;
 
                     if self.highlights.is_empty() {
-                        frame.fill_text(Text {
-                            content: row_text.to_string(),
-                            position: Point::new(text_x0, y),
-                            color: color(p.text_body),
-                            size: Pixels(font_size),
-                            line_height: LineHeight::Absolute(Pixels(line_height)),
-                            font: mono,
-                            align_y: Vertical::Top,
-                            ..Text::default()
-                        });
+                        self.fill_span_text(
+                            frame,
+                            row_text,
+                            row_start_byte_abs,
+                            text_x0,
+                            y,
+                            color(p.text_body),
+                            font_size,
+                            line_height,
+                            mono,
+                        );
                     } else {
                         // Spans are document-ordered and non-overlapping, so a
                         // running (byte, char) cursor converts each span's byte
@@ -923,23 +1024,47 @@ impl EditorCanvas {
                                 }
                                 walked_chars += text[walked_bytes..seg_start].chars().count();
                                 walked_bytes = seg_start;
-                                let content = text[seg_start..seg_end].to_string();
-                                frame.fill_text(Text {
+                                let content = &text[seg_start..seg_end];
+                                self.fill_span_text(
+                                    frame,
                                     content,
-                                    position: Point::new(
-                                        text_x0 + (walked_chars - row_start_char) as f32 * char_width,
-                                        y,
-                                    ),
-                                    color: highlight_color(span.kind, p),
-                                    size: Pixels(font_size),
-                                    line_height: LineHeight::Absolute(Pixels(line_height)),
-                                    font: mono,
-                                    align_y: Vertical::Top,
-                                    ..Text::default()
-                                });
+                                    line_start_byte + seg_start,
+                                    text_x0 + (walked_chars - row_start_char) as f32 * char_width,
+                                    y,
+                                    highlight_color(span.kind, p),
+                                    font_size,
+                                    line_height,
+                                    mono,
+                                );
                             }
                             idx += 1;
                         }
+                    }
+                }
+
+                // Inline type hints (roadmap item 13) — dimmed ghost text
+                // right after the position the server named, on whichever
+                // visual row that column actually falls on (word wrap can
+                // split one buffer line into several).
+                for hint in &inlay_hints_visible {
+                    if hint.line != line || hint.col < row_start_char {
+                        continue;
+                    }
+                    if hint.col > row_end_char || (hint.col == row_end_char && !row_is_last) {
+                        continue;
+                    }
+                    let x = text_x0 + (hint.col - row_start_char) as f32 * char_width;
+                    if x <= bounds.width {
+                        frame.fill_text(Text {
+                            content: hint.text.clone(),
+                            position: Point::new(x, y),
+                            color: tint(p.text_muted, 0.7),
+                            size: Pixels(font_size - 1.0),
+                            line_height: LineHeight::Absolute(Pixels(line_height)),
+                            font: mono,
+                            align_y: Vertical::Top,
+                            ..Text::default()
+                        });
                     }
                 }
 

@@ -14,7 +14,8 @@ use async_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DynamicRegistrationClientCapabilities, GotoCapability, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverContents, HoverParams,
-    InitializeParams, InitializedParams, LocationLink, LogMessageParams, MarkedString,
+    InitializeParams, InitializedParams, InlayHint, InlayHintClientCapabilities, InlayHintKind,
+    InlayHintLabel, InlayHintParams, LocationLink, LogMessageParams, MarkedString,
     OneOf, PartialResultParams, ProgressParams, PublishDiagnosticsParams, ReferenceContext,
     NumberOrString, ProgressParamsValue, ReferenceParams, RenameClientCapabilities, RenameParams,
     ShowMessageParams, SignatureHelpClientCapabilities, SignatureHelpParams,
@@ -46,6 +47,30 @@ pub enum LspLanguage {
 }
 
 impl LspLanguage {
+    /// Every language this crate talks to a server for — for the settings
+    /// panel's per-language inline-type-hints toggles (roadmap item 13).
+    /// Mirrors `syntax::Language::ALL`.
+    pub const ALL: [LspLanguage; 6] = [
+        LspLanguage::Rust,
+        LspLanguage::Java,
+        LspLanguage::Python,
+        LspLanguage::JavaScript,
+        LspLanguage::TypeScript,
+        LspLanguage::Cpp,
+    ];
+
+    /// Display name for the settings panel's per-language toggles.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Java => "Java",
+            Self::Python => "Python",
+            Self::JavaScript => "JavaScript",
+            Self::TypeScript => "TypeScript",
+            Self::Cpp => "C/C++",
+        }
+    }
+
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Self::Rust),
@@ -120,6 +145,14 @@ pub enum LspCommand {
     /// whole workspace for this the same way `References` does, not just
     /// open files.
     WorkspaceSymbol { query: String },
+    /// `textDocument/inlayHint` — inline type hints (roadmap item 13),
+    /// requested for the whole document (`start`/`end` cover line 0 through
+    /// the last line) rather than just the visible viewport, the same
+    /// "simplify, the server can handle it" trade-off `DidChange`'s
+    /// full-text sync already makes. `devscribe`'s state layer re-requests
+    /// this whenever a buffer settles after an edit (`flush_pending_edits`),
+    /// mirroring how it re-sends `DidChange` there.
+    InlayHint { uri: Url, start_line: u32, start_character: u32, end_line: u32, end_character: u32 },
 }
 
 /// An event a running worker reports back to the app.
@@ -197,6 +230,14 @@ pub enum LspEvent {
     /// never requests — see `symbol` capability below) are dropped rather
     /// than shown as unreachable.
     WorkspaceSymbols { query: String, symbols: Vec<SymbolEntry> },
+    /// The result of a `LspCommand::InlayHint` request, already flattened
+    /// past `InlayHint`'s own richer shape to just what the editor canvas
+    /// renders — see `InlayHintEntry`. A parameter-name hint
+    /// (`InlayHintKind::PARAMETER`) is dropped rather than kept: roadmap
+    /// item 13 asks for inferred *types*, a separate (and separately-scoped)
+    /// feature from parameter-name hints. Empty means the server had
+    /// nothing to offer for this range, not an error.
+    InlayHints { uri: Url, hints: Vec<InlayHintEntry> },
     /// Binary not found anywhere — the app should auto-install it.
     NeedsInstall,
     /// The server binary couldn't be spawned, or the connection died.
@@ -232,6 +273,20 @@ pub struct SymbolEntry {
     /// matching.
     pub container_name: Option<String>,
     pub location: Location,
+}
+
+/// One `textDocument/inlayHint` result, flattened to just what the editor
+/// canvas needs to draw it — `text` already has `padding_left`/
+/// `padding_right`'s spacing folded in (see `inlay_hint_to_entry`), and
+/// `InlayHintLabel`'s two shapes (a plain string or several label parts)
+/// are joined to one string, since this client never requests per-part
+/// hover/navigation (`InlayHintLabelPart`'s own `location`/`tooltip`), which
+/// is the only reason to keep them separate.
+#[derive(Debug, Clone)]
+pub struct InlayHintEntry {
+    pub line: u32,
+    pub character: u32,
+    pub text: String,
 }
 
 struct ClientState {
@@ -398,6 +453,9 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                             ..Default::default()
                         }),
                         rename: Some(RenameClientCapabilities {
+                            ..Default::default()
+                        }),
+                        inlay_hint: Some(InlayHintClientCapabilities {
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -793,6 +851,39 @@ pub async fn run(root: PathBuf, language: LspLanguage, binary: PathBuf, mut outp
                             let _ = output.send(LspEvent::WorkspaceSymbols { query, symbols }).await;
                         }
                     }
+                    LspCommand::InlayHint { uri, start_line, start_character, end_line, end_character } => {
+                        let hint_fut = server
+                            .inlay_hint(InlayHintParams {
+                                work_done_progress_params: WorkDoneProgressParams::default(),
+                                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                range: Range {
+                                    start: Position { line: start_line, character: start_character },
+                                    end: Position { line: end_line, character: end_character },
+                                },
+                            })
+                            .fuse();
+                        futures::pin_mut!(hint_fut);
+                        let result = loop {
+                            futures::select! {
+                                r = hint_fut => break Some(r),
+                                r = mainloop_fut => {
+                                    if let Err(err) = r {
+                                        let line_str = format!("\n[lsp-mainloop] error: {err:?}\n");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&log_path)
+                                            .and_then(|mut f| { use std::io::Write; f.write_all(line_str.as_bytes()) });
+                                    }
+                                    break None;
+                                }
+                            }
+                        };
+                        let Some(result) = result else { return; };
+                        if let Ok(Some(hints)) = result {
+                            let hints = hints.into_iter().filter_map(inlay_hint_to_entry).collect();
+                            let _ = output.send(LspEvent::InlayHints { uri, hints }).await;
+                        }
+                    }
                 }
             }
         }
@@ -913,6 +1004,34 @@ fn progress_params_to_event(params: ProgressParams) -> LspEvent {
             done: true,
         },
     }
+}
+
+/// Flattens one `textDocument/inlayHint` result to an `InlayHintEntry`, or
+/// drops it — a parameter-name hint (`InlayHintKind::PARAMETER`) is out of
+/// this feature's scope (see `LspEvent::InlayHints`'s own doc comment), and
+/// a hint whose label is empty after joining has nothing to draw anyway
+/// (the spec already forbids an empty label, but a defensive server is
+/// still cheaper to handle here than to trust).
+fn inlay_hint_to_entry(hint: InlayHint) -> Option<InlayHintEntry> {
+    if hint.kind == Some(InlayHintKind::PARAMETER) {
+        return None;
+    }
+    let label = match hint.label {
+        InlayHintLabel::String(s) => s,
+        InlayHintLabel::LabelParts(parts) => parts.into_iter().map(|p| p.value).collect::<Vec<_>>().join(""),
+    };
+    if label.trim().is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    if hint.padding_left == Some(true) {
+        text.push(' ');
+    }
+    text.push_str(&label);
+    if hint.padding_right == Some(true) {
+        text.push(' ');
+    }
+    Some(InlayHintEntry { line: hint.position.line, character: hint.position.character, text })
 }
 
 fn marked_string_to_text(marked: MarkedString) -> String {

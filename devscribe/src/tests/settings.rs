@@ -89,6 +89,8 @@ fn sample_settings() -> Settings {
         tab_size: 2,
         show_line_numbers: false,
         word_wrap: true,
+        bracket_pair_colorization: false,
+        inlay_hints_disabled_languages: ["python".to_string(), "rust".to_string()].into_iter().collect(),
     }
 }
 

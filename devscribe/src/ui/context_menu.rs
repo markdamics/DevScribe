@@ -224,6 +224,15 @@ pub fn editor_menu_view(state: &State, p: Palette) -> Option<Element<'static, Me
         ));
         rows.push(widgets::hline(color(p.border_hairline)));
     }
+    // Roadmap item 14 — a pure client-side text operation, so this doesn't
+    // need `lsp_ready` the way the rows above it do.
+    if state::active_file_path(state)
+        .and_then(|path| state::find_editor(state, &path).and_then(|e| e.language))
+        .is_some_and(state::language_supports_imports)
+    {
+        rows.push(menu_row("Organize Imports", "", Message::OrganizeImports, p));
+        rows.push(widgets::hline(color(p.border_hairline)));
+    }
     rows.push(menu_row("Search Symbol in Project\u{2026}", "", Message::SearchSymbolInProject, p));
     let row_count = rows.len();
 

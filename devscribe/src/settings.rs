@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// Every persisted setting, decoupled from `State` so this module doesn't
 /// need to know about tabs/trees/LSP/etc. — just the values the Settings
 /// panel actually controls.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub theme_mode: ThemeMode,
     pub accent: Accent,
@@ -55,6 +55,15 @@ pub struct Settings {
     pub tab_size: u8,
     pub show_line_numbers: bool,
     pub word_wrap: bool,
+    /// Rainbow bracket-pair colorization (roadmap item 15) — see
+    /// `devscribe_core::bracket::bracket_depths`.
+    pub bracket_pair_colorization: bool,
+    /// Language ids (`devscribe_core::lsp::LspLanguage::language_id()`) with
+    /// inline type hints (roadmap item 13) turned off. A blocklist rather
+    /// than an allowlist so every LSP language defaults to hints *on*
+    /// without needing an entry here, and a language added later doesn't
+    /// need this updated to also default on.
+    pub inlay_hints_disabled_languages: std::collections::BTreeSet<String>,
 }
 
 impl Default for Settings {
@@ -94,6 +103,8 @@ impl Default for Settings {
             tab_size: crate::state::TAB_SIZE_DEFAULT,
             show_line_numbers: true,
             word_wrap: false,
+            bracket_pair_colorization: true,
+            inlay_hints_disabled_languages: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -153,6 +164,10 @@ struct SettingsFile {
     show_line_numbers: bool,
     #[serde(default)]
     word_wrap: bool,
+    #[serde(default = "default_true")]
+    bracket_pair_colorization: bool,
+    #[serde(default)]
+    inlay_hints_disabled_languages: std::collections::BTreeSet<String>,
 }
 
 fn default_true() -> bool {
@@ -279,6 +294,8 @@ fn load_from(path: &Path) -> Option<Settings> {
         tab_size: file.tab_size,
         show_line_numbers: file.show_line_numbers,
         word_wrap: file.word_wrap,
+        bracket_pair_colorization: file.bracket_pair_colorization,
+        inlay_hints_disabled_languages: file.inlay_hints_disabled_languages,
     })
 }
 
@@ -321,6 +338,8 @@ fn save_to(path: &Path, settings: &Settings) {
         tab_size: settings.tab_size,
         show_line_numbers: settings.show_line_numbers,
         word_wrap: settings.word_wrap,
+        bracket_pair_colorization: settings.bracket_pair_colorization,
+        inlay_hints_disabled_languages: settings.inlay_hints_disabled_languages.clone(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(path, json);

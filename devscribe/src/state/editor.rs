@@ -44,6 +44,18 @@ pub struct EditorDiagnostic {
     pub message: String,
 }
 
+/// An inline type hint (roadmap item 13) from the language server, converted
+/// into a char-based position the same way `EditorDiagnostic` is. `text` is
+/// already fully formatted (padding folded in — see
+/// `lsp::inlay_hint_to_entry`) and ready to draw verbatim right after
+/// `(line, col)`.
+#[derive(Debug, Clone)]
+pub struct EditorInlayHint {
+    pub line: usize,
+    pub col: usize,
+    pub text: String,
+}
+
 /// A handful of lines from a definition/reference's target file, resolved
 /// silently off the same dwell that shows the hover tooltip (roadmap item
 /// 12, "quick file peek") — rendered by `hover_popup.rs` under the hover
@@ -314,9 +326,19 @@ pub struct EditorState {
     pub bookmarks: std::collections::BTreeSet<usize>,
     pub language: Option<syntax::Language>,
     pub highlights: Rc<Vec<Span>>,
+    /// Every bracket character's nesting depth, for rainbow bracket-pair
+    /// colorization (roadmap item 15) — recomputed alongside `highlights`
+    /// (see `rehighlight_with`), not on every `view()` like
+    /// `bracket::matching_bracket_pair`'s single cursor-touching pair: this
+    /// is a whole-document scan, too expensive to redo every frame.
+    pub bracket_depths: Rc<Vec<BracketDepth>>,
     highlighter: syntax::Highlighter,
     tree: Option<outline::Tree>,
     pub diagnostics: Rc<Vec<EditorDiagnostic>>,
+    /// Roadmap item 13 — see `EditorInlayHint`. Empty until the server's
+    /// first `textDocument/inlayHint` reply lands (`request_inlay_hints_for`),
+    /// same "starts empty, filled asynchronously" lifecycle as `diagnostics`.
+    pub inlay_hints: Rc<Vec<EditorInlayHint>>,
     pub json: Option<Result<serde_json::Value, String>>,
     pub json_collapsed: HashSet<String>,
     pub json_text_mode: bool,
@@ -524,6 +546,7 @@ impl EditorState {
             (Some(lang), Some(text)) => outline::parse(lang, text),
             _ => None,
         };
+        let bracket_depths = bracket::bracket_depths(document.text(), &highlights);
         // A one-time full scan, same cost class as the initial highlight
         // parse above — cheap relative to that (just `len_chars()` per line,
         // no text materialized), and there's no settle-debounced moment
@@ -539,9 +562,11 @@ impl EditorState {
             bookmarks: std::collections::BTreeSet::new(),
             language,
             highlights: Rc::new(highlights),
+            bracket_depths: Rc::new(bracket_depths),
             highlighter,
             tree,
             diagnostics: Rc::new(Vec::new()),
+            inlay_hints: Rc::new(Vec::new()),
             json: None,
             json_collapsed: HashSet::new(),
             // Unlike Markdown's preview-by-default (`markdown_text_mode`),
@@ -831,6 +856,7 @@ impl EditorState {
         if let Some(lang) = self.language {
             self.highlights = Rc::new(self.highlighter.highlight(lang, text));
         }
+        self.bracket_depths = Rc::new(bracket::bracket_depths(self.document.text(), &self.highlights));
     }
 
     /// Recomputes `json` from `text` (the current buffer contents), for
@@ -1267,6 +1293,116 @@ impl EditorState {
         self.resync_after_edit();
     }
 
+    /// `Enter`, context-aware (roadmap item 16) — like `insert_text("\n")`,
+    /// but the new line's indentation is chosen from the surrounding code
+    /// instead of just carrying over whatever the current line already has:
+    /// one level deeper when the line being split opens a block (a trailing
+    /// `{`/`(`/`[`, or a trailing `:` in Python), and — when the cursor sits
+    /// directly between a bracket pair typed together (`{|}`) — split into
+    /// two lines, the cursor's own one level deeper and the closer dropped
+    /// back to the opener's own indent, the shape a finished block is
+    /// supposed to end in anyway. `tab_size` is `State::tab_size` — this
+    /// struct doesn't otherwise know it (see `EditorState::indent`'s own
+    /// parameter for the same reason). The caller is expected to route only
+    /// a literal `"\n"` Enter keystroke here — pasted or generated text
+    /// containing newlines stays on the plain `insert_text` path, which
+    /// doesn't try to guess indentation for text that already has its own.
+    pub fn insert_newline_smart(&mut self, tab_size: u8) {
+        if self.extra_cursors.is_empty() {
+            self.record_undo_boundary(EditKind::Other);
+            self.insert_newline_smart_body(tab_size);
+        } else {
+            self.for_each_cursor(EditKind::Other, |e| {
+                e.insert_newline_smart_body(tab_size);
+                true
+            });
+        }
+    }
+
+    /// `insert_newline_smart`'s actual work — see `insert_text_body`/
+    /// `for_each_cursor` for why this is split out the same way.
+    fn insert_newline_smart_body(&mut self, tab_size: u8) {
+        self.delete_selection();
+        let base_indent = self.current_line_indent();
+        let unit = " ".repeat(tab_size as usize);
+        let opener = self.line_prefix_trimmed(self.cursor.line, self.cursor.col).chars().last();
+        let opens_bracket = matches!(opener, Some('{') | Some('(') | Some('['));
+        let opens_deeper =
+            opens_bracket || (opener == Some(':') && self.language == Some(syntax::Language::Python));
+        let next_char = self.document.line_char(self.cursor.line, self.cursor.col);
+        let pair_split = opens_bracket && next_char.is_some() && next_char == opener.and_then(closer_for);
+
+        let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+        let (text, cursor_offset) = if pair_split {
+            // `{|}` (or `(|)`/`[|]`) — split into two lines rather than one,
+            // so the closer doesn't end up indented a level too deep itself.
+            let inserted = format!("\n{base_indent}{unit}\n{base_indent}");
+            let offset = 1 + base_indent.chars().count() + unit.chars().count();
+            (inserted, offset)
+        } else if opens_deeper {
+            let inserted = format!("\n{base_indent}{unit}");
+            let offset = inserted.chars().count();
+            (inserted, offset)
+        } else {
+            let inserted = format!("\n{base_indent}");
+            let offset = inserted.chars().count();
+            (inserted, offset)
+        };
+        self.edit_insert(idx, &text);
+        let new_idx = idx + cursor_offset;
+        self.cursor = self.document.line_col(new_idx).into();
+        self.resync_after_edit();
+    }
+
+    /// The line's own text from its start up to (not including) `col`,
+    /// right-trimmed of trailing spaces/tabs — used to tell "this line looks
+    /// like it's opening a block" apart from trailing whitespace before the
+    /// cursor throwing that off.
+    fn line_prefix_trimmed(&self, line: usize, col: usize) -> String {
+        let text: String = (0..col).filter_map(|c| self.document.line_char(line, c)).collect();
+        text.trim_end().to_string()
+    }
+
+    /// Whether every character on `self.cursor`'s line before the cursor
+    /// itself is a space or tab — i.e. the cursor is sitting in what is, so
+    /// far, pure leading indentation. Used to gate the closing-bracket
+    /// smart-dedent below to only a bracket typed as the first real
+    /// character on its line, not one appearing mid-expression (`foo())`).
+    fn cursor_line_is_blank_before_cursor(&self) -> bool {
+        (0..self.cursor.col).all(|c| matches!(self.document.line_char(self.cursor.line, c), Some(' ') | Some('\t')))
+    }
+
+    /// After a lone closing bracket has just been typed at `self.cursor`
+    /// (immediately following it), rewrites that line's leading whitespace
+    /// to match its matching opener's own line indent — so `{` + Enter + `}`
+    /// lands the closer flush with the `{` line rather than at whatever
+    /// (one-level-deeper) indent `insert_newline_smart_body` guessed before
+    /// it could know a closer was coming. A silent no-op if the bracket has
+    /// no matching opener (unbalanced code) or the indent already matches.
+    fn dedent_closer_to_opener(&mut self) {
+        let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+        let Some((open_idx, _)) = bracket::matching_bracket_pair(self.document.text(), &self.highlights, idx) else {
+            return;
+        };
+        let opener_line = self.document.line_col(open_idx).0;
+        if opener_line == self.cursor.line {
+            return;
+        }
+        let target_col = self.line_indent_col(opener_line);
+        let target: String = (0..target_col).filter_map(|c| self.document.line_char(opener_line, c)).collect();
+        let current_col = self.line_indent_col(self.cursor.line);
+        let current: String = (0..current_col).filter_map(|c| self.document.line_char(self.cursor.line, c)).collect();
+        if current == target {
+            return;
+        }
+        let line_start = self.document.char_index(self.cursor.line, 0);
+        self.edit_remove(line_start..line_start + current_col);
+        self.edit_insert(line_start, &target);
+        let delta = target.chars().count() as i32 - current_col as i32;
+        self.shift_cols_after_edit(self.cursor.line, 0, delta);
+        self.resync_after_edit();
+    }
+
     /// A single live keystroke's character — auto-pairing-aware, unlike
     /// `insert_text` (which stays a literal insert for paste and generated
     /// text like Enter/Tab). Three cases, checked in order:
@@ -1310,6 +1446,19 @@ impl EditorState {
         }
         if let Some(closer) = closer_for(ch) {
             self.insert_pair(ch, closer);
+            return;
+        }
+        // Smart dedent (roadmap item 16): a closing bracket typed as the
+        // first real character on its line snaps that line's indent back to
+        // match its opener — see `dedent_closer_to_opener`'s own doc
+        // comment. Quotes are deliberately excluded (`is_closer` also
+        // matches those): they close themselves rather than an indent-
+        // relevant block, so `matches!` here checks the three bracket kinds
+        // directly instead of reusing `is_closer`.
+        if matches!(ch, ')' | ']' | '}') && self.selection().is_none() && self.cursor_line_is_blank_before_cursor() {
+            self.record_undo_boundary(EditKind::Insert);
+            self.insert_text_body(&ch.to_string());
+            self.dedent_closer_to_opener();
             return;
         }
         self.record_undo_boundary(EditKind::Insert);
@@ -1533,6 +1682,114 @@ impl EditorState {
             }
         }
         self.resync_after_edit();
+        true
+    }
+
+    /// "Organize Imports" (roadmap item 14) — every contiguous run of
+    /// import/use statements in the buffer (a blank line ends a run, so
+    /// deliberately blank-separated groups — std vs. external crates, say —
+    /// each get sorted independently rather than merged into one) gets its
+    /// lines sorted alphabetically, case-insensitively, with any exact
+    /// duplicate line dropped. `false` if the language has no import syntax
+    /// this recognizes (`is_import_line` always says no), or every run it
+    /// found was already sorted with no duplicates, in which case nothing
+    /// happened.
+    pub fn organize_imports(&mut self) -> bool {
+        let Some(language) = self.language else {
+            return false;
+        };
+        let total_lines = self.document.line_count();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_start: Option<usize> = None;
+        for line in 0..total_lines {
+            let is_import = is_import_line(language, self.document.line_text(line).trim());
+            match (is_import, run_start) {
+                (true, None) => run_start = Some(line),
+                (false, Some(start)) => {
+                    if line - start >= 2 {
+                        runs.push((start, line - 1));
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = run_start
+            && total_lines - start >= 2
+        {
+            runs.push((start, total_lines - 1));
+        }
+        if runs.is_empty() {
+            return false;
+        }
+
+        // Applied last-run-first so an earlier run's own line numbers stay
+        // valid as a later run's edit shrinks (a dropped duplicate) or
+        // leaves unchanged the line count below it — same reasoning
+        // `revert_lines` gives for its own descending order.
+        let mut changed = false;
+        for &(start, end) in runs.iter().rev() {
+            let mut lines: Vec<String> = (start..=end)
+                .map(|l| self.document.line_text(l).trim_end_matches(['\n', '\r']).to_string())
+                .collect();
+            let original = lines.clone();
+            lines.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+            lines.dedup();
+            if lines == original {
+                continue;
+            }
+            if !changed {
+                self.record_undo_boundary(EditKind::Other);
+            }
+            changed = true;
+            let range_start = self.document.char_index(start, 0);
+            let range_end = self.document.char_index(end, self.document.line_len_chars(end));
+            self.edit_remove(range_start..range_end);
+            self.edit_insert(range_start, &lines.join("\n"));
+        }
+        if changed {
+            let landing_line = runs[0].0.min(self.document.line_count().saturating_sub(1));
+            self.cursor = self.document.line_col(self.document.char_index(landing_line, 0)).into();
+            self.resync_after_edit();
+            self.recompute_max_line_chars();
+        }
+        changed
+    }
+
+    /// A quick-fix (roadmap item 14) for every current diagnostic that reads
+    /// as "this import is unused" (see `is_unused_import_message`) *and*
+    /// whose own line actually parses as an import statement — the second
+    /// check is what keeps a same-shaped-but-different diagnostic (several
+    /// servers word "unused import" and "unused local variable" almost
+    /// identically) from ever deleting a line that isn't really an import.
+    /// Deletes every matching line as one undo step. `false` if nothing
+    /// matched, in which case nothing happened.
+    pub fn remove_unused_imports(&mut self) -> bool {
+        let Some(language) = self.language else {
+            return false;
+        };
+        let mut lines: Vec<usize> = self
+            .diagnostics
+            .iter()
+            .filter(|d| is_unused_import_message(&d.message))
+            .map(|d| d.start.line)
+            .filter(|&line| is_import_line(language, self.document.line_text(line).trim()))
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        if lines.is_empty() {
+            return false;
+        }
+
+        self.record_undo_boundary(EditKind::Other);
+        for &line in lines.iter().rev() {
+            let range = self.document.line_char_range_with_terminator(line);
+            self.edit_remove(range);
+        }
+        let landing_line = lines[0].min(self.document.line_count().saturating_sub(1));
+        self.cursor = self.document.line_col(self.document.char_index(landing_line, 0)).into();
+        self.resync_after_edit();
+        self.recompute_max_line_chars();
         true
     }
 
@@ -2513,6 +2770,78 @@ pub fn closer_for(open: char) -> Option<char> {
 /// an auto-inserted one a skip-over rather than a double-insert.
 pub fn is_closer(c: char) -> bool {
     matches!(c, ')' | ']' | '}' | '"' | '\'' | '`')
+}
+
+/// Whether `language` has import/use syntax `is_import_line` recognizes at
+/// all — the command palette's "Organize Imports"/"Remove Unused Imports"
+/// entries and the editor context menu's own row are gated on this, so
+/// e.g. a JSON or Markdown buffer never offers an action that could only
+/// ever be a no-op.
+pub fn language_supports_imports(language: syntax::Language) -> bool {
+    matches!(
+        language,
+        syntax::Language::Rust
+            | syntax::Language::Python
+            | syntax::Language::JavaScript
+            | syntax::Language::TypeScript
+            | syntax::Language::Tsx
+            | syntax::Language::Java
+    )
+}
+
+/// Whether `trimmed` (a buffer line with leading/trailing whitespace already
+/// stripped) reads as a single-line import/use statement in `language` —
+/// `EditorState::organize_imports`'s and `remove_unused_imports`'s own unit
+/// of work. Deliberately conservative: a multi-line grouped import (Rust's
+/// `use foo::{\n    a,\n    b,\n};`, TS's multi-line `import {\n  a,\n} from
+/// "x";`) is recognized on none of its lines rather than guessed at from a
+/// fragment, which just means it's left out of the sort/quick-fix — safer
+/// than reordering or deleting half of a statement that spans lines.
+fn is_import_line(language: syntax::Language, trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    match language {
+        syntax::Language::Rust => {
+            let after_vis = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub(super) "))
+                .or_else(|| trimmed.strip_prefix("pub(self) "))
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            after_vis.starts_with("use ") && trimmed.ends_with(';')
+        }
+        syntax::Language::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
+        syntax::Language::JavaScript | syntax::Language::TypeScript | syntax::Language::Tsx => {
+            trimmed.starts_with("import ") && !trimmed.ends_with('{') && !trimmed.ends_with(',')
+        }
+        syntax::Language::Java => {
+            let after_static = trimmed.strip_prefix("import static ").unwrap_or(trimmed);
+            after_static.starts_with("import ") && trimmed.ends_with(';')
+        }
+        _ => false,
+    }
+}
+
+/// Whether an LSP diagnostic's own message text reads as "this import is
+/// unused" — every server this app talks to words it differently
+/// (rust-analyzer: "unused import: `...`"; pyright: "Import \"x\" is not
+/// accessed"; typescript-language-server: "'x' is declared but its value is
+/// never read."; jdtls: "The import x.y.Z is never used"), so this checks
+/// the handful of substrings each one actually emits rather than any single
+/// canonical phrase. Deliberately loose (the ts-language-server phrasing in
+/// particular is identical for an unused local variable, not just an
+/// unused import) — callers are expected to also confirm the diagnostic's
+/// own line looks like an import statement (`is_import_line`) before acting
+/// on this, which is what actually rules out a false positive rather than
+/// this string match alone.
+fn is_unused_import_message(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.starts_with("unused import")
+        || m.contains("is not accessed")
+        || m.contains("imported but unused")
+        || m.contains("is declared but its value is never read")
+        || (m.contains("import") && m.contains("never used"))
 }
 
 /// Sidebar width bounds for the drag handle — narrow enough to still show
@@ -3970,6 +4299,7 @@ pub fn flush_pending_edits(state: &mut State) {
         }
         send_did_change_for(state, &path);
         send_copilot_did_change_for(state, &path);
+        request_inlay_hints_for(state, &path);
         recompute_diff_for(state, &path);
     }
 }
@@ -4049,6 +4379,7 @@ pub fn send_did_open_for(state: &mut State, path: &Path) {
     if let Some(sender) = state.lsp_sender.as_mut() {
         let _ = sender.try_send(LspCommand::DidOpen { uri, text });
     }
+    request_inlay_hints_for(state, path);
 }
 
 /// `copilot_completion`'s own document sync — deliberately not gated by
@@ -4221,6 +4552,62 @@ pub fn send_did_change_for(state: &mut State, path: &Path) {
     };
     if let Some(sender) = state.lsp_sender.as_mut() {
         let _ = sender.try_send(LspCommand::DidChange { uri, text });
+    }
+}
+
+/// Converts `lsp::InlayHintEntry`s (UTF-16 positions) into char-based
+/// `EditorInlayHint`s against the document's *current* text — mirrors
+/// `convert_diagnostics`.
+pub fn convert_inlay_hints(document: &Document, hints: Vec<lsp::InlayHintEntry>) -> Vec<EditorInlayHint> {
+    let mut converted: Vec<EditorInlayHint> = hints
+        .into_iter()
+        .map(|h| {
+            let line = h.line as usize;
+            let col = utf16_col_to_char_col(&document.line_text(line), h.character as usize);
+            EditorInlayHint { line, col, text: h.text }
+        })
+        .collect();
+    // Document order isn't guaranteed by the spec — sorted the same way
+    // `Span`s already are, so a future caller can binary-search this the
+    // same way `editor_canvas.rs` does for those.
+    converted.sort_by_key(|h| (h.line, h.col));
+    converted
+}
+
+/// Sends a `textDocument/inlayHint` request for `path`'s whole document
+/// (full-document rather than just the visible range — see
+/// `LspCommand::InlayHint`'s own doc comment), if `path`'s language is an
+/// LSP one and inline type hints (roadmap item 13) aren't turned off for
+/// it. Called from `send_did_open_for` and `flush_pending_edits`, the same
+/// two call sites `send_did_change_for` has, so a fresh open and every
+/// settled edit both keep hints current.
+pub fn request_inlay_hints_for(state: &mut State, path: &Path) {
+    if !is_lsp_language(path) {
+        return;
+    }
+    let Some(language) = path.extension().and_then(|e| e.to_str()).and_then(lsp::LspLanguage::from_extension) else {
+        return;
+    };
+    if state.inlay_hints_disabled_languages.contains(language.language_id()) {
+        return;
+    }
+    let Some(uri) = lsp_uri(path) else {
+        return;
+    };
+    let Some(editor) = find_editor(state, path) else {
+        return;
+    };
+    let last_line = editor.document.line_count().saturating_sub(1);
+    let last_line_text = editor.document.line_text(last_line);
+    let end_character = char_col_to_utf16_col(&last_line_text, last_line_text.chars().count());
+    if let Some(sender) = state.lsp_sender.as_mut() {
+        let _ = sender.try_send(LspCommand::InlayHint {
+            uri,
+            start_line: 0,
+            start_character: 0,
+            end_line: last_line as u32,
+            end_character,
+        });
     }
 }
 

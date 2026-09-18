@@ -82,3 +82,53 @@ fn a_scan_past_max_bracket_scan_gives_up_rather_than_walking_the_whole_document(
     let rope = Rope::from_str(&text);
     assert_eq!(matching_bracket_pair(&rope, &[], 0), None);
 }
+
+#[test]
+fn bracket_depths_shares_one_counter_across_bracket_kinds() {
+    // `(a[b]c)` — the outer parens are depth 1, the square brackets nested
+    // one level inside them are depth 2.
+    let rope = Rope::from_str("(a[b]c)");
+    let depths = bracket_depths(&rope, &[]);
+    assert_eq!(
+        depths,
+        vec![
+            BracketDepth { byte_idx: 0, depth: 1 }, // (
+            BracketDepth { byte_idx: 2, depth: 2 }, // [
+            BracketDepth { byte_idx: 4, depth: 2 }, // ]
+            BracketDepth { byte_idx: 6, depth: 1 }, // )
+        ]
+    );
+}
+
+#[test]
+fn bracket_depths_gives_an_opener_and_its_closer_the_same_depth() {
+    let rope = Rope::from_str("((()))");
+    let depths = bracket_depths(&rope, &[]);
+    let by_idx: Vec<u32> = depths.iter().map(|b| b.depth).collect();
+    assert_eq!(by_idx, vec![1, 2, 3, 3, 2, 1]);
+}
+
+#[test]
+fn bracket_depths_floors_an_unmatched_closer_at_depth_one() {
+    let rope = Rope::from_str(")");
+    let depths = bracket_depths(&rope, &[]);
+    assert_eq!(depths, vec![BracketDepth { byte_idx: 0, depth: 1 }]);
+}
+
+#[test]
+fn bracket_depths_skips_brackets_inside_strings_and_comments() {
+    let text = r#"(a "(b)" c) // (d)"#;
+    let rope = Rope::from_str(text);
+    let string_start = text.find('"').unwrap();
+    let string_end = text.rfind('"').unwrap() + 1;
+    let comment_start = text.find("//").unwrap();
+    let highlights = [
+        Span { start: string_start, end: string_end, kind: HighlightKind::String },
+        Span { start: comment_start, end: text.len(), kind: HighlightKind::Comment },
+    ];
+    let depths = bracket_depths(&rope, &highlights);
+    // Only the real outer `(` and `)` should be picked up.
+    assert_eq!(depths.len(), 2);
+    assert_eq!(depths[0].depth, 1);
+    assert_eq!(depths[1].depth, 1);
+}

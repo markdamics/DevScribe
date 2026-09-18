@@ -88,6 +88,54 @@ fn find_bracket_partner(rope: &Rope, highlights: &[Span], idx: usize) -> Option<
     }
 }
 
+/// One bracket character's nesting depth, for rainbow bracket-pair
+/// colorization (roadmap item 15 — the "color matching pairs by nesting
+/// depth" reading of that feature, distinct from `matching_bracket_pair`'s
+/// own "highlight the pair touching the cursor" one; see this module's own
+/// doc comment). `byte_idx` is the bracket character's own byte offset
+/// (always one byte — `(`/`)`/`[`/`]`/`{`/`}` are all ASCII); `depth` is
+/// 1-based and shared by an opener and its matching closer (a top-level
+/// `(...)` is depth 1 on both halves), so a caller just needs
+/// `(depth - 1) % palette.len()` to pick a color, the same "no bound on how
+/// deep code nests, so wrap the palette" scheme every other rainbow-bracket
+/// implementation uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BracketDepth {
+    pub byte_idx: usize,
+    pub depth: u32,
+}
+
+/// Every bracket character in `rope` (skipping ones inside a string/comment,
+/// same as `find_bracket_partner`), tagged with its nesting depth — a single
+/// forward pass tracking one shared counter across all three bracket kinds
+/// together (matching VS Code's own default: `([)]` reads as two nested
+/// levels, not two independent counters), so mismatched/unbalanced brackets
+/// degrade gracefully (an extra unmatched closer just floors at depth 1
+/// rather than going negative) instead of needing real pair-matching first.
+/// Returned in document order, ready for the caller's own binary search
+/// (`editor_canvas.rs`'s render loop, which already has one for
+/// `highlights`).
+pub fn bracket_depths(rope: &Rope, highlights: &[Span]) -> Vec<BracketDepth> {
+    let mut depth: u32 = 0;
+    let mut out = Vec::new();
+    let mut byte_idx = 0usize;
+    for ch in rope.chars() {
+        let is_open = matches!(ch, '(' | '[' | '{');
+        let is_close = matches!(ch, ')' | ']' | '}');
+        if (is_open || is_close) && !is_string_or_comment(highlights, byte_idx) {
+            if is_open {
+                depth += 1;
+                out.push(BracketDepth { byte_idx, depth });
+            } else {
+                out.push(BracketDepth { byte_idx, depth: depth.max(1) });
+                depth = depth.saturating_sub(1);
+            }
+        }
+        byte_idx += ch.len_utf8();
+    }
+    out
+}
+
 /// The bracket pair (char indices) touching `cursor_char_idx`, if any —
 /// checked at the cursor position itself first, then one char back, so the
 /// caret sitting immediately *after* a bracket (where it lands right after

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use devscribe_core::bracket::{self, BracketDepth};
 use devscribe_core::claude_agent::{self, ClaudeCommand, ClaudeEvent, PermissionMode};
 use devscribe_core::copilot_agent;
 use devscribe_core::copilot_completion::{self, CopilotCompletionCommand, CopilotCompletionEvent};
@@ -220,6 +221,10 @@ pub enum PaletteAction {
     /// palette action rather than reusing that message directly since the
     /// palette's own entries are all `PaletteAction`, not `Message`.
     JumpToSymbolLocation { path: PathBuf, line: usize, col: usize },
+    /// Roadmap item 14 — see `EditorState::organize_imports`.
+    OrganizeImports,
+    /// Roadmap item 14's quick-fix — see `EditorState::remove_unused_imports`.
+    RemoveUnusedImports,
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +704,14 @@ pub struct State {
     /// comment for why `draw`/`hit_test` share one code path with the
     /// unwrapped case rather than branching throughout.
     pub word_wrap: bool,
+    /// Roadmap item 15: rainbow bracket-pair colorization by nesting depth —
+    /// see `devscribe_core::bracket::bracket_depths` and
+    /// `EditorCanvas::bracket_depths`.
+    pub bracket_pair_colorization: bool,
+    /// Language ids with inline type hints (roadmap item 13) turned off —
+    /// see `settings::Settings::inlay_hints_disabled_languages`'s own doc
+    /// comment for why this is a blocklist.
+    pub inlay_hints_disabled_languages: std::collections::BTreeSet<String>,
     pub toasts: Vec<Toast>,
     next_toast_id: u64,
     /// Non-`None` while the sidebar tree has an inline new-file/new-folder/
@@ -979,6 +992,8 @@ impl Default for State {
             tab_size: settings.tab_size,
             show_line_numbers: settings.show_line_numbers,
             word_wrap: settings.word_wrap,
+            bracket_pair_colorization: settings.bracket_pair_colorization,
+            inlay_hints_disabled_languages: settings.inlay_hints_disabled_languages,
             toasts: Vec::new(),
             next_toast_id: 0,
             draft: None,
@@ -1288,6 +1303,14 @@ pub enum Message {
     EditorDedent { pane: Pane },
     /// `Ctrl+/` — see `EditorState::toggle_comment`.
     EditorToggleComment { pane: Pane },
+    /// The command palette's/editor context menu's "Organize Imports"
+    /// (roadmap item 14) — see `EditorState::organize_imports`. Always acts
+    /// on the primary pane's active file, same as `BeginRenameSymbol` and
+    /// the rest of the context menu's own actions.
+    OrganizeImports,
+    /// The command palette's "Remove Unused Imports" quick-fix (roadmap
+    /// item 14) — see `EditorState::remove_unused_imports`.
+    RemoveUnusedImports,
     EditorMove { dir: Direction, extend: bool, pane: Pane },
     /// A left-button press or drag-move over the canvas — also the plain
     /// (non-double/triple) click path. `extend: true` both for shift-click
@@ -1476,6 +1499,11 @@ pub enum Message {
     SetTabSize(u8),
     ToggleShowLineNumbers,
     ToggleWordWrap,
+    /// Roadmap item 15 — see `State::bracket_pair_colorization`.
+    ToggleBracketColorization,
+    /// Roadmap item 13's per-language toggle — flips whether `language` is
+    /// in `State::inlay_hints_disabled_languages`.
+    ToggleInlayHintsLanguage(LspLanguage),
     /// The mouse entered/left a tab bar entry — starts/clears the hover
     /// preview's dwell timer (`State::tab_hover`). Mirrors
     /// `EditorHoverMove`/`EditorHoverLeave`'s shape.
@@ -2305,6 +2333,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     return update(state, Message::CompletionSelect);
                 }
 
+                let tab_size = state.tab_size;
                 if let Some(editor) = find_editor_mut(state, &path) {
                     // A trigger char (`.`/`:`) always starts its own fresh
                     // request below, so any popup already open gets closed
@@ -2318,7 +2347,18 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                         editor.close_completions();
                     }
                     editor.clear_hover();
-                    editor.insert_text(&text);
+                    // A literal Enter keystroke gets context-aware indent
+                    // (roadmap item 16); anything else (paste, a ghost/
+                    // snippet insert routed through this same message,
+                    // generated multi-char text) already carries whatever
+                    // indentation it has, so it stays on the plain insert —
+                    // see `EditorState::insert_newline_smart`'s own doc
+                    // comment for why the check is this narrow.
+                    if text == "\n" {
+                        editor.insert_newline_smart(tab_size);
+                    } else {
+                        editor.insert_text(&text);
+                    }
                     editor.refilter_completions();
                 }
                 mark_edited(state, &path);
@@ -2438,6 +2478,24 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
                 mark_edited(state, &path);
                 return scroll_cursor_into_view(state, pane);
+            }
+        }
+        Message::OrganizeImports => {
+            if let Some(path) = active_file_path(state) {
+                if !find_editor_mut(state, &path).is_some_and(|e| e.organize_imports()) {
+                    return iced::Task::none();
+                }
+                mark_edited(state, &path);
+                return scroll_cursor_into_view(state, Pane::Primary);
+            }
+        }
+        Message::RemoveUnusedImports => {
+            if let Some(path) = active_file_path(state) {
+                if !find_editor_mut(state, &path).is_some_and(|e| e.remove_unused_imports()) {
+                    return iced::Task::none();
+                }
+                mark_edited(state, &path);
+                return scroll_cursor_into_view(state, Pane::Primary);
             }
         }
         Message::EditorMove { dir, extend, pane } => {
@@ -2683,6 +2741,13 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 {
                     editor.diagnostics =
                         Rc::new(convert_diagnostics(&editor.document, diagnostics));
+                }
+            }
+            LspEvent::InlayHints { uri, hints } => {
+                if let Some(path) = uri.to_file_path().ok()
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.inlay_hints = Rc::new(convert_inlay_hints(&editor.document, hints));
                 }
             }
             LspEvent::Completions { uri, line, character, items } => {
@@ -3190,6 +3255,20 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::ToggleWordWrap => {
             state.word_wrap = !state.word_wrap;
             persist_settings(state);
+        }
+        Message::ToggleBracketColorization => {
+            state.bracket_pair_colorization = !state.bracket_pair_colorization;
+            persist_settings(state);
+        }
+        Message::ToggleInlayHintsLanguage(language) => {
+            let id = language.language_id();
+            if !state.inlay_hints_disabled_languages.remove(id) {
+                state.inlay_hints_disabled_languages.insert(id.to_string());
+            }
+            persist_settings(state);
+            if let Some(path) = active_file_path(state) {
+                request_inlay_hints_for(state, &path);
+            }
         }
         Message::DismissToast(id) => state.toasts.retain(|t| t.id != id),
         Message::PruneToasts => {
@@ -3913,6 +3992,8 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
             }
             return scroll_cursor_into_view(state, Pane::Primary);
         }
+        PaletteAction::OrganizeImports => return update(state, Message::OrganizeImports),
+        PaletteAction::RemoveUnusedImports => return update(state, Message::RemoveUnusedImports),
     }
     iced::Task::none()
 }
@@ -3946,6 +4027,8 @@ fn persist_settings(state: &State) {
         tab_size: state.tab_size,
         show_line_numbers: state.show_line_numbers,
         word_wrap: state.word_wrap,
+        bracket_pair_colorization: state.bracket_pair_colorization,
+        inlay_hints_disabled_languages: state.inlay_hints_disabled_languages.clone(),
     });
 }
 
@@ -4220,6 +4303,16 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
                 label: "Toggle Bookmark at Cursor Line".to_string(),
                 action: PaletteAction::ToggleBookmarkAtCursor,
             });
+            if editor.language.is_some_and(language_supports_imports) {
+                entries.push(PaletteEntry {
+                    label: "Organize Imports".to_string(),
+                    action: PaletteAction::OrganizeImports,
+                });
+                entries.push(PaletteEntry {
+                    label: "Remove Unused Imports".to_string(),
+                    action: PaletteAction::RemoveUnusedImports,
+                });
+            }
             // One entry per bookmark in the active file — `editor.bookmarks`
             // is a `BTreeSet`, so these already come out in ascending line
             // order. Not persisted, and not listed across other open tabs:

@@ -675,8 +675,38 @@ fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
             autosave_row(state, p),
         ]
         .spacing(8.0),
+        column![
+            section_label("BRACKET COLORIZATION", p),
+            toggle_row(
+                "Rainbow bracket pairs",
+                "Color matching brackets by nesting depth",
+                state.bracket_pair_colorization,
+                Message::ToggleBracketColorization,
+                p,
+            ),
+        ]
+        .spacing(8.0),
+        column![section_label("INLINE TYPE HINTS", p), inlay_hints_rows(state, p)].spacing(8.0),
     ]
     .spacing(24.0)
+    .into()
+}
+
+/// One toggle per `LspLanguage` for roadmap item 13's "configurable per
+/// language" — each flips that language's membership in
+/// `State::inlay_hints_disabled_languages` (a blocklist, so a checked row
+/// means hints are *on*; see that field's own doc comment).
+fn inlay_hints_rows(state: &State, p: Palette) -> Element<'static, Message> {
+    column(LspLanguage::ALL.into_iter().map(|language| {
+        toggle_row(
+            language.label(),
+            "Show inferred types for variables",
+            !state.inlay_hints_disabled_languages.contains(language.language_id()),
+            Message::ToggleInlayHintsLanguage(language),
+            p,
+        )
+    }))
+    .spacing(8.0)
     .into()
 }
 

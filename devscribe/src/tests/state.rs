@@ -3281,6 +3281,186 @@ fn enter_inside_the_indent_only_copies_up_to_the_cursor() {
 }
 
 #[test]
+fn smart_enter_indents_one_level_deeper_after_an_opening_brace() {
+    let mut editor = EditorState::new(Document::from_str("fn f() {"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 8 };
+
+    editor.insert_newline_smart(4);
+
+    assert_eq!(editor.document.text().to_string(), "fn f() {\n    ");
+    assert_eq!(editor.cursor, CursorPos { line: 1, col: 4 });
+}
+
+#[test]
+fn smart_enter_splits_a_bracket_pair_typed_together() {
+    // `{}` with the caret sitting between them (as auto-pairing leaves it) —
+    // Enter must not just indent once and leave `}` dangling a level deep;
+    // it should land the closer back at the opener's own indent.
+    let mut editor = EditorState::new(Document::from_str("fn f() {}"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 8 };
+
+    editor.insert_newline_smart(4);
+
+    assert_eq!(editor.document.text().to_string(), "fn f() {\n    \n}");
+    assert_eq!(editor.cursor, CursorPos { line: 1, col: 4 }, "caret lands on the deeper-indented middle line");
+}
+
+#[test]
+fn smart_enter_indents_after_a_python_colon() {
+    let mut editor = EditorState::new(Document::from_str("if x:"), PathBuf::from("t.py"));
+    editor.cursor = CursorPos { line: 0, col: 5 };
+
+    editor.insert_newline_smart(4);
+
+    assert_eq!(editor.document.text().to_string(), "if x:\n    ");
+}
+
+#[test]
+fn smart_enter_does_not_treat_a_rust_colon_as_a_block_opener() {
+    // A trailing `:` only means "indent deeper" in Python — the same shape
+    // in a Rust buffer must not trigger it.
+    let mut editor = EditorState::new(Document::from_str("let x:"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 6 };
+
+    editor.insert_newline_smart(4);
+
+    assert_eq!(editor.document.text().to_string(), "let x:\n");
+}
+
+#[test]
+fn smart_enter_on_an_ordinary_line_just_carries_over_indent() {
+    let mut editor = EditorState::new(Document::from_str("    let a = 1;"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 14 };
+
+    editor.insert_newline_smart(4);
+
+    assert_eq!(editor.document.text().to_string(), "    let a = 1;\n    ");
+}
+
+#[test]
+fn typing_a_lone_closing_brace_dedents_to_match_its_opener() {
+    // As if `{` + Enter had just landed the caret one level deeper than
+    // `fn f() {`'s own indent (column 4) — typing `}` there should snap
+    // back to column 0, matching the opener's line, not stay at column 4.
+    let mut editor = EditorState::new(Document::from_str("fn f() {\n    "), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 1, col: 4 };
+
+    editor.type_char('}');
+
+    assert_eq!(editor.document.text().to_string(), "fn f() {\n}");
+    assert_eq!(editor.cursor, CursorPos { line: 1, col: 1 });
+}
+
+#[test]
+fn typing_a_closing_bracket_mid_expression_does_not_dedent() {
+    // `}` here is closing a call's arguments, not standing alone as the
+    // first thing on its line — smart-dedent must leave it alone.
+    let mut editor = EditorState::new(Document::from_str("    foo(a"), PathBuf::from("t.rs"));
+    editor.cursor = CursorPos { line: 0, col: 9 };
+
+    editor.type_char(')');
+
+    assert_eq!(editor.document.text().to_string(), "    foo(a)");
+}
+
+#[test]
+fn organize_imports_sorts_a_contiguous_run_of_rust_use_lines() {
+    let mut editor = EditorState::new(
+        Document::from_str("use std::io;\nuse std::collections::HashMap;\nuse crate::foo;\n\nfn main() {}\n"),
+        PathBuf::from("t.rs"),
+    );
+
+    assert!(editor.organize_imports());
+
+    assert_eq!(
+        editor.document.text().to_string(),
+        "use crate::foo;\nuse std::collections::HashMap;\nuse std::io;\n\nfn main() {}\n"
+    );
+}
+
+#[test]
+fn organize_imports_sorts_python_import_and_from_lines_and_dedupes() {
+    let mut editor = EditorState::new(
+        Document::from_str("import sys\nfrom os import path\nimport os\nimport os\n"),
+        PathBuf::from("t.py"),
+    );
+
+    assert!(editor.organize_imports());
+
+    assert_eq!(editor.document.text().to_string(), "from os import path\nimport os\nimport sys\n");
+}
+
+#[test]
+fn organize_imports_keeps_blank_separated_groups_independent() {
+    // Two groups, already each internally sorted but in the "wrong" overall
+    // order relative to each other — a global sort across the blank line
+    // would merge them; each group must instead stay exactly where it is.
+    let mut editor = EditorState::new(
+        Document::from_str("use zeta::a;\n\nuse alpha::b;\n"),
+        PathBuf::from("t.rs"),
+    );
+
+    assert!(!editor.organize_imports(), "each group is already sorted on its own, so nothing should change");
+    assert_eq!(editor.document.text().to_string(), "use zeta::a;\n\nuse alpha::b;\n");
+}
+
+#[test]
+fn organize_imports_is_a_no_op_for_a_language_with_no_import_syntax() {
+    let mut editor = EditorState::new(Document::from_str("{\"b\": 1, \"a\": 2}"), PathBuf::from("t.json"));
+    assert!(!editor.organize_imports());
+}
+
+#[test]
+fn remove_unused_imports_deletes_only_lines_flagged_and_shaped_like_an_import() {
+    let mut editor = EditorState::new(
+        Document::from_str("use std::io;\nuse std::fmt;\n\nfn main() {}\n"),
+        PathBuf::from("t.rs"),
+    );
+    editor.diagnostics = std::rc::Rc::new(vec![
+        EditorDiagnostic {
+            start: CursorPos { line: 1, col: 0 },
+            end: CursorPos { line: 1, col: 13 },
+            severity: lsp::DiagnosticSeverity::WARNING,
+            message: "unused import: `std::fmt`".to_string(),
+        },
+        // Same wording, but on a line that isn't actually an import — must
+        // not be deleted just because the message alone looks like a match.
+        EditorDiagnostic {
+            start: CursorPos { line: 3, col: 0 },
+            end: CursorPos { line: 3, col: 1 },
+            severity: lsp::DiagnosticSeverity::WARNING,
+            message: "unused import: `std::fmt`".to_string(),
+        },
+    ]);
+
+    assert!(editor.remove_unused_imports());
+
+    assert_eq!(editor.document.text().to_string(), "use std::io;\n\nfn main() {}\n");
+}
+
+#[test]
+fn remove_unused_imports_is_a_no_op_when_nothing_matches() {
+    let mut editor = EditorState::new(Document::from_str("use std::io;\n"), PathBuf::from("t.rs"));
+    assert!(!editor.remove_unused_imports());
+}
+
+#[test]
+fn convert_inlay_hints_maps_utf16_columns_and_sorts_by_position() {
+    let document = Document::from_str("let x = 1;\nlet y = 2;\n");
+    let hints = vec![
+        lsp::InlayHintEntry { line: 1, character: 5, text: ": i32".to_string() },
+        lsp::InlayHintEntry { line: 0, character: 5, text: ": i32".to_string() },
+    ];
+
+    let converted = convert_inlay_hints(&document, hints);
+
+    assert_eq!(converted.len(), 2);
+    assert_eq!((converted[0].line, converted[0].col), (0, 5), "sorted into document order");
+    assert_eq!((converted[1].line, converted[1].col), (1, 5));
+    assert_eq!(converted[0].text, ": i32");
+}
+
+#[test]
 fn tab_block_indents_a_multi_line_selection_instead_of_replacing_it() {
     let mut editor = EditorState::new(Document::from_str("a\nb\nc\n"), PathBuf::from("t.txt"));
     editor.selection_anchor = Some(CursorPos { line: 0, col: 0 });
