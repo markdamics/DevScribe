@@ -256,6 +256,8 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
                 left: 24.0,
             }),
         )
+        .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+        .style(widgets::scrollbar_style(p))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

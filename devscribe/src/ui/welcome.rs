@@ -242,7 +242,13 @@ fn right_pane(state: &State, p: Palette) -> Element<'static, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
-    container(scrollable(content).width(Length::Fill).height(Length::Fill))
+    container(
+        scrollable(content)
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {

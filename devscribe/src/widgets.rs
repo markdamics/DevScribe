@@ -4,8 +4,51 @@ use crate::fonts;
 use devscribe_core::theme::Palette;
 use iced::alignment::Vertical;
 use iced::border;
-use iced::widget::{column, container, text, Space};
-use iced::{Alignment, Border, Color, Element, Length};
+use iced::widget::{column, container, scrollable, text, Space};
+use iced::{Alignment, Border, Color, Element, Length, Theme};
+
+/// Every scrollbar in the app shares this thickness — slim enough to read as
+/// a hairline rather than a chrome-wide gutter.
+const SCROLLBAR_THICKNESS: f32 = 4.0;
+
+/// A slim scrollbar rail — pass to `.direction(scrollable::Direction::...)`
+/// alongside `scrollbar_style` so every scrollable in the app shares the same
+/// thin gutter.
+pub fn thin_scrollbar() -> scrollable::Scrollbar {
+    scrollable::Scrollbar::default()
+        .width(SCROLLBAR_THICKNESS)
+        .margin(0.0)
+        .scroller_width(SCROLLBAR_THICKNESS)
+}
+
+/// Tints the scroller with the active accent color — dimmed at rest so it
+/// reads as a quiet hint rather than a bright UI element, brightening to the
+/// full accent while hovered/dragged. Pass to `.style(...)` alongside
+/// `thin_scrollbar` so every scrollable in the app matches the current
+/// theme's accent.
+pub fn scrollbar_style(p: Palette) -> impl Fn(&Theme, scrollable::Status) -> scrollable::Style {
+    move |theme, status| {
+        let dragged = matches!(status, scrollable::Status::Dragged { .. });
+        let hovered = matches!(status, scrollable::Status::Hovered { .. }) || dragged;
+        let scroller_color = if hovered {
+            color(p.accent_solid)
+        } else {
+            let mut idle = p.accent_solid;
+            idle.a *= 0.45;
+            color(idle)
+        };
+        let rail = scrollable::Rail {
+            background: None,
+            border: Border::default(),
+            scroller: scrollable::Scroller { background: scroller_color.into(), border: Border::default() },
+        };
+        scrollable::Style {
+            horizontal_rail: rail,
+            vertical_rail: rail,
+            ..scrollable::default(theme, status)
+        }
+    }
+}
 
 /// Centers `content` in both axes, filling whatever space its parent (e.g. a
 /// fixed-size `button`) allocates. `iced`'s `button`/`container` don't center

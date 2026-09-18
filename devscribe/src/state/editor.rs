@@ -25,6 +25,12 @@ pub enum Direction {
     Down,
     LineStart,
     LineEnd,
+    /// `Ctrl`/`Cmd`+`Left` — the start of the previous identifier/punctuation
+    /// run, skipping any whitespace first. See `EditorState::word_left`.
+    WordLeft,
+    /// `Ctrl`/`Cmd`+`Right` — the end of the next identifier/punctuation run,
+    /// plus any whitespace immediately after it. See `EditorState::word_right`.
+    WordRight,
 }
 
 /// A diagnostic from the language server, converted into char-based
@@ -36,6 +42,20 @@ pub struct EditorDiagnostic {
     pub end: CursorPos,
     pub severity: lsp::DiagnosticSeverity,
     pub message: String,
+}
+
+/// A handful of lines from a definition/reference's target file, resolved
+/// silently off the same dwell that shows the hover tooltip (roadmap item
+/// 12, "quick file peek") — rendered by `hover_popup.rs` under the hover
+/// text so the target can be checked without leaving the current tab.
+/// `lines[i]` is file line `start_line + i`; `target_line` is which of
+/// those is the actual definition/reference to highlight.
+#[derive(Debug, Clone)]
+pub struct PeekPreview {
+    pub path: PathBuf,
+    pub start_line: usize,
+    pub target_line: usize,
+    pub lines: Vec<String>,
 }
 
 /// One clickable row in the Locations dock panel (`references_panel.rs`) —
@@ -272,6 +292,26 @@ pub struct EditorState {
     pub path: PathBuf,
     pub cursor: CursorPos,
     pub selection_anchor: Option<CursorPos>,
+    /// Additional simultaneous cursor+selection pairs for multi-cursor
+    /// editing (`Ctrl+D` "select next occurrence", Alt-drag column select)
+    /// — the primary `cursor`/`selection_anchor` above is always one of the
+    /// active cursors too, this is just the rest. Empty outside multi-cursor
+    /// mode, which is the overwhelmingly common case, so every ordinary
+    /// single-cursor code path (`insert_text`, `backspace`, ...) stays on
+    /// its original fast path, and multi-cursor editing reuses it verbatim
+    /// per cursor via `for_each_cursor` rather than duplicating any of it.
+    pub extra_cursors: Vec<(CursorPos, Option<CursorPos>)>,
+    /// Set for the duration of `for_each_cursor`'s per-cursor loop so the
+    /// ordinary single-cursor methods it calls (`insert_text_body`'s own
+    /// `record_undo_boundary` call, etc.) don't each push their own undo
+    /// step — the multi-cursor edit as a whole gets exactly one.
+    suppress_undo_boundary: bool,
+    /// Lines toggled via `Ctrl+Shift+M` (`toggle_bookmark`) — quick markers
+    /// shown in the gutter and listed as "Bookmark: ..." command palette
+    /// entries. Deliberately not persisted anywhere: gone the moment this
+    /// tab closes, same as `pending_revert_line` and everything else here
+    /// that isn't written to disk.
+    pub bookmarks: std::collections::BTreeSet<usize>,
     pub language: Option<syntax::Language>,
     pub highlights: Rc<Vec<Span>>,
     highlighter: syntax::Highlighter,
@@ -352,6 +392,16 @@ pub struct EditorState {
     /// `hover_popup.rs`. Distinct from `hover_pending`: this only changes
     /// once an actual response lands (or resolves to "nothing to show").
     pub hover: Option<(CursorPos, String)>,
+    /// Position a `LspCommand::GotoDefinition` request was sent for on
+    /// behalf of the hover-dwell "quick peek" (roadmap item 12) rather than
+    /// an explicit F12/"Go to Definition" (`Message::GoToDefinition` clears
+    /// this before sending its own request, so it wins any race) — lets
+    /// `LspEvent::Definition`'s handler tell which of the two a given reply
+    /// belongs to, since both ride the same request/event shape.
+    peek_pending_for: Option<CursorPos>,
+    /// The resolved preview and the position it's for, mirroring `hover`
+    /// above — rendered by `hover_popup.rs` under the hover text.
+    pub peek: Option<(CursorPos, PeekPreview)>,
     /// Undo history — snapshots taken just before an edit that starts a new
     /// undo step (see `record_undo_boundary`). Consecutive same-kind edits
     /// (typing character after character, backspacing run after run)
@@ -433,6 +483,15 @@ pub const MAX_RENDERED_LINE_CHARS: usize = 2000;
 /// comment for why.
 const MAX_WORD_OCCURRENCES: usize = 500;
 
+/// Cap on `EditorState::extra_cursors` — `select_next_occurrence` stops
+/// adding more once it's hit, and `set_column_selection` clamps a drag to
+/// this many lines. Same shape as `MAX_WORD_OCCURRENCES`: a real editing
+/// session never wants more simultaneous cursors than fit on several
+/// screens at once, so this only bites a pathological case (a one-character
+/// selection that happens to occur thousands of times, or a column-drag
+/// across an entire huge file).
+const MAX_EXTRA_CURSORS: usize = 300;
+
 /// A one-time full scan for `EditorState::new` — every other call site
 /// updates `max_line_chars` incrementally (grow-only in the hot path,
 /// reconciled at settle) rather than rescanning, per its own doc comment.
@@ -475,6 +534,9 @@ impl EditorState {
             path,
             cursor: CursorPos::default(),
             selection_anchor: None,
+            extra_cursors: Vec::new(),
+            suppress_undo_boundary: false,
+            bookmarks: std::collections::BTreeSet::new(),
             language,
             highlights: Rc::new(highlights),
             highlighter,
@@ -482,7 +544,13 @@ impl EditorState {
             diagnostics: Rc::new(Vec::new()),
             json: None,
             json_collapsed: HashSet::new(),
-            json_text_mode: false,
+            // Unlike Markdown's preview-by-default (`markdown_text_mode`),
+            // JSON/config files open straight into the syntax-highlighted
+            // `code_area` — the tree view is opt-in (`JsonToggleTextMode` /
+            // the breadcrumb bar's "Tree View" button) rather than the
+            // landing view, since a tree obscures the raw file text a config
+            // file is usually opened to check or edit.
+            json_text_mode: true,
             markdown: None,
             markdown_text_mode: false,
             markdown_headings: Vec::new(),
@@ -511,6 +579,8 @@ impl EditorState {
             hover_pending: None,
             hover_requested_for: None,
             hover: None,
+            peek_pending_for: None,
+            peek: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_kind: None,
@@ -632,6 +702,50 @@ impl EditorState {
             .text()
             .char_to_byte(self.document.char_index(self.cursor.line, self.cursor.col));
         outline::breadcrumbs_at(tree, self.document.text(), byte, lang)
+    }
+
+    /// Sticky-scroll headers (roadmap item 18): the enclosing named scopes
+    /// (module/type/function/closure — the same filter `outline::
+    /// emphasized_index` uses to pick the breadcrumb's bolded segment,
+    /// minus control-flow crumbs, which would make the pinned strip flicker
+    /// on every `if`/`for` the viewport happens to start inside) whose own
+    /// opening line sits *above* `first_visible_line` — a scope whose
+    /// definition line is still on screen doesn't need pinning, it's
+    /// already visible. Returns `(header, start_line)` pairs, outermost
+    /// first, ready for `EditorCanvas` to paint as fixed rows atop the
+    /// scrolled content. Same staleness guard as `breadcrumbs()`.
+    pub fn sticky_scopes_at_line(&self, first_visible_line: usize) -> Vec<(String, usize)> {
+        if self.needs_reparse {
+            return Vec::new();
+        }
+        let Some(tree) = self.tree.as_ref() else {
+            return Vec::new();
+        };
+        let Some(lang) = self.language else {
+            return Vec::new();
+        };
+        if first_visible_line == 0 {
+            return Vec::new();
+        }
+        let byte = self.document.char_index(first_visible_line, 0);
+        let byte = self.document.text().char_to_byte(byte);
+        outline::breadcrumbs_at(tree, self.document.text(), byte, lang)
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    outline::CrumbKind::Module
+                        | outline::CrumbKind::Type
+                        | outline::CrumbKind::Function
+                        | outline::CrumbKind::Closure
+                )
+            })
+            .filter_map(|c| {
+                let start_char = self.document.text().byte_to_char(c.start_byte);
+                let (line, _) = self.document.line_col(start_char);
+                (line < first_visible_line).then_some((c.header, line))
+            })
+            .collect()
     }
 
     /// Bumped on every buffer mutation — a cheap proxy for "has the document
@@ -1026,6 +1140,14 @@ impl EditorState {
     /// `document`. `Other` never coalesces, so paste/cut are always their
     /// own undo step regardless of what happened right before them.
     fn record_undo_boundary(&mut self, kind: EditKind) {
+        // Suppressed for the duration of `for_each_cursor`'s per-cursor loop
+        // — it already recorded one boundary for the whole multi-cursor
+        // edit up front, so the ordinary single-cursor methods it calls per
+        // cursor (which each call this exactly as they would standalone)
+        // must not each push (or coalesce-track) their own.
+        if self.suppress_undo_boundary {
+            return;
+        }
         let coalesce = kind != EditKind::Other && self.last_edit_kind == Some(kind);
         if !coalesce {
             let entry = self.snapshot();
@@ -1038,6 +1160,69 @@ impl EditorState {
         self.redo_stack.clear();
     }
 
+    /// Runs `edit` once per active cursor — the primary plus every entry in
+    /// `extra_cursors` — for multi-cursor editing. `edit` is built from the
+    /// same single-cursor methods (`insert_text_body`, `backspace_body`,
+    /// ...) the non-multi-cursor path calls directly, each still going
+    /// through its own `record_undo_boundary` call internally; that call is
+    /// a no-op for the loop's duration (`suppress_undo_boundary`), and this
+    /// method records exactly one boundary for the whole batch itself,
+    /// before the loop starts — same "record before mutating" contract
+    /// `record_undo_boundary` itself documents, just for every cursor at
+    /// once rather than one.
+    ///
+    /// Processed rightmost-first (by selection end, or the bare cursor with
+    /// no selection): an edit at one cursor only ever touches text at or
+    /// immediately around that cursor's own position, so going right first
+    /// guarantees every not-yet-processed (necessarily lower-positioned)
+    /// cursor's stored `(line, col)` is still valid when its turn comes,
+    /// without needing to track char-index deltas across the whole pass.
+    ///
+    /// `edit` reports whether it actually changed anything; if none of them
+    /// did, no undo step is recorded at all — the same "an inert keystroke
+    /// must not touch undo history" rule `backspace_body`/`delete_forward_body`
+    /// already follow standalone.
+    fn for_each_cursor(&mut self, kind: EditKind, mut edit: impl FnMut(&mut Self) -> bool) -> bool {
+        let coalesce = kind != EditKind::Other && self.last_edit_kind == Some(kind);
+        let pre_snapshot = if coalesce { None } else { Some(self.snapshot()) };
+
+        let mut slots: Vec<(CursorPos, Option<CursorPos>)> =
+            std::iter::once((self.cursor, self.selection_anchor)).chain(self.extra_cursors.iter().copied()).collect();
+        let mut order: Vec<usize> = (0..slots.len()).collect();
+        order.sort_by_key(|&i| {
+            let (cursor, anchor) = slots[i];
+            let c = self.document.char_index(cursor.line, cursor.col);
+            let a = anchor.map(|a| self.document.char_index(a.line, a.col)).unwrap_or(c);
+            std::cmp::Reverse(c.max(a))
+        });
+
+        self.suppress_undo_boundary = true;
+        let mut changed = false;
+        for i in order {
+            self.cursor = slots[i].0;
+            self.selection_anchor = slots[i].1;
+            changed |= edit(self);
+            slots[i] = (self.cursor, self.selection_anchor);
+        }
+        self.suppress_undo_boundary = false;
+
+        self.cursor = slots[0].0;
+        self.selection_anchor = slots[0].1;
+        self.extra_cursors = slots[1..].to_vec();
+
+        if changed {
+            if let Some(entry) = pre_snapshot {
+                self.undo_stack.push(entry);
+                if self.undo_stack.len() > MAX_UNDO_ENTRIES {
+                    self.undo_stack.remove(0);
+                }
+            }
+            self.last_edit_kind = Some(kind);
+            self.redo_stack.clear();
+        }
+        changed
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         // A lone, non-newline character is ordinary typing and coalesces
         // with adjacent typing into one undo step; anything else (paste,
@@ -1047,7 +1232,21 @@ impl EditorState {
         } else {
             EditKind::Other
         };
-        self.record_undo_boundary(kind);
+        if self.extra_cursors.is_empty() {
+            self.record_undo_boundary(kind);
+            self.insert_text_body(text);
+        } else {
+            self.for_each_cursor(kind, |e| {
+                e.insert_text_body(text);
+                true
+            });
+        }
+    }
+
+    /// `insert_text`'s actual work, undo-boundary-free — called directly for
+    /// the single-cursor case (after `insert_text` records the boundary) and
+    /// once per cursor from `for_each_cursor` for the multi-cursor case.
+    fn insert_text_body(&mut self, text: &str) {
         self.delete_selection();
         // Auto-indent: Enter carries over the current line's leading
         // whitespace, up to wherever the cursor actually sits (so pressing
@@ -1081,6 +1280,27 @@ impl EditorState {
     ///    cursor left in between.
     /// 3. Anything else: ordinary typing.
     pub fn type_char(&mut self, ch: char) {
+        if self.extra_cursors.is_empty() {
+            self.type_char_body(ch);
+        } else {
+            self.for_each_cursor(EditKind::Insert, |e| {
+                e.type_char_body(ch);
+                true
+            });
+        }
+    }
+
+    /// `type_char`'s actual work — see `for_each_cursor`/`insert_text_body`
+    /// for why this is split out. Unlike `insert_text_body`, this still
+    /// calls `record_undo_boundary` itself for the plain-typing fallback
+    /// (rather than leaving it to a dispatching wrapper): the skip-over and
+    /// auto-pair branches above it either touch no undo-relevant state at
+    /// all or already record their own via `insert_pair`, and this has to
+    /// match `insert_text`'s calling convention on those, so it can't just
+    /// forward to the public `insert_text` (which would re-check
+    /// `extra_cursors` and, called from inside `for_each_cursor`'s own loop,
+    /// recurse into a second, nested multi-cursor pass).
+    fn type_char_body(&mut self, ch: char) {
         if self.selection().is_none() {
             let next = self.document.line_char(self.cursor.line, self.cursor.col);
             if next == Some(ch) && is_closer(ch) {
@@ -1092,7 +1312,8 @@ impl EditorState {
             self.insert_pair(ch, closer);
             return;
         }
-        self.insert_text(&ch.to_string());
+        self.record_undo_boundary(EditKind::Insert);
+        self.insert_text_body(&ch.to_string());
     }
 
     /// The actual insert behind `type_char`'s pairing case: wraps the
@@ -1318,6 +1539,9 @@ impl EditorState {
     /// `Backspace`. `false` if there was nothing to delete, in which case
     /// nothing at all happened — see the guard below.
     pub fn backspace(&mut self) -> bool {
+        if !self.extra_cursors.is_empty() {
+            return self.for_each_cursor(EditKind::Delete, |e| e.backspace_body());
+        }
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
         // An inert keystroke must not touch the undo history.
         // `record_undo_boundary` unconditionally clears the redo stack and
@@ -1328,6 +1552,19 @@ impl EditorState {
             return false;
         }
         self.record_undo_boundary(EditKind::Delete);
+        self.backspace_body()
+    }
+
+    /// `backspace`'s actual work, undo-boundary-free and re-checking the
+    /// "nothing to delete" guard itself — needed standalone for the
+    /// multi-cursor case, where each cursor's own outcome (not just the
+    /// primary's) decides whether `for_each_cursor` records an undo step at
+    /// all. See `insert_text_body`/`for_each_cursor` for the same split.
+    fn backspace_body(&mut self) -> bool {
+        let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+        if idx == 0 && self.selection().is_none() {
+            return false;
+        }
         if self.delete_selection() {
             self.resync_after_edit();
             return true;
@@ -1343,11 +1580,23 @@ impl EditorState {
 
     /// `Delete`. `false` if there was nothing to delete — see `backspace`.
     pub fn delete_forward(&mut self) -> bool {
+        if !self.extra_cursors.is_empty() {
+            return self.for_each_cursor(EditKind::Delete, |e| e.delete_forward_body());
+        }
         let idx = self.document.char_index(self.cursor.line, self.cursor.col);
         if idx >= self.document.text().len_chars() && self.selection().is_none() {
             return false;
         }
         self.record_undo_boundary(EditKind::Delete);
+        self.delete_forward_body()
+    }
+
+    /// `delete_forward`'s actual work — see `backspace_body`.
+    fn delete_forward_body(&mut self) -> bool {
+        let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+        if idx >= self.document.text().len_chars() && self.selection().is_none() {
+            return false;
+        }
         if self.delete_selection() {
             self.resync_after_edit();
             return true;
@@ -1407,6 +1656,12 @@ impl EditorState {
         self.revision = snapshot.revision;
         self.document.set_dirty(self.revision != self.saved_revision);
         self.last_edit_kind = None;
+        // `UndoSnapshot` doesn't carry `extra_cursors` (multi-cursor state
+        // is a live editing convenience, not part of the document history a
+        // `Ctrl+Z` is meant to step through) — clearing it here rather than
+        // leaving stale positions around that may no longer even fit the
+        // just-restored buffer.
+        self.extra_cursors.clear();
         self.resync_after_edit();
         // The whole buffer just changed out from under the grow-only
         // tracking `resync_after_edit` did above (via whatever line the
@@ -1475,7 +1730,67 @@ impl EditorState {
             Direction::LineEnd => {
                 self.cursor.col = self.document.line_len_chars(self.cursor.line);
             }
+            Direction::WordLeft => {
+                let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+                self.cursor = self.document.line_col(self.word_left(idx)).into();
+            }
+            Direction::WordRight => {
+                let idx = self.document.char_index(self.cursor.line, self.cursor.col);
+                self.cursor = self.document.line_col(self.word_right(idx)).into();
+            }
         }
+    }
+
+    /// The absolute char index `Ctrl`/`Cmd`+`Left` lands on from `idx`: back
+    /// one char, then past any run of whitespace, then to the start of
+    /// whatever identifier/punctuation run is left — same `char_class`
+    /// run-boundary rule `select_word_at`'s double-click uses, just walked
+    /// backwards and crossing line boundaries freely (`\n` is `CharClass::
+    /// Space`, so a press at column 0 jumps to the end of the previous
+    /// line's own last word, same as most editors).
+    fn word_left(&self, idx: usize) -> usize {
+        if idx == 0 {
+            return 0;
+        }
+        let rope = self.document.text();
+        let mut i = self.document.prev_char_index(idx);
+        while i > 0 && char_class(rope.char(i)) == CharClass::Space {
+            i = self.document.prev_char_index(i);
+        }
+        if char_class(rope.char(i)) == CharClass::Space {
+            return i;
+        }
+        let class = char_class(rope.char(i));
+        while i > 0 {
+            let prev = self.document.prev_char_index(i);
+            if char_class(rope.char(prev)) != class {
+                break;
+            }
+            i = prev;
+        }
+        i
+    }
+
+    /// The absolute char index `Ctrl`/`Cmd`+`Right` lands on from `idx`: past
+    /// whatever identifier/punctuation/whitespace run `idx` currently sits
+    /// in, then past any whitespace immediately following it — so landing
+    /// mid-word jumps to the next word's own end rather than stopping at
+    /// its start, matching most editors' word-right convention.
+    fn word_right(&self, idx: usize) -> usize {
+        let rope = self.document.text();
+        let len = rope.len_chars();
+        if idx >= len {
+            return len;
+        }
+        let mut i = idx;
+        let class = char_class(rope.char(i));
+        while i < len && char_class(rope.char(i)) == class {
+            i = self.document.next_char_index(i);
+        }
+        while i < len && char_class(rope.char(i)) == CharClass::Space {
+            i = self.document.next_char_index(i);
+        }
+        i
     }
 
     pub fn click(&mut self, line: usize, col: usize, extend: bool) {
@@ -1604,6 +1919,112 @@ impl EditorState {
         let total_chars = self.document.text().len_chars();
         self.selection_anchor = Some(CursorPos { line: 0, col: 0 });
         self.cursor = self.document.line_col(total_chars).into();
+    }
+
+    /// `Ctrl+D`. With no selection, selects the word under the cursor —
+    /// same expansion `select_word_at`'s double-click does, just keyed off
+    /// the caret instead of a click. With a selection already active (the
+    /// word `Ctrl+D` just selected, or a manual one), finds the next exact
+    /// occurrence of the selected text anywhere in the document, turns the
+    /// current selection into an additional simultaneous cursor
+    /// (`extra_cursors`), and makes the new occurrence the primary
+    /// selection — so repeated presses build up one cursor per match,
+    /// wrapping around the end of the document, and skipping any occurrence
+    /// that's already an active cursor. A no-op once every occurrence is
+    /// already selected, the selection is empty, or `MAX_EXTRA_CURSORS` is
+    /// already reached.
+    pub fn select_next_occurrence(&mut self) {
+        self.last_edit_kind = None;
+        self.goal_col = None;
+        if self.selection().is_none() {
+            if let Some((start, end)) = word_range_at(&self.document, self.cursor.line, self.cursor.col) {
+                self.selection_anchor = Some(self.document.line_col(start).into());
+                self.cursor = self.document.line_col(end).into();
+            }
+            return;
+        }
+        if self.extra_cursors.len() >= MAX_EXTRA_CURSORS {
+            return;
+        }
+        let Some((sel_start, sel_end)) = self.selection() else {
+            return;
+        };
+        let needle = self.document.text().slice(sel_start..sel_end).to_string();
+        if needle.is_empty() {
+            return;
+        }
+        // Every occurrence already claimed by an active cursor (the primary
+        // selection included), so a repeat press skips straight past it
+        // instead of re-adding the same one.
+        let mut taken: std::collections::HashSet<usize> = self
+            .extra_cursors
+            .iter()
+            .filter_map(|&(cursor, anchor)| self.selection_for(cursor, anchor))
+            .map(|(start, _)| start)
+            .collect();
+        taken.insert(sel_start);
+
+        let hay = self.document.text().to_string();
+        let occurrence_starts: Vec<usize> =
+            hay.match_indices(&needle).map(|(byte_off, _)| self.document.text().byte_to_char(byte_off)).collect();
+
+        let next = occurrence_starts
+            .iter()
+            .copied()
+            .find(|&start| start > sel_start && !taken.contains(&start))
+            .or_else(|| occurrence_starts.iter().copied().find(|start| !taken.contains(start)));
+
+        let Some(start) = next else {
+            return;
+        };
+        let end = start + needle.chars().count();
+        self.extra_cursors.push((self.cursor, self.selection_anchor));
+        self.selection_anchor = Some(self.document.line_col(start).into());
+        self.cursor = self.document.line_col(end).into();
+    }
+
+    /// Alt-drag column/block selection: replaces `extra_cursors` with one
+    /// cursor per line from `anchor_line` to `to_line` (inclusive, whichever
+    /// order the drag went), all sharing the same column range. A line
+    /// shorter than that range gets a bare caret at its own end rather than
+    /// being skipped — so typing across the block still reaches every line
+    /// the drag crossed, short ones included, matching the column of
+    /// whichever end of the drag it's the primary cursor.
+    pub fn set_column_selection(&mut self, anchor_line: usize, anchor_col: usize, to_line: usize, to_col: usize) {
+        self.last_edit_kind = None;
+        self.goal_col = None;
+        let (lo, hi) = if anchor_line <= to_line { (anchor_line, to_line) } else { (to_line, anchor_line) };
+        let hi = hi.min(lo + MAX_EXTRA_CURSORS).min(self.document.line_count().saturating_sub(1));
+        let (col_lo, col_hi) = if anchor_col <= to_col { (anchor_col, to_col) } else { (to_col, anchor_col) };
+
+        let mut cursors: Vec<(CursorPos, Option<CursorPos>)> = (lo..=hi)
+            .map(|line| {
+                let len = self.document.line_len_chars(line);
+                let start = col_lo.min(len);
+                let end = col_hi.min(len);
+                (CursorPos { line, col: end }, (start != end).then_some(CursorPos { line, col: start }))
+            })
+            .collect();
+        if cursors.is_empty() {
+            return;
+        }
+        // The line the drag actually ended on is the primary cursor — same
+        // "most recently touched is primary" rule `select_next_occurrence`
+        // follows — so continuing to drag keeps extending from where the
+        // mouse is, not from wherever the drag started.
+        let primary_idx = if to_line >= anchor_line { cursors.len() - 1 } else { 0 };
+        let (primary_cursor, primary_anchor) = cursors.remove(primary_idx);
+        self.cursor = primary_cursor;
+        self.selection_anchor = primary_anchor;
+        self.extra_cursors = cursors;
+    }
+
+    /// `Ctrl+Shift+M`. Toggles a bookmark on `line` — see the `bookmarks`
+    /// field's own doc comment for what these are (and aren't).
+    pub fn toggle_bookmark(&mut self, line: usize) {
+        if !self.bookmarks.remove(&line) {
+            self.bookmarks.insert(line);
+        }
     }
 
     /// The currently selected text, if any — `Ctrl+C`'s payload.
@@ -1822,6 +2243,8 @@ impl EditorState {
         self.hover_pending = Some((CursorPos { line, col }, Instant::now()));
         self.hover_requested_for = None;
         self.hover = None;
+        self.peek_pending_for = None;
+        self.peek = None;
     }
 
     /// The mouse left the canvas, or some other action (a keypress, an
@@ -1831,6 +2254,8 @@ impl EditorState {
         self.hover_pending = None;
         self.hover_requested_for = None;
         self.hover = None;
+        self.peek_pending_for = None;
+        self.peek = None;
     }
 
     /// Whether there's currently a rested-on position at all — what
@@ -1874,6 +2299,57 @@ impl EditorState {
             return;
         }
         self.hover = text.map(|t| (requested, t));
+    }
+
+    /// Marks `pos` as the position a peek's `LspCommand::GotoDefinition`
+    /// request has been sent for — the peek counterpart to
+    /// `mark_hover_requested`, called right alongside it since both ride
+    /// the same dwell tick.
+    pub fn mark_peek_requested(&mut self, pos: CursorPos) {
+        self.peek_pending_for = Some(pos);
+    }
+
+    /// Discards any in-flight peek request (and whatever peek is currently
+    /// shown) without touching the hover tooltip — called right before an
+    /// explicit F12/"Go to Definition" request, so its reply always wins
+    /// the race described on `peek_pending_for`.
+    pub fn clear_peek(&mut self) {
+        self.peek_pending_for = None;
+        self.peek = None;
+    }
+
+    /// Whether `peek_pending_for` currently exists and matches `(line,
+    /// character)` — how `LspEvent::Definition`'s handler tells a peek
+    /// reply apart from an explicit F12/"Go to Definition" one, since both
+    /// ride the same event shape. `character` is UTF-16 columns, same as
+    /// every other LSP-facing position in this file.
+    pub fn peek_requested_at(&self, line: u32, character: u32) -> bool {
+        self.peek_pending_for.is_some_and(|pos| {
+            pos.line == line as usize
+                && char_col_to_utf16_col(&self.document.line_text(pos.line), pos.col) == character
+        })
+    }
+
+    /// Applies the peek half of a `LspEvent::Definition` reply — discarded
+    /// (same staleness guard as `apply_hover_response`) if the mouse has
+    /// since left the position it was requested for. Also discarded when
+    /// the resolved location is the exact line already under the mouse:
+    /// hovering a symbol right at its own definition would otherwise "peek"
+    /// a preview of exactly what's already on screen there.
+    pub fn apply_peek_response(&mut self, line: u32, character: u32, preview: Option<PeekPreview>) {
+        let Some(requested) = self.peek_pending_for.take() else {
+            return;
+        };
+        if requested.line != line as usize {
+            return;
+        }
+        let line_text = self.document.line_text(requested.line);
+        if char_col_to_utf16_col(&line_text, requested.col) != character {
+            return;
+        }
+        self.peek = preview
+            .filter(|pv| !(pv.path == self.path && pv.target_line == requested.line))
+            .map(|pv| (requested, pv));
     }
 
     /// Applies a `LspEvent::SignatureHelp` response, discarding it if the
@@ -2671,6 +3147,11 @@ pub fn hold_scroll_position(editor: &EditorState, pane: Pane) -> iced::Task<Mess
 
 pub const MAX_PALETTE_RESULTS: usize = 50;
 
+/// Cap on `State::recent_files` (roadmap item 17) — same rough budget as
+/// `MAX_PALETTE_RESULTS`, just for a list that's appended to constantly
+/// (every file activation) rather than rebuilt fresh per query.
+pub const MAX_RECENT_FILES: usize = 50;
+
 /// The path of the active tab, if it's a `File` tab (not `Diff` or `Search`).
 pub fn active_file_path(state: &State) -> Option<PathBuf> {
     match state.active_tab.as_ref()? {
@@ -3384,6 +3865,17 @@ pub fn close_tab(state: &mut State, key: &TabKey) {
 pub fn touch_tab_mru(state: &mut State, key: &TabKey) {
     state.tab_activation_seq += 1;
     state.tab_last_activated.insert(key.clone(), state.tab_activation_seq);
+    // `Ctrl+E` quick-open's per-session file history (roadmap item 17) —
+    // deliberately never pruned when a tab closes, unlike `tab_last_activated`:
+    // the whole point over the Ctrl+Tab switcher (only ever open tabs) is
+    // surfacing files the user *isn't* looking at anymore. Most-recent-first,
+    // deduped so reopening an already-recent file just moves it back to the
+    // top instead of listing it twice.
+    if let TabKey::File(path) = key {
+        state.recent_files.retain(|p| p != path);
+        state.recent_files.insert(0, path.clone());
+        state.recent_files.truncate(MAX_RECENT_FILES);
+    }
 }
 
 /// The Ctrl+Tab quick switcher's (roadmap item 2) candidate list, most-
@@ -3787,6 +4279,35 @@ fn location_entry(state: &State, loc: &lsp::Location) -> Option<LocationEntry> {
         col,
         preview: line_text.trim().chars().take(160).collect(),
     })
+}
+
+/// How many lines of context to show above and below the target line in a
+/// `PeekPreview` (roadmap item 12) — small enough to stay a glance-sized
+/// popup rather than a second editor, generous enough to actually show the
+/// shape of a function/import rather than one bare line.
+const PEEK_CONTEXT_LINES: usize = 4;
+
+/// Builds the small file-preview `hover_popup.rs` renders under the hover
+/// text when hovering an identifier resolves elsewhere (roadmap item 12) —
+/// preferring the already-open editor's live buffer, same disk-fallback
+/// reasoning as `location_entry` right above. `None` if the location's
+/// `uri` isn't a `file://` path, the on-disk read fails, or the target file
+/// is empty.
+pub fn build_peek_preview(state: &State, loc: &lsp::Location) -> Option<PeekPreview> {
+    let path = loc.uri.to_file_path().ok()?;
+    let target_line = loc.range.start.line as usize;
+    let all_lines: Vec<String> = if let Some(editor) = find_editor(state, &path) {
+        (0..editor.document.line_count()).map(|i| editor.document.line_text(i)).collect()
+    } else {
+        std::fs::read_to_string(&path).ok()?.lines().map(str::to_string).collect()
+    };
+    if all_lines.is_empty() {
+        return None;
+    }
+    let target_line = target_line.min(all_lines.len() - 1);
+    let start_line = target_line.saturating_sub(PEEK_CONTEXT_LINES);
+    let end_line = (target_line + PEEK_CONTEXT_LINES + 1).min(all_lines.len());
+    Some(PeekPreview { path, start_line, target_line, lines: all_lines[start_line..end_line].to_vec() })
 }
 
 /// Turns `workspace/symbol` results into ready-made palette rows — the

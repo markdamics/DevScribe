@@ -6,9 +6,22 @@ use iced::{Alignment, Border, Element, Length};
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{Message, State};
+use crate::state::{self, Message, State};
+use crate::ui::breadcrumb_bar;
 use crate::ui::logo_mark::LogoMark;
+use crate::ui::run_icon::RunIcon;
 use crate::widgets;
+
+/// The `DEVSCRIBE` wordmark's own separator glyph — used again between the
+/// brand and the breadcrumb trail (see `view` below), so the trail reads as
+/// "attached to" the title rather than a second, unrelated bar segment.
+fn pipe_sep(p: Palette) -> Element<'static, Message> {
+    text("|")
+        .font(fonts::mono(Weight::Medium))
+        .size(crate::text_scale::px(15.0))
+        .color(color(p.border_hairline))
+        .into()
+}
 
 pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     let logo = canvas(LogoMark {
@@ -29,44 +42,48 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     // its own new inconsistency.
     let version = widgets::micro(concat!("V", env!("CARGO_PKG_VERSION")), color(p.text_muted));
 
-    let brand = row![logo, wordmark, version]
+    let mut brand = row![logo, wordmark, version]
         .spacing(8.0)
         .align_y(Alignment::Center);
 
-    let palette_button = button(widgets::center_v(
-        row![
-            text("RUN ANYTHING")
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(15.0)),
-            text("⌘K").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(15.0)),
-        ]
-        .spacing(9.0)
-        .align_y(Alignment::Center),
-    ))
-    .padding([0.0, 16.0])
-    .height(Length::Fixed(34.0))
-    .on_press(Message::TogglePalette)
-    .style(move |_theme, status| {
-        let hovered = status == button::Status::Hovered;
-        button::Style {
-            background: Some(color(p.bg_canvas).into()),
-            text_color: if hovered {
-                color(p.text_strong)
-            } else {
-                color(p.text_muted)
-            },
-            border: Border {
-                color: if hovered {
-                    color(p.accent_solid)
-                } else {
-                    color(p.border_hairline)
-                },
-                width: 1.5,
-                radius: 3.0.into(),
-            },
-            ..button::Style::default()
+    // The active file's scope breadcrumbs, right after the wordmark and set
+    // off by a "|" separator — see `breadcrumb_bar::title_crumbs`. `None`
+    // with no active file (nothing to open a trail for) or an empty trail
+    // (a landmark-less language, or the cursor sitting outside any scope).
+    if let Some(editor) = state::active_editor(state) {
+        if let Some(crumbs) = breadcrumb_bar::title_crumbs(editor, p) {
+            brand = brand.push(pipe_sep(p)).push(crumbs);
         }
-    });
+    }
+
+    // A bare icon button, not the mockup's wide "RUN ANYTHING ⌘K" pill —
+    // that pill duplicated the tab bar's own fixed search icon in spirit
+    // (another big, centered entry point), so it's now a small glyph
+    // sitting right next to Assist instead. A lightning bolt rather than
+    // another magnifying glass — the tab bar already owns that glyph for
+    // project search (`search_icon.rs`), and reusing it here for a
+    // differently-scoped action (run/open anything) would blur the two.
+    let run_icon = canvas(RunIcon { color: color(p.text_muted) })
+        .width(Length::Fixed(15.0))
+        .height(Length::Fixed(15.0));
+    let palette_button = button(widgets::center_fill(run_icon))
+        .width(Length::Fixed(32.0))
+        .height(Length::Fixed(32.0))
+        .padding(0.0)
+        .on_press(Message::TogglePalette)
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: if hovered { Some(color(p.surface_hover).into()) } else { None },
+                border: Border {
+                    color: if hovered { color(p.accent_solid) } else { color(p.border_hairline) },
+                    width: 1.5,
+                    radius: 3.0.into(),
+                },
+                ..button::Style::default()
+            }
+        });
+    let palette_button = widgets::tooltip(palette_button, "Run anything \u{2318}K", p);
 
     // "On" here means "there's a live session at all" — includes it being
     // open as a full tab, not just `chat_mode != Closed` alone, since
@@ -122,9 +139,8 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
 
     let bar = row![
         brand,
-        container(palette_button)
-            .width(Length::Fill)
-            .center_x(Length::Fill),
+        iced::widget::Space::new().width(Length::Fill),
+        palette_button,
         assist_button
     ]
     .spacing(12.0)

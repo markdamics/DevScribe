@@ -615,6 +615,8 @@ pub fn view(state: &State, path: &Path, p: Palette) -> Element<'static, Message>
                 toolbar(path, selected_count, editor.pending_hunk_revert, state.diff_ignore_whitespace, state.diff_view_mode, p),
                 widgets::hline(color(p.border_hairline)),
                 scrollable(column(rows).padding([8.0, 0.0]))
+                    .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+                    .style(widgets::scrollbar_style(p))
                     .width(Length::Fill)
                     .height(Length::Fill),
             ])

@@ -95,7 +95,12 @@ pub fn dock_panel(state: &State, p: Palette) -> Element<'static, Message> {
     } else {
         let rows: Vec<Element<'static, Message>> =
             state.references_results.iter().map(|entry| location_row(entry, &root, p)).collect();
-        scrollable(column(rows)).width(Length::Fill).height(Length::Fill).into()
+        scrollable(column(rows))
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     };
 
     let panel = container(column![header, widgets::hline(color(p.border_hairline)), list].width(Length::Fill).height(Length::Fill))

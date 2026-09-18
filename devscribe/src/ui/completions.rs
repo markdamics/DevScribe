@@ -142,6 +142,8 @@ fn doc_panel(item: &CompletionItem, p: Palette) -> Option<Element<'static, Messa
             .size(crate::text_scale::px(12.0))
             .color(color(p.text_body)),
     )
+    .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+    .style(widgets::scrollbar_style(p))
     .height(Length::Fixed(220.0));
 
     Some(
@@ -202,7 +204,10 @@ pub fn view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
         .map(|(i, item)| item_row(i, item, selected, p))
         .collect();
 
-    let list = scrollable(column(rows)).height(Length::Fixed(220.0));
+    let list = scrollable(column(rows))
+        .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+        .style(widgets::scrollbar_style(p))
+        .height(Length::Fixed(220.0));
 
     let popup = container(column![list, widgets::hline(color(p.border_hairline)), key_hints(p)])
         .width(Length::Fixed(280.0))

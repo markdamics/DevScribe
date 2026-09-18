@@ -85,6 +85,17 @@ fn tint(c: Rgba, alpha: f32) -> Color {
     color(Rgba { a: alpha, ..c })
 }
 
+/// Whether `path` names an image file — used by the sidebar to hand a click
+/// off to the OS's default image viewer (`sidebar::open_file_externally`)
+/// instead of opening a tab, since `Document::open`'s `Rope::from_reader`
+/// can't load binary image formats as text anyway.
+pub fn is_image(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "tiff" | "tif" | "svg" | "avif")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum Node {
     Dir { name: String, path: PathBuf, children: Vec<Node> },

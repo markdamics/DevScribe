@@ -79,6 +79,7 @@ fn sample_settings() -> Settings {
         show_hidden_files: true,
         problem_lens_enabled: false,
         save_on_focus_loss: true,
+        autosave_interval_secs: 60,
         lsp_enabled: false,
         copilot_inline_enabled: true,
         chat_mode: ChatMode::Collapsed,

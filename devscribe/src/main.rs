@@ -85,6 +85,10 @@ pub fn main() -> iced::Result {
     let mut app = iced::daemon(boot, state::update, view)
         .title(title)
         .default_font(fonts::sans(Weight::Normal))
+        // Off by default in iced; on for the smoother glyph/vector edges
+        // (caret, selection/diff-gutter shapes, rounded corners) this app's
+        // small-size monospace text and dense chrome both benefit from.
+        .antialiasing(true)
         .subscription(state::subscription);
 
     for bytes in fonts::BYTES {

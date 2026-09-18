@@ -550,7 +550,16 @@ pub fn handle_chat_event(state: &mut State, event: ClaudeEvent) -> iced::Task<Me
         // process is actually up), so clearing on `Ready` would wipe out
         // the very history it just replayed.
         ClaudeEvent::SessionStarting => {
-            state.chat = ChatThread::default();
+            // The composer's own draft survives the reset — a respawn (Shell
+            // Access, Edit type/permission mode, and provider all trigger
+            // one; see `State::chat_permission_mode`'s own doc comment on
+            // why those have to respawn the subprocess) is about the
+            // session/transcript, not whatever the user is mid-typing into
+            // the input bar. Losing an unsent draft just because a toggle in
+            // the Actions popup happened to require a fresh subprocess would
+            // be surprising and, worse, silently destructive.
+            let draft = std::mem::take(&mut state.chat.input);
+            state.chat = ChatThread { input: draft, ..ChatThread::default() };
             state.chat_pinned_to_bottom = true;
         }
         ClaudeEvent::Ready(sender) => {

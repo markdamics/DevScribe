@@ -222,7 +222,7 @@ fn operator_row<'a>(text_content: &str, content: &'a text_editor::Content, index
             widgets::micro("OPERATOR", color(p.text_muted)),
             Space::new().width(Length::Fill),
             link_button("Edit", Message::ChatEditMessage(text_content.to_string()), p),
-            link_button("Copy", Message::ChatCopyText(text_content.to_string()), p),
+            link_button("Copy", Message::CopyText(text_content.to_string()), p),
         ]
         .spacing(10.0)
         .align_y(Alignment::Center),
@@ -260,7 +260,7 @@ fn assistant_row<'a>(text_content: &str, content: &'a text_editor::Content, inde
     // caret never showing on a finalized bubble, just the other way round.
     if !streaming {
         header = header.push(Space::new().width(Length::Fill));
-        header = header.push(link_button("Copy", Message::ChatCopyText(text_content.to_string()), p));
+        header = header.push(link_button("Copy", Message::CopyText(text_content.to_string()), p));
     }
     let mut body = column![header, selectable_text(content, index, None, 15.0, p.text_body, p)].spacing(6.0);
     if streaming {
@@ -1344,7 +1344,12 @@ fn session_list_view(state: &State, p: Palette) -> Element<'static, Message> {
         widgets::placeholder("No sessions match your search", p)
     } else {
         let rows: Vec<Element<'static, Message>> = filtered.into_iter().map(|s| session_row(s, p)).collect();
-        scrollable(column(rows).spacing(2.0).padding([4.0, 8.0]).width(Length::Fill)).width(Length::Fill).height(Length::Fill).into()
+        scrollable(column(rows).spacing(2.0).padding([4.0, 8.0]).width(Length::Fill))
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     };
 
     column![
@@ -1408,6 +1413,8 @@ pub fn thread_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     let list: Element<'a, Message> = if rows.is_empty() { empty_state(state, p) } else {
         scrollable(column(rows).spacing(12.0).padding(16.0).width(Length::Fill))
             .id(crate::state::chat_scroll_id())
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
             .width(Length::Fill)
             .height(Length::Fill)
             // Drives `State::chat_pinned_to_bottom` — see its own doc

@@ -85,10 +85,30 @@ fn dot_sep(p: Palette) -> Element<'static, Message> {
     text("\u{b7}").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.text_muted)).into()
 }
 
-/// `Ln {line}, Col {col} · {EOL} · {encoding} · {Language}`, each segment
-/// independently clickable — only shown once a file tab is active; there's
-/// nothing to report otherwise (roadmap item 9). Encoding only ever reads
-/// "UTF-8" (`Document` has no other encoding to track — see
+/// `+{inserted} -{deleted}`, colored like `git_indicator`'s own dirty-file
+/// count — moved here from the breadcrumb strip's right side (see
+/// `breadcrumb_bar::view`'s own doc comment) so the file's modified-line
+/// count sits next to the rest of its per-file readout instead of a strip of
+/// its own. `None` with nothing to diff against, or a clean file.
+fn diff_indicator(editor: &state::EditorState, p: Palette) -> Option<Element<'static, Message>> {
+    let (inserted, deleted) = editor.diff_counts()?;
+    if inserted == 0 && deleted == 0 {
+        return None;
+    }
+    Some(
+        row![
+            text(format!("+{inserted}")).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.status_success)),
+            text(format!("-{deleted}")).font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.status_danger)),
+        ]
+        .spacing(4.0)
+        .into(),
+    )
+}
+
+/// `Ln {line}, Col {col} · [+N -N ·] {EOL} · {encoding} · {Language}`, each
+/// clickable segment independently clickable — only shown once a file tab is
+/// active; there's nothing to report otherwise (roadmap item 9). Encoding
+/// only ever reads "UTF-8" (`Document` has no other encoding to track — see
 /// `encoding_popover`'s own doc comment), but stays clickable, matching the
 /// mockup's three-part indicator and making that limitation discoverable
 /// rather than silently baked in.
@@ -97,20 +117,20 @@ fn cursor_info(state: &State, p: Palette) -> Option<Element<'static, Message>> {
     let lang_label = editor.language.map(syntax_label).unwrap_or("Plain Text");
     let eol_label = editor.document.detect_eol().label();
 
-    Some(
-        row![
-            status_segment(format!("Ln {}, Col {}", editor.cursor.line + 1, editor.cursor.col + 1), Message::OpenGoToLine, p),
-            dot_sep(p),
-            status_segment(eol_label.to_string(), Message::ToggleEolPicker, p),
-            dot_sep(p),
-            status_segment("UTF-8".to_string(), Message::ToggleEncodingInfo, p),
-            dot_sep(p),
-            status_segment(lang_label.to_string(), Message::ToggleLanguagePicker, p),
-        ]
-        .spacing(8.0)
-        .align_y(Alignment::Center)
-        .into(),
-    )
+    let mut segments: Vec<Element<'static, Message>> =
+        vec![status_segment(format!("Ln {}, Col {}", editor.cursor.line + 1, editor.cursor.col + 1), Message::OpenGoToLine, p)];
+    if let Some(diff) = diff_indicator(editor, p) {
+        segments.push(dot_sep(p));
+        segments.push(diff);
+    }
+    segments.push(dot_sep(p));
+    segments.push(status_segment(eol_label.to_string(), Message::ToggleEolPicker, p));
+    segments.push(dot_sep(p));
+    segments.push(status_segment("UTF-8".to_string(), Message::ToggleEncodingInfo, p));
+    segments.push(dot_sep(p));
+    segments.push(status_segment(lang_label.to_string(), Message::ToggleLanguagePicker, p));
+
+    Some(row(segments).spacing(8.0).align_y(Alignment::Center).into())
 }
 
 /// The status bar's git indicator (roadmap item 9) — branch name plus a
@@ -332,7 +352,12 @@ pub fn dock_panel(state: &State, p: Palette) -> Element<'static, Message> {
     } else {
         let rows: Vec<Element<'static, Message>> =
             diagnostics.iter().map(|(path, d)| diagnostic_row(path, &root, d, p)).collect();
-        scrollable(column(rows)).width(Length::Fill).height(Length::Fill).into()
+        scrollable(column(rows))
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     };
 
     let panel = container(column![header, widgets::hline(color(p.border_hairline)), list].width(Length::Fill).height(Length::Fill))

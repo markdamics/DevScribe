@@ -197,6 +197,13 @@ pub enum PaletteAction {
     /// The palette's `:N` syntax — see `filtered_palette_entries`. `N` is
     /// 1-based, matching the gutter's own line numbers.
     GoToLine(usize),
+    /// Toggles a bookmark on the active file's current cursor line — the
+    /// palette's own entry point to `EditorState::toggle_bookmark`, mirroring
+    /// `Ctrl+Shift+M`.
+    ToggleBookmarkAtCursor,
+    /// A "Bookmark: ..." entry — jumps to `line` (0-based, matching
+    /// `EditorState::bookmarks`) in the active file.
+    JumpToBookmark(usize),
     /// Opens (or closes) the secondary split pane — see `State::split_tab`.
     ToggleSplitView,
     /// Shows `path` in the split pane, opening it first if it isn't already
@@ -614,6 +621,14 @@ pub struct State {
     /// The results `filtered_palette_entries` turns into `#query` mode's
     /// palette rows — see `workspace_symbol_query`.
     pub workspace_symbol_results: Vec<lsp::SymbolEntry>,
+    /// `Ctrl`/`Cmd`+`E` quick-open (roadmap item 17) — most-recent-first,
+    /// deduped list of every file activated this session, closed tabs
+    /// included (unlike `tab_last_activated`, never pruned on close). See
+    /// `editor::touch_tab_mru`, the single place this gets updated.
+    pub recent_files: Vec<PathBuf>,
+    pub quick_open_open: bool,
+    pub quick_open_query: String,
+    pub quick_open_selected: usize,
     /// The most recent in-buffer find query (Ctrl+F/`FindState::query`),
     /// persisted per-project (`session::Session`) so reopening the project
     /// and pressing Ctrl+F again doesn't start from empty. Only ever a
@@ -654,6 +669,12 @@ pub struct State {
     /// unlike the other toggles in this struct, this one silently writes to
     /// disk, so it shouldn't turn on a new behavior nobody asked for.
     pub save_on_focus_loss: bool,
+    /// Auto-saves every dirty open file on a fixed timer (roadmap item 20's
+    /// "or on timer") — `0` (the default) disables it entirely, otherwise
+    /// the number of seconds between ticks (`Message::AutosaveTick`, gated
+    /// in `subscription()` on this being nonzero). Independent of
+    /// `save_on_focus_loss`: either, both, or neither can be on.
+    pub autosave_interval_secs: u32,
     pub editor_font_size: f32,
     /// Multiplies every chrome text size (sidebar, tabs, status bar, title
     /// bar, palette, settings, toasts). Independent of `editor_font_size` —
@@ -937,12 +958,17 @@ impl Default for State {
             palette_selected: 0,
             workspace_symbol_query: String::new(),
             workspace_symbol_results: Vec::new(),
+            recent_files: Vec::new(),
+            quick_open_open: false,
+            quick_open_query: String::new(),
+            quick_open_selected: 0,
             last_find_query: String::new(),
             settings_open: false,
             settings_category: SettingsCategory::default(),
             git_status_in_tree: settings.git_status_in_tree,
             show_hidden_files: settings.show_hidden_files,
             save_on_focus_loss: settings.save_on_focus_loss,
+            autosave_interval_secs: settings.autosave_interval_secs,
             density: settings.density,
             problem_lens_enabled: settings.problem_lens_enabled,
             diff_ignore_whitespace: false,
@@ -1116,11 +1142,13 @@ pub enum Message {
     /// Expands/collapses a `permission_card`'s truncated diff preview — see
     /// `ChatThread::expanded_tools`.
     ChatToggleToolExpanded(String),
-    /// Copies a single message's raw text (an operator prompt or a settled
-    /// assistant reply — see `operator_row`/`assistant_row`'s own "Copy"
-    /// buttons) to the system clipboard. Same `push_flash` confirmation as
-    /// `CopyPath`.
-    ChatCopyText(String),
+    /// Copies raw text to the system clipboard — a chat message (an operator
+    /// prompt or a settled assistant reply, see `operator_row`/`assistant_row`'s
+    /// own "Copy" buttons) or a previewed Markdown document's raw source
+    /// (`markdown_view`'s "Copy" badge, standing in for the text selection
+    /// iced's `rich_text` preview renderer doesn't support). Same
+    /// `push_flash` confirmation as `CopyPath`.
+    CopyText(String),
     /// "Edit" on a past operator message — reloads its text into the
     /// composer, ready to tweak and resend (see the handler's own doc
     /// comment on why this can't rewrite the transcript itself).
@@ -1236,6 +1264,11 @@ pub enum Message {
     /// shares a handler with.
     ViewWorkingTreeDiff,
     SelectFile(PathBuf),
+    /// A sidebar click on an image file (`fs_tree::is_image`) — handed to
+    /// the OS's default image viewer instead of `SelectFile`'s "open as a
+    /// tab," since there's nothing useful `Document::open` could show for
+    /// binary image formats anyway. See `sidebar::open_file_externally`.
+    OpenImageExternally(PathBuf),
     /// Every field below tagged `pane: Pane` is published by an
     /// `EditorCanvas` instance (`shell.rs`'s `code_area`, one per pane) —
     /// see `Pane`'s own doc comment for why the tag exists at all.
@@ -1269,6 +1302,14 @@ pub enum Message {
     EditorSelectLine { line: usize, pane: Pane },
     /// `Ctrl+A`.
     EditorSelectAll { pane: Pane },
+    /// `Ctrl+D` — see `EditorState::select_next_occurrence`.
+    EditorSelectNextOccurrence { pane: Pane },
+    /// Alt-drag — see `EditorState::set_column_selection`. `anchor_*` is
+    /// where the drag started, `to_*` is the current drag position; sent on
+    /// every `CursorMoved` while the drag continues (`EditorCanvas::update`).
+    EditorColumnSelect { anchor_line: usize, anchor_col: usize, to_line: usize, to_col: usize, pane: Pane },
+    /// `Ctrl+Shift+M` — see `EditorState::toggle_bookmark`.
+    EditorToggleBookmark { pane: Pane },
     /// `Ctrl+Z`.
     EditorUndo { pane: Pane },
     /// `Ctrl+Shift+Z` / `Ctrl+Y`.
@@ -1293,6 +1334,11 @@ pub enum Message {
         pane: Pane,
         viewport_width: f32,
     },
+    /// Clicked or dragged on `ui::overview_ruler` (roadmap item 11) —
+    /// `offset` is a ready-to-use vertical `AbsoluteOffset`, already
+    /// resolved from the click's fraction down the strip by
+    /// `OverviewRuler::offset_for_fraction`.
+    EditorScrollTo { pane: Pane, offset: f32 },
     CaretTick,
     /// Fires only while an edit is pending; runs the deferred per-edit work
     /// once the buffer has been still for `EDIT_SETTLE`.
@@ -1346,6 +1392,18 @@ pub enum Message {
     PaletteMove(i32),
     PaletteExecute,
     PaletteRun(PaletteAction),
+    /// `Ctrl`/`Cmd`+`E` — the recent-files quick-open overlay (roadmap item
+    /// 17), distinct from the command palette: scoped to `State::
+    /// recent_files` (session file history, closed tabs included) rather
+    /// than every command/theme/project file the palette lists.
+    ToggleQuickOpen,
+    CloseQuickOpen,
+    QuickOpenQueryChanged(String),
+    QuickOpenExecute,
+    /// A direct click on a result row — opens `path` regardless of
+    /// `quick_open_selected` (a click doesn't necessarily land on the
+    /// keyboard-highlighted row).
+    QuickOpenOpen(PathBuf),
     ToggleSettings,
     CloseSettings,
     SetDensity(Density),
@@ -1354,6 +1412,14 @@ pub enum Message {
     ToggleGitStatusInTree,
     ToggleShowHiddenFiles,
     ToggleSaveOnFocusLoss,
+    /// Cycles `State::autosave_interval_secs` through `AUTOSAVE_PRESETS`
+    /// (roadmap item 20's "or on timer") — settings-panel stepper only, no
+    /// keybinding.
+    SetAutosaveInterval(u32),
+    /// A recurring tick (see `subscription`, gated on `autosave_interval_secs`
+    /// being nonzero) that saves every dirty open file, same action
+    /// `WindowUnfocused` takes for `save_on_focus_loss`.
+    AutosaveTick,
     /// Turns the `rust-analyzer` subscription on/off (see `subscription`).
     /// Switching off drops the running worker (killing its child process,
     /// `kill_on_drop`) and clears every open editor's diagnostics; switching
@@ -2014,7 +2080,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.chat.expanded_tools.insert(id);
             }
         }
-        Message::ChatCopyText(text) => {
+        Message::CopyText(text) => {
             push_flash(state, "COPIED TO CLIPBOARD");
             return iced::clipboard::write(text);
         }
@@ -2202,6 +2268,12 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
         Message::OpenDiffFor(path) => open_or_focus_diff(state, path),
         Message::ViewWorkingTreeDiff => view_working_tree_diff(state),
         Message::SelectFile(path) => open_or_focus_file(state, path),
+        Message::OpenImageExternally(path) => {
+            if let Err(err) = sidebar::open_file_externally(&path) {
+                crate::logging::error(format!("failed to open {} externally: {err}", path.display()));
+                push_toast(state, ToastKind::Warning, "Couldn't open the image.");
+            }
+        }
         Message::MarkdownToggleTextMode { pane } => {
             if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
@@ -2369,6 +2441,13 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             }
         }
         Message::EditorMove { dir, extend, pane } => {
+            // Pin the caret visible for this move rather than leaving it to
+            // whatever phase the independent ~530ms `CaretTick` blink
+            // happens to be in — held/repeated arrow keys otherwise have a
+            // decent chance of moving the cursor while it's mid-blink and
+            // invisible, which reads as the caret lagging behind the actual
+            // position instead of tracking it immediately.
+            state.caret_visible = true;
             if let Some(path) = pane_file_path(state, pane)
                 && let Some(editor) = find_editor_mut(state, &path)
             {
@@ -2397,6 +2476,10 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     }
                 }
                 editor.close_snippet();
+                // Arrow-key navigation always collapses multi-cursor mode
+                // back to one caret — same "any ordinary navigation ends it"
+                // rule `EditorClick` below follows.
+                editor.extra_cursors.clear();
                 editor.move_cursor(dir, extend);
             }
             return scroll_cursor_into_view(state, pane);
@@ -2408,7 +2491,42 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.close_completions();
                 editor.close_snippet();
                 editor.clear_hover();
+                // A plain click/drag starts a fresh single-cursor selection
+                // — multi-cursor mode (`Ctrl+D`, column select) ends the
+                // moment the mouse does something that isn't itself
+                // building on it (`EditorColumnSelect` is the one mouse
+                // gesture that doesn't route through here mid-drag).
+                editor.extra_cursors.clear();
                 editor.click(line, col, extend);
+            }
+        }
+        Message::EditorSelectNextOccurrence { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.close_completions();
+                editor.close_snippet();
+                editor.clear_hover();
+                editor.select_next_occurrence();
+            }
+            return scroll_cursor_into_view(state, pane);
+        }
+        Message::EditorColumnSelect { anchor_line, anchor_col, to_line, to_col, pane } => {
+            if let Some(path) = pane_file_path(state, pane)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.close_completions();
+                editor.close_snippet();
+                editor.clear_hover();
+                editor.set_column_selection(anchor_line, anchor_col, to_line, to_col);
+            }
+        }
+        Message::EditorToggleBookmark { pane } => {
+            if let Some(path) = pane_file_path(state, pane)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                let line = editor.cursor.line;
+                editor.toggle_bookmark(line);
             }
         }
         Message::JumpToFirstOccurrence { line, col, pane } => {
@@ -2428,6 +2546,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 editor.close_completions();
                 editor.close_snippet();
+                editor.extra_cursors.clear();
                 editor.select_word_at(line, col);
             }
         }
@@ -2437,6 +2556,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 editor.close_completions();
                 editor.close_snippet();
+                editor.extra_cursors.clear();
                 editor.select_line_at(line);
             }
         }
@@ -2446,6 +2566,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 editor.close_completions();
                 editor.close_snippet();
+                editor.extra_cursors.clear();
                 editor.select_all();
             }
         }
@@ -2516,6 +2637,23 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 editor.viewport_height = viewport_height;
                 editor.scroll_offset_x = offset_x;
                 editor.viewport_width = viewport_width;
+            }
+        }
+        Message::EditorScrollTo { pane, offset } => {
+            if let Some(path) = pane_file_path(state, pane)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                editor.scroll_offset = offset;
+                let offset_x = editor.scroll_offset_x;
+                let scroll_id = match pane {
+                    Pane::Primary => editor_scroll_id(),
+                    Pane::Split => split_editor_scroll_id(),
+                    Pane::Solo(id) => solo_editor_scroll_id(id),
+                };
+                return iced::widget::operation::scroll_to(
+                    scroll_id,
+                    iced::widget::scrollable::AbsoluteOffset { x: offset_x, y: offset },
+                );
             }
         }
         Message::CaretTick => state.caret_visible = !state.caret_visible,
@@ -2602,7 +2740,28 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                     }
                 }
             }
-            LspEvent::Definition { locations, .. } => {
+            LspEvent::Definition { uri, line, character, locations } => {
+                // A reply riding this exact shape can be either an explicit
+                // F12/"Go to Definition" or the passive hover-driven "quick
+                // peek" (roadmap item 12) — see `HoverDebounceTick`'s and
+                // `Message::GoToDefinition`'s own comments on why they
+                // share it. `peek_requested_at` tells the two apart by
+                // position; only a genuine peek reply is routed to
+                // `apply_peek_response` instead of navigated to.
+                let is_peek = uri
+                    .to_file_path()
+                    .ok()
+                    .and_then(|path| find_editor(state, &path))
+                    .is_some_and(|editor| editor.peek_requested_at(line, character));
+                if is_peek {
+                    let preview = locations.first().and_then(|loc| build_peek_preview(state, loc));
+                    if let Some(path) = uri.to_file_path().ok()
+                        && let Some(editor) = find_editor_mut(state, &path)
+                    {
+                        editor.apply_peek_response(line, character, preview);
+                    }
+                    return iced::Task::none();
+                }
                 return apply_locations(state, locations, "Definition");
             }
             LspEvent::References { locations, .. } => {
@@ -2796,10 +2955,36 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.palette_query.clear();
                 state.palette_selected = 0;
                 state.settings_open = false;
+                state.quick_open_open = false;
                 return iced::widget::operation::focus(palette_query_id());
             }
         }
         Message::ClosePalette => state.palette_open = false,
+        Message::ToggleQuickOpen => {
+            state.quick_open_open = !state.quick_open_open;
+            if state.quick_open_open {
+                state.quick_open_query.clear();
+                state.quick_open_selected = 0;
+                state.palette_open = false;
+                state.settings_open = false;
+                return iced::widget::operation::focus(quick_open_query_id());
+            }
+        }
+        Message::CloseQuickOpen => state.quick_open_open = false,
+        Message::QuickOpenQueryChanged(query) => {
+            state.quick_open_query = query;
+            state.quick_open_selected = 0;
+        }
+        Message::QuickOpenExecute => {
+            state.quick_open_open = false;
+            if let Some(path) = filtered_quick_open_entries(state).get(state.quick_open_selected).cloned() {
+                open_or_focus_file(state, path);
+            }
+        }
+        Message::QuickOpenOpen(path) => {
+            state.quick_open_open = false;
+            open_or_focus_file(state, path);
+        }
         Message::OpenGoToLine => {
             if active_file_path(state).is_some() {
                 state.palette_open = true;
@@ -2828,13 +3013,27 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
             }
         }
+        // Also drives quick-open's arrow-key navigation: the two overlays
+        // are mutually exclusive (see `ToggleQuickOpen`/`TogglePalette`), and
+        // `global_keys` has no `State` access to pick the right message
+        // itself, so this checks which one is actually open instead of
+        // introducing a parallel `QuickOpenMove`.
         Message::PaletteMove(delta) => {
-            let len = filtered_palette_entries(state).len();
-            state.palette_selected = if len == 0 {
-                0
+            if state.quick_open_open {
+                let len = filtered_quick_open_entries(state).len();
+                state.quick_open_selected = if len == 0 {
+                    0
+                } else {
+                    ((state.quick_open_selected as i32 + delta).rem_euclid(len as i32)) as usize
+                };
             } else {
-                ((state.palette_selected as i32 + delta).rem_euclid(len as i32)) as usize
-            };
+                let len = filtered_palette_entries(state).len();
+                state.palette_selected = if len == 0 {
+                    0
+                } else {
+                    ((state.palette_selected as i32 + delta).rem_euclid(len as i32)) as usize
+                };
+            }
         }
         Message::PaletteExecute => {
             state.palette_open = false;
@@ -2850,6 +3049,7 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             state.settings_open = !state.settings_open;
             if state.settings_open {
                 state.palette_open = false;
+                state.quick_open_open = false;
             }
             state.theme_preview = None;
         }
@@ -2881,6 +3081,11 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             state.save_on_focus_loss = !state.save_on_focus_loss;
             persist_settings(state);
         }
+        Message::SetAutosaveInterval(secs) => {
+            state.autosave_interval_secs = secs;
+            persist_settings(state);
+        }
+        Message::AutosaveTick => save_all_dirty_files(state),
         Message::ToggleLspEnabled => {
             state.lsp_enabled = !state.lsp_enabled;
             persist_settings(state);
@@ -3352,6 +3557,17 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 }
                 return iced::Task::none();
             }
+            let multi_cursor_active = active_file_path(state)
+                .and_then(|ref path| find_editor(state, path))
+                .is_some_and(|e| !e.extra_cursors.is_empty());
+            if multi_cursor_active {
+                if let Some(path) = active_file_path(state)
+                    && let Some(editor) = find_editor_mut(state, &path)
+                {
+                    editor.extra_cursors.clear();
+                }
+                return iced::Task::none();
+            }
             let find_open = active_file_path(state)
                 .and_then(|path| find_editor(state, &path))
                 .is_some_and(|editor| editor.find.is_some());
@@ -3387,6 +3603,8 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 state.projects_open = false;
             } else if state.palette_open {
                 state.palette_open = false;
+            } else if state.quick_open_open {
+                state.quick_open_open = false;
             } else if state.settings_open {
                 state.settings_open = false;
             }
@@ -3484,13 +3702,23 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
                 let utf16_char = char_col_to_utf16_col(&line_text, pos.col);
                 if let Some(sender) = state.lsp_sender.as_mut() {
                     let _ = sender.try_send(LspCommand::Hover {
-                        uri,
+                        uri: uri.clone(),
                         line: pos.line as u32,
                         character: utf16_char,
                     });
+                    // Piggybacks the same dwell/position as the `Hover`
+                    // request above to drive the hover-popup's "quick peek"
+                    // (roadmap item 12) — resolves silently, and only shows
+                    // anything (see `apply_peek_response`) once the reply
+                    // lands. `Message::GoToDefinition`'s own explicit F12
+                    // request rides the identical `LspCommand`/`LspEvent`
+                    // shape; `peek_requested_at` is how the `Definition`
+                    // handler tells the two apart.
+                    let _ = sender.try_send(LspCommand::GotoDefinition { uri, line: pos.line as u32, character: utf16_char });
                 }
                 if let Some(editor) = find_editor_mut(state, &path) {
                     editor.mark_hover_requested(pos);
+                    editor.mark_peek_requested(pos);
                 }
             }
         }
@@ -3501,6 +3729,14 @@ fn update_impl(state: &mut State, message: Message) -> iced::Task<Message> {
             {
                 let line_text = find_editor(state, &path).map(|e| e.document.line_text(line)).unwrap_or_default();
                 let character = char_col_to_utf16_col(&line_text, col);
+                // Clears any in-flight peek request first — an explicit
+                // "Go to Definition" always wins a race against the passive
+                // hover-driven peek riding the same request/event shape
+                // (see `HoverDebounceTick` above), so its reply is never
+                // mistaken for a peek and swallowed instead of navigated to.
+                if let Some(editor) = find_editor_mut(state, &path) {
+                    editor.clear_peek();
+                }
                 if let Some(sender) = state.lsp_sender.as_mut() {
                     let _ = sender.try_send(LspCommand::GotoDefinition { uri, line: line as u32, character });
                 }
@@ -3656,6 +3892,17 @@ fn run_palette_action(state: &mut State, action: PaletteAction) -> iced::Task<Me
         PaletteAction::SaveFile => return save_current_file(state),
         PaletteAction::NewUntitledFile => begin_untitled_buffer(state),
         PaletteAction::GoToLine(line) => return goto_line(state, line),
+        PaletteAction::ToggleBookmarkAtCursor => {
+            if let Some(path) = active_file_path(state)
+                && let Some(editor) = find_editor_mut(state, &path)
+            {
+                let line = editor.cursor.line;
+                editor.toggle_bookmark(line);
+            }
+        }
+        // `+ 1`: `bookmarks` stores 0-based lines, `goto_line` takes 1-based
+        // (matching the palette's own `:N` "Go to line" syntax).
+        PaletteAction::JumpToBookmark(line) => return goto_line(state, line + 1),
         PaletteAction::ToggleSplitView => toggle_split_view(state),
         PaletteAction::OpenFileInSplit(path) => open_or_focus_file_in_split(state, path),
         PaletteAction::OpenInNewWindow(path) => return open_in_new_window(state, path),
@@ -3689,6 +3936,7 @@ fn persist_settings(state: &State) {
         show_hidden_files: state.show_hidden_files,
         problem_lens_enabled: state.problem_lens_enabled,
         save_on_focus_loss: state.save_on_focus_loss,
+        autosave_interval_secs: state.autosave_interval_secs,
         lsp_enabled: state.lsp_enabled,
         copilot_inline_enabled: state.copilot_inline_enabled,
         chat_mode: state.chat_mode,
@@ -3883,6 +4131,11 @@ pub fn palette_query_id() -> iced::widget::Id {
     iced::widget::Id::new("command-palette-query")
 }
 
+/// Same pattern for the quick-open overlay's own search box.
+pub fn quick_open_query_id() -> iced::widget::Id {
+    iced::widget::Id::new("quick-open-query")
+}
+
 /// A stable id for the "Rename Symbol" prompt's text input, so `update()`
 /// can focus it the moment `rename_prompt` opens — same pattern as
 /// `palette_query_id`/`draft_input_id`.
@@ -3962,6 +4215,23 @@ fn all_palette_entries(state: &State) -> Vec<PaletteEntry> {
             label: format!("View Diff: {name} \u{2194} HEAD"),
             action: PaletteAction::ViewDiffOfActiveFile,
         });
+        if let Some(editor) = find_editor(state, &path) {
+            entries.push(PaletteEntry {
+                label: "Toggle Bookmark at Cursor Line".to_string(),
+                action: PaletteAction::ToggleBookmarkAtCursor,
+            });
+            // One entry per bookmark in the active file — `editor.bookmarks`
+            // is a `BTreeSet`, so these already come out in ascending line
+            // order. Not persisted, and not listed across other open tabs:
+            // see `EditorState::bookmarks`'s own doc comment for why.
+            for &line in &editor.bookmarks {
+                let preview = editor.document.line_text_capped(line, 60);
+                entries.push(PaletteEntry {
+                    label: format!("Bookmark: {name}:{} \u{2014} {}", line + 1, preview.trim()),
+                    action: PaletteAction::JumpToBookmark(line),
+                });
+            }
+        }
     }
     // Surfaces whenever the query happens to contain "diff" (plain substring
     // filtering in `filtered_palette_entries` — no special-casing needed
@@ -4077,6 +4347,32 @@ pub fn filtered_palette_entries(state: &State) -> Vec<PaletteEntry> {
         .collect()
 }
 
+/// `Ctrl`/`Cmd`+`E` quick-open's result list, most-recent-first for an empty
+/// query (real fuzzy scoring — `fuzzy::score`, the same matcher the
+/// completion popup filters with — once the user types, unlike the command
+/// palette's plain substring `contains` above, since scoring plus a stable
+/// sort naturally falls back to `recent_files`' own MRU order on a tie —
+/// empty query scores everything `0`, so nothing reorders until there's
+/// something to rank). Paths are labeled relative to `state.root`, same as
+/// `all_palette_entries`'s "Open: " entries.
+pub fn filtered_quick_open_entries(state: &State) -> Vec<PathBuf> {
+    let query = state.quick_open_query.trim();
+    let mut scored: Vec<(i32, usize, &PathBuf)> = state
+        .recent_files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, path)| {
+            let label = path.strip_prefix(&state.root).unwrap_or(path).display().to_string();
+            crate::fuzzy::score(query, &label).map(|score| (score, i, path))
+        })
+        .collect();
+    // Highest score first; ties keep `recent_files`' own MRU order (its
+    // index ascending) rather than whatever order `sort_by`'s comparator
+    // happens to leave equal-score entries in.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, path)| path.clone()).take(MAX_PALETTE_RESULTS).collect()
+}
+
 /// Keyed on `root` alone, mirroring `lsp_worker`'s keying — switching
 /// projects tears down and respawns the watcher on the new root.
 fn file_watcher(root: &PathBuf) -> impl iced::futures::Stream<Item = Vec<WatchEvent>> + use<> {
@@ -4144,8 +4440,12 @@ fn global_keys(event: keyboard::Event) -> Message {
                     DraftKind::NewFile
                 });
             }
-            if modifiers.shift() && c.eq_ignore_ascii_case("e") {
-                return Message::RevealActiveInTree;
+            if c.eq_ignore_ascii_case("e") {
+                return if modifiers.shift() {
+                    Message::RevealActiveInTree
+                } else {
+                    Message::ToggleQuickOpen
+                };
             }
             if modifiers.shift() && c.eq_ignore_ascii_case("t") {
                 return Message::ReopenClosedTab;
@@ -4238,6 +4538,12 @@ pub fn subscription(state: &State) -> iced::Subscription<Message> {
         iced::keyboard::listen().map(global_keys),
         iced::window::events().map(window_events),
     ];
+    // Off by default (`autosave_interval_secs == 0`) — see the field's own
+    // doc comment. No project-open gate needed: `Message::AutosaveTick`'s
+    // handler (`save_all_dirty_files`) is already a no-op with nothing dirty.
+    if state.autosave_interval_secs > 0 {
+        subs.push(iced::time::every(Duration::from_secs(state.autosave_interval_secs as u64)).map(|_| Message::AutosaveTick));
+    }
     // No LSP worker while no project is open or LSP is disabled. The key
     // includes `lsp_restart_token` so incrementing it (after a successful
     // auto-install) forces iced to respawn the worker — see `lsp_worker`.

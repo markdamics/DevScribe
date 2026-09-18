@@ -39,6 +39,10 @@ pub struct Settings {
     pub show_hidden_files: bool,
     pub problem_lens_enabled: bool,
     pub save_on_focus_loss: bool,
+    /// `0` disables the timer entirely (the default); otherwise the number
+    /// of seconds between auto-saves of every dirty open file — see
+    /// `State::autosave_interval_secs`'s own doc comment.
+    pub autosave_interval_secs: u32,
     pub lsp_enabled: bool,
     pub copilot_inline_enabled: bool,
     pub chat_mode: ChatMode,
@@ -71,6 +75,7 @@ impl Default for Settings {
             show_hidden_files: false,
             problem_lens_enabled: true,
             save_on_focus_loss: false,
+            autosave_interval_secs: 0,
             lsp_enabled: true,
             // Off by default, unlike `lsp_enabled`: inline completions need
             // an external binary plus a signed-in GitHub Copilot account, so
@@ -128,6 +133,8 @@ struct SettingsFile {
     problem_lens_enabled: bool,
     #[serde(default)]
     save_on_focus_loss: bool,
+    #[serde(default)]
+    autosave_interval_secs: u32,
     #[serde(default = "default_true")]
     lsp_enabled: bool,
     #[serde(default)]
@@ -262,6 +269,7 @@ fn load_from(path: &Path) -> Option<Settings> {
         show_hidden_files: file.show_hidden_files,
         problem_lens_enabled: file.problem_lens_enabled,
         save_on_focus_loss: file.save_on_focus_loss,
+        autosave_interval_secs: file.autosave_interval_secs,
         lsp_enabled: file.lsp_enabled,
         copilot_inline_enabled: file.copilot_inline_enabled,
         chat_mode: chat_mode_from_key(&file.chat_mode).unwrap_or(defaults.chat_mode),
@@ -303,6 +311,7 @@ fn save_to(path: &Path, settings: &Settings) {
         show_hidden_files: settings.show_hidden_files,
         problem_lens_enabled: settings.problem_lens_enabled,
         save_on_focus_loss: settings.save_on_focus_loss,
+        autosave_interval_secs: settings.autosave_interval_secs,
         lsp_enabled: settings.lsp_enabled,
         copilot_inline_enabled: settings.copilot_inline_enabled,
         chat_mode: chat_mode_key(settings.chat_mode).to_string(),

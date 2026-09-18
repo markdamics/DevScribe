@@ -500,6 +500,15 @@ pub fn open_project_in_file_manager(dir: &Path) -> Result<(), opener::OpenError>
     opener::open(dir)
 }
 
+/// Opens `path` (a single file, e.g. an image the sidebar tree flagged via
+/// `fs_tree::is_image`) in the OS's default application for it — same
+/// `opener::open` call as `open_project_in_file_manager`, just a file
+/// instead of a directory, so it lands in an image viewer rather than a
+/// file manager.
+pub fn open_file_externally(path: &Path) -> Result<(), opener::OpenError> {
+    opener::open(path)
+}
+
 /// Computes the sidebar's "CHANGES" panel contents: every file `repo`
 /// reports as differing from `HEAD`, with insertion/deletion counts from
 /// `devscribe_core::diff::diff_lines` run against `HEAD`'s blob and the

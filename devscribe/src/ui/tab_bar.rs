@@ -12,11 +12,20 @@ use crate::state::{self, EditorState, Message, OpenTab, State, TabKey};
 use crate::ui::search_icon::SearchIcon;
 use crate::widgets;
 
+/// Transparent rather than `border_hairline` when inactive — an active tab
+/// is the only one that gets an underline at all (matching the reference
+/// editor mockup, where unselected tabs sit flush with no dividing line),
+/// so the color/active split doesn't compete with a second, always-on line
+/// underneath every tab regardless of state.
 fn underline_color(active: bool, p: Palette) -> Color {
-    color(if active { p.accent_solid } else { p.border_hairline })
+    if active {
+        color(p.accent_solid)
+    } else {
+        Color::TRANSPARENT
+    }
 }
 
-/// Wraps `content` with a 1px active/inactive indicator along its bottom
+/// Wraps `content` with a 3px active/inactive indicator along its bottom
 /// edge, sized to `content`'s own natural width rather than stretching to
 /// fill the tab bar.
 ///
@@ -26,14 +35,16 @@ fn underline_color(active: bool, p: Palette) -> Color {
 /// this tab as the last/only item in the bar, that stacked-underline version
 /// stretched all the way to the far edge instead of tracking the tab. This
 /// version paints the indicator as the *container's own background*, showing
-/// through only the 1px of bottom padding `content` doesn't cover — so the
+/// through only the 3px of bottom padding `content` doesn't cover — so the
 /// container's width is simply `content`'s width, no `Fill` involved.
+const UNDERLINE_THICKNESS: f32 = 3.0;
+
 fn with_underline(content: Element<'static, Message>, active: bool, p: Palette) -> Element<'static, Message> {
     container(content)
         .padding(Padding {
             top: 0.0,
             right: 0.0,
-            bottom: 1.0,
+            bottom: UNDERLINE_THICKNESS,
             left: 0.0,
         })
         .style(move |_theme| container::Style {
@@ -309,30 +320,8 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     }
 
     let tabs = scrollable(row(tab_elements).height(Length::Fixed(bar_h)))
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::default().width(4.0).margin(0.0).scroller_width(4.0),
-        ))
-        .style(move |theme, status| {
-            let dragged = matches!(status, scrollable::Status::Dragged { .. });
-            let hovered = matches!(status, scrollable::Status::Hovered { .. }) || dragged;
-            let scroller_color = if dragged {
-                color(p.text_muted)
-            } else if hovered {
-                color(p.text_muted)
-            } else {
-                color(p.border_hairline)
-            };
-            let rail = scrollable::Rail {
-                background: None,
-                border: Border::default(),
-                scroller: scrollable::Scroller { background: scroller_color.into(), border: Border::default() },
-            };
-            scrollable::Style {
-                horizontal_rail: rail,
-                vertical_rail: rail,
-                ..scrollable::default(theme, status)
-            }
-        })
+        .direction(scrollable::Direction::Horizontal(widgets::thin_scrollbar()))
+        .style(widgets::scrollbar_style(p))
         .width(Length::Fill)
         .height(Length::Fixed(bar_h));
 
@@ -462,8 +451,10 @@ pub fn overflow_menu(state: &State, p: Palette) -> Option<Element<'static, Messa
 
 /// How long the mouse has to rest on a tab before its preview appears — long
 /// enough that sweeping across the bar to reach a different tab doesn't
-/// flash a preview for every tab passed over.
-pub const TAB_PREVIEW_DWELL: Duration = Duration::from_millis(350);
+/// flash a preview for every tab passed over, but still within the same
+/// 200-300ms responsiveness band every other hover popup in the app uses
+/// (see `state::editor::HOVER_DWELL`, the LSP hover popup).
+pub const TAB_PREVIEW_DWELL: Duration = Duration::from_millis(250);
 
 /// Roadmap item 2: a small floating card previewing whichever tab the mouse
 /// has rested on for `TAB_PREVIEW_DWELL` — the first few lines for a file
@@ -610,7 +601,10 @@ pub fn switcher_view(state: &State, p: Palette) -> Option<Element<'static, Messa
             bottom: 6.0,
             left: 14.0,
         }),
-        scrollable(column(rows)).height(Length::Shrink),
+        scrollable(column(rows))
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
+            .height(Length::Shrink),
     ])
     .width(Length::Fixed(360.0))
     .style(move |_theme| container::Style {

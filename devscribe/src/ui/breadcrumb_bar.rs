@@ -1,15 +1,14 @@
-//! The breadcrumb strip: `DevScribe.dc.html`'s `isCode`-only bar under the
-//! tab bar, showing the enclosing scope stack at the cursor
-//! (`ledger::engine › settle_batch › for (id, amount) in delta`) plus a
-//! current-file-scoped error/warning/position/language readout on the
-//! right. Distinct from `status_bar.rs`'s bottom Ln/Col/language readout,
-//! which is workspace-wide; this one is specific to the active file, same
-//! split the mockup itself draws (`1 error`/`1 warning` here vs `2
-//! problems` there).
+//! The breadcrumb module: `title_crumbs` renders the enclosing scope stack
+//! at the cursor (`ledger::engine › settle_batch › for (id, amount) in
+//! delta`) inline in the title bar, right after the DevScribe wordmark (see
+//! `title_bar::view`). `toggle_view_button` is the other survivor of the old
+//! under-tab-bar strip (removed entirely — its diagnostics/Ln,Col/language
+//! readout duplicated `status_bar.rs`'s own) — the JSON/Markdown "switch
+//! back to the rendered view" badge, now floated over the editor pane
+//! itself (see `shell.rs::view_mode_toggle`).
 //!
 //! Crumbs come from `EditorState::breadcrumbs()` — see
 //! `devscribe_core::outline` for how the scope stack is actually found.
-use devscribe_core::lsp::DiagnosticSeverity;
 use devscribe_core::outline::{self, Crumb, CrumbKind};
 use devscribe_core::theme::Palette;
 use iced::font::Weight;
@@ -19,20 +18,15 @@ use std::time::Duration;
 
 use crate::color::color;
 use crate::fonts;
-use crate::state::{self, EditorState, Message, Pane, State};
+use crate::state::{self, EditorState, Message, State};
 use crate::widgets;
-
-const HEIGHT: f32 = 30.0;
-
-/// Same value `completions.rs`/`hover_popup.rs` use — every cursor/UI-
-/// anchored popup in this app lines up off the same header height.
-const HEADER_HEIGHT: f32 = 78.0;
 
 /// How long the mouse has to rest on a breadcrumb segment before its hover
 /// tooltip (`hover_view`) appears — same value `tab_bar::TAB_PREVIEW_DWELL`
 /// uses for the same kind of "don't flash a tooltip while just passing
-/// through" reasoning.
-pub const HOVER_DWELL: Duration = Duration::from_millis(350);
+/// through" reasoning, and same 200-300ms responsiveness band
+/// `state::editor::HOVER_DWELL` (the LSP hover popup) already sits in.
+pub const HOVER_DWELL: Duration = Duration::from_millis(250);
 
 /// A glyph per `CrumbKind`, standing in for the mockup's `box` /
 /// `square-function` / `repeat` icon set — plain monospace characters,
@@ -77,10 +71,11 @@ fn crumb_view(index: usize, crumb: &Crumb, emphasized: bool, p: Palette) -> Elem
         .into()
 }
 
-/// The strip's "switch back to the other view" button — JSON's "Tree View"
-/// and Markdown's "Preview", both shown only while that file's `_text_mode`
-/// flag has flipped it over to the plain `code_area` (see `shell.rs`).
-fn toggle_view_button(label: &'static str, on_press: Message, p: Palette) -> Element<'static, Message> {
+/// The "switch back to the other view" button — JSON's "Tree View" and
+/// Markdown's "Preview", both shown only while that file's `_text_mode`
+/// flag has flipped it over to the plain `code_area`, as a small floating
+/// badge over the editor pane (see `shell.rs::view_mode_toggle`).
+pub fn toggle_view_button(label: &'static str, on_press: Message, p: Palette) -> Element<'static, Message> {
     button(
         text(label)
             .font(fonts::mono(Weight::Medium))
@@ -116,13 +111,17 @@ fn chevron(p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-/// `true` for a language `outline` never wires a landmark table for
-/// (JSON/TOML/YAML/XML/INI) — those still get the strip (for its right-side
-/// Ln/Col/language readout), just with an empty crumb trail, same as the
-/// mockup showing the strip on every code tab regardless of how deep the
-/// cursor happens to sit.
-pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
+/// Just the crumb trail (no chrome, no right-side diagnostics/Ln/Col) — for
+/// embedding inline in the title bar next to the DevScribe wordmark (see
+/// `title_bar::view`). `None` with no crumbs to show, same as `view` showing
+/// an empty trail in that case, except here there's no strip left to anchor
+/// a lone right-side readout to, so the title bar just omits the separator
+/// and trail entirely.
+pub fn title_crumbs(editor: &EditorState, p: Palette) -> Option<Element<'static, Message>> {
     let crumbs = editor.breadcrumbs();
+    if crumbs.is_empty() {
+        return None;
+    }
     let emphasized = outline::emphasized_index(&crumbs);
 
     let mut path = Vec::with_capacity(crumbs.len() * 2);
@@ -133,97 +132,18 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
         path.push(crumb_view(i, crumb, emphasized == Some(i), p));
     }
 
-    let errors = editor.diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::ERROR).count();
-    let warnings = editor.diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::WARNING).count();
-    let lang_label = editor.language.map(|l| l.label()).unwrap_or("Plain Text");
-    let diff_counts = editor.diff_counts();
-
-    let mut right = row![].spacing(12.0).align_y(Alignment::Center);
-    if editor.json.is_some() && editor.json_text_mode {
-        right = right.push(toggle_view_button("Tree View", Message::JsonToggleTextMode, p));
-    }
-    if editor.markdown.is_some() && editor.markdown_text_mode {
-        right = right.push(toggle_view_button(
-            "Preview",
-            Message::MarkdownToggleTextMode { pane: Pane::Primary },
-            p,
-        ));
-    }
-    if let Some((inserted, deleted)) = diff_counts {
-        if inserted > 0 || deleted > 0 {
-            right = right.push(
-                row![
-                    text(format!("+{inserted}"))
-                        .font(fonts::mono(Weight::Medium))
-                        .size(crate::text_scale::px(11.0))
-                        .color(color(p.status_success)),
-                    text(format!("-{deleted}"))
-                        .font(fonts::mono(Weight::Medium))
-                        .size(crate::text_scale::px(11.0))
-                        .color(color(p.status_danger)),
-                ]
-                .spacing(6.0),
-            );
-        }
-    }
-    if errors > 0 {
-        right = right.push(
-            text(format!("{errors} error{}", if errors == 1 { "" } else { "s" }))
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(11.0))
-                .color(color(p.status_danger)),
-        );
-    }
-    if warnings > 0 {
-        right = right.push(
-            text(format!("{warnings} warning{}", if warnings == 1 { "" } else { "s" }))
-                .font(fonts::mono(Weight::Medium))
-                .size(crate::text_scale::px(11.0))
-                .color(color(p.status_warning)),
-        );
-    }
-    right = right.push(
-        text(format!("Ln {}, Col {}", editor.cursor.line + 1, editor.cursor.col + 1))
-            .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
-            .color(color(p.text_muted)),
-    );
-    right = right.push(
-        text(lang_label)
-            .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(11.0))
-            .color(color(p.text_muted)),
-    );
-
-    let content = row![
-        row(path).spacing(7.0).align_y(Alignment::Center).width(Length::Fill),
-        right,
-    ]
-    .spacing(7.0)
-    .align_y(Alignment::Center);
-
-    let bar = container(content)
-        .width(Length::Fill)
-        .height(Length::Fixed(HEIGHT))
-        .padding([0.0, 16.0])
-        .align_y(Alignment::Center)
-        .style(move |_theme| container::Style {
-            background: Some(color(p.bg_canvas).into()),
-            ..container::Style::default()
-        });
-
-    column![bar, widgets::hline(color(p.border_hairline))].into()
+    Some(row(path).spacing(7.0).align_y(Alignment::Center).into())
 }
 
 /// The hover-context tooltip for whichever breadcrumb segment `state`'s
 /// `breadcrumb_hover` dwell has settled on (roadmap item 10) — the crumb's
 /// `header` (a function signature, a class definition, ...). Rendered as a
 /// `stack!` layer in `shell.rs`, same pattern as `hover_popup::view`.
-/// Anchored just under the breadcrumb strip's own fixed position rather
-/// than the hovered segment's exact on-screen x — this app doesn't measure
-/// widget positions anywhere else either (see `tab_bar::hover_preview`'s
-/// own doc comment on the same tradeoff), so "near the strip" is as precise
-/// as any popup here gets.
+/// Anchored just under the title bar's own fixed height rather than the
+/// hovered segment's exact on-screen x — this app doesn't measure widget
+/// positions anywhere else either (see `tab_bar::hover_preview`'s own doc
+/// comment on the same tradeoff), so "near the title bar" is as precise as
+/// any popup here gets.
 pub fn hover_view(state: &State, p: Palette) -> Option<Element<'static, Message>> {
     let (index, since) = state.breadcrumb_hover.as_ref()?;
     if since.elapsed() < HOVER_DWELL {
@@ -239,7 +159,9 @@ pub fn hover_view(state: &State, p: Palette) -> Option<Element<'static, Message>
             .size(crate::text_scale::px(12.5))
             .color(color(p.text_body))]
         .padding(10.0),
-    );
+    )
+    .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+    .style(widgets::scrollbar_style(p));
 
     let popup = container(body)
         .max_width(480.0)
@@ -250,8 +172,11 @@ pub fn hover_view(state: &State, p: Palette) -> Option<Element<'static, Message>
             ..container::Style::default()
         });
 
+    // The title bar's own painted height (`bar_panel`) plus the 1px hline
+    // `title_bar::view` stacks under it — crumbs render inline in that bar
+    // now, not in a separate strip below the tab bar.
     let positioned = container(popup)
-        .padding(Padding { top: HEADER_HEIGHT + HEIGHT, left: 16.0, right: 0.0, bottom: 0.0 })
+        .padding(Padding { top: state.density.title_bar_h() + 1.0, left: 16.0, right: 0.0, bottom: 0.0 })
         .width(Length::Fill)
         .height(Length::Fill);
 

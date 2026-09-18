@@ -9,6 +9,7 @@ use crate::color::color;
 use crate::fonts;
 use crate::state::{self, Message, State};
 use crate::ui::search_icon::SearchIcon;
+use crate::widgets;
 
 /// A `↑↓ navigate` / `esc close`-style hint, used in the palette's footer.
 fn hint(label: &'static str, p: devscribe_core::theme::Palette) -> Element<'static, Message> {
@@ -138,7 +139,11 @@ pub fn view(state: &State) -> Option<Element<'static, Message>> {
         .padding(16.0)
         .into()
     } else {
-        scrollable(column(rows)).height(Length::Fixed(320.0)).into()
+        scrollable(column(rows))
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
+            .height(Length::Fixed(320.0))
+            .into()
     };
 
     let input = text_input("Run anything\u{2026}", &state.palette_query)

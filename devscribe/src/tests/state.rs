@@ -173,6 +173,81 @@ fn switch_to_tab_and_select_open_tab_both_update_mru_like_open_or_focus_file() {
 }
 
 #[test]
+fn recent_files_is_most_recent_first_deduped_and_survives_a_tab_close() {
+    let files = TempFiles::new("recent-files");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+    // Reactivating `a` should move it back to the front, same MRU rule
+    // `tab_switcher_entries` follows — but unlike that list, `recent_files`
+    // must not lose `a` once its tab is later closed.
+    open_or_focus_file(&mut state, files.a.clone());
+    assert_eq!(state.recent_files, vec![files.a.clone(), files.b.clone()]);
+
+    let _ = update(&mut state, Message::CloseActiveTab);
+    assert_eq!(
+        state.recent_files,
+        vec![files.a.clone(), files.b.clone()],
+        "closing a tab must not drop it from the session's file history — Ctrl+E's whole point \
+         is finding files that aren't open anymore"
+    );
+}
+
+#[test]
+fn filtered_quick_open_entries_fuzzy_matches_and_falls_back_to_recency() {
+    let files = TempFiles::new("quick-open-filter");
+    let mut state = State::default();
+    // Labels are relative to `state.root` (see `filtered_quick_open_entries`),
+    // same as the command palette's own "Open: " entries — without this the
+    // label falls back to `files.a`'s full temp-dir path, which both
+    // filenames are a fuzzy subsequence of.
+    state.root = files.dir.clone();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+
+    // Empty query: every score ties at 0, so the stable sort leaves
+    // `recent_files`' own most-recent-first order untouched.
+    assert_eq!(filtered_quick_open_entries(&state), vec![files.b.clone(), files.a.clone()]);
+
+    // "a.txt" only subsequence-matches `a.txt`, not `b.txt`.
+    let _ = update(&mut state, Message::QuickOpenQueryChanged("a.txt".to_string()));
+    assert_eq!(filtered_quick_open_entries(&state), vec![files.a.clone()]);
+}
+
+#[test]
+fn toggle_quick_open_resets_the_query_and_is_mutually_exclusive_with_the_palette() {
+    let mut state = State::default();
+    state.palette_open = true;
+
+    let _ = update(&mut state, Message::ToggleQuickOpen);
+    assert!(state.quick_open_open);
+    assert!(!state.palette_open, "opening quick-open should close the command palette");
+
+    let _ = update(&mut state, Message::QuickOpenQueryChanged("x".to_string()));
+    let _ = update(&mut state, Message::ToggleQuickOpen);
+    assert!(!state.quick_open_open);
+
+    let _ = update(&mut state, Message::ToggleQuickOpen);
+    assert_eq!(state.quick_open_query, "", "reopening should start from a blank query, not the last one");
+}
+
+#[test]
+fn quick_open_execute_opens_the_selected_entry_and_closes_the_overlay() {
+    let files = TempFiles::new("quick-open-execute");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+    let _ = update(&mut state, Message::CloseActiveTab); // `b` is now closed, but still "recent"
+
+    let _ = update(&mut state, Message::ToggleQuickOpen);
+    // Most-recent-first with an empty query, so index 0 is `b`.
+    let _ = update(&mut state, Message::QuickOpenExecute);
+
+    assert!(!state.quick_open_open);
+    assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())));
+}
+
+#[test]
 fn close_tab_is_blocked_for_a_pinned_tab_until_unpinned() {
     let files = TempFiles::new("pin-close-guard");
     let mut state = State::default();
@@ -597,6 +672,32 @@ fn window_unfocused_only_saves_when_the_toggle_is_on() {
         !find_editor(&state, &files.a).unwrap().document.is_dirty(),
         "with the toggle on, losing focus should save every dirty file"
     );
+}
+
+#[test]
+fn autosave_tick_saves_every_dirty_file_regardless_of_the_interval_value() {
+    // `AutosaveTick`'s handler doesn't itself check `autosave_interval_secs`
+    // — that field only gates whether `subscription()` ever fires the tick
+    // at all (see its own doc comment) — so this only needs to check the
+    // message's own effect, same shape as `WindowUnfocused`'s test above.
+    let files = TempFiles::new("autosave-tick");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    find_editor_mut(&mut state, &files.a).unwrap().insert_text("x");
+
+    let _ = update(&mut state, Message::AutosaveTick);
+    assert!(
+        !find_editor(&state, &files.a).unwrap().document.is_dirty(),
+        "an autosave tick should save every dirty open file"
+    );
+}
+
+#[test]
+fn set_autosave_interval_persists_the_value() {
+    let mut state = State::default();
+    assert_eq!(state.autosave_interval_secs, 0, "off by default, same reasoning as save_on_focus_loss");
+    let _ = update(&mut state, Message::SetAutosaveInterval(60));
+    assert_eq!(state.autosave_interval_secs, 60);
 }
 
 /// Drives the real `git` CLI — same rationale as
@@ -1328,6 +1429,23 @@ fn chat_session_starting_event_clears_any_prior_thread() {
     assert!(state.chat.messages.is_empty());
     assert_eq!(state.chat.cost_usd, 0.0);
     assert!(state.chat.sender.is_none());
+}
+
+/// Toggling Shell Access or the Manual/Auto-Edit/Plan/Auto permission mode
+/// both respawn the `claude` subprocess (they're spawn-time-only CLI flags —
+/// see `State::chat_permission_mode`'s own doc comment), which fires this
+/// same `SessionStarting` event. An unsent draft the user is mid-typing has
+/// nothing to do with the session being reset and must survive it.
+#[test]
+fn chat_session_starting_event_preserves_an_unsent_composer_draft() {
+    let mut state = State::default();
+    state.chat.input = iced::widget::text_editor::Content::with_text("an unsent draft");
+    state.chat.messages.push(ChatMessage::Assistant { text: "leftover from a previous worker instance".to_string(), streaming: false });
+
+    let _ = update(&mut state, Message::Chat(ClaudeEvent::SessionStarting));
+
+    assert_eq!(state.chat.input.text(), "an unsent draft", "the in-progress draft must not be wiped out by a session respawn");
+    assert!(state.chat.messages.is_empty(), "the transcript itself must still reset as before");
 }
 
 #[test]
@@ -2553,6 +2671,27 @@ fn breadcrumbs_go_empty_mid_edit_and_come_back_after_settling() {
         vec!["settle_batch".to_string()],
         "must come back once the tree is back in sync"
     );
+}
+
+#[test]
+fn sticky_scopes_at_line_only_shows_scopes_whose_definition_line_has_scrolled_past() {
+    let dir = std::env::temp_dir().join(format!("devscribe-sticky-scroll-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.rs");
+    std::fs::write(&path, "fn outer() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
+    let editor = EditorState::new(Document::open(&path).unwrap(), path.clone());
+
+    assert!(
+        editor.sticky_scopes_at_line(0).is_empty(),
+        "line 0 is the function's own definition line, still visible on screen — nothing to pin above it"
+    );
+    let scopes = editor.sticky_scopes_at_line(2);
+    assert_eq!(
+        scopes.iter().map(|(header, _)| header.clone()).collect::<Vec<_>>(),
+        vec!["fn outer()".to_string()],
+        "line 2 has scrolled past the function's own opening line, so it should be pinned"
+    );
+    assert_eq!(scopes[0].1, 0, "the pinned header should point back at its own definition line");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2989,6 +3128,46 @@ fn the_caret_can_cross_a_crlf_line_ending_in_both_directions() {
 
     editor.move_cursor(Direction::Left, false);
     assert_eq!(editor.cursor, CursorPos { line: 0, col: 2 }, "and Left must come straight back, not stall either");
+}
+
+#[test]
+fn word_right_lands_on_the_next_words_own_end_skipping_trailing_space() {
+    let mut editor = EditorState::new(Document::from_str("foo  bar.baz"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 0 };
+
+    editor.move_cursor(Direction::WordRight, false);
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 5 }, "past `foo` and the run of spaces after it, to the start of `bar`");
+
+    editor.move_cursor(Direction::WordRight, false);
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 8 }, "stops at the `.` boundary rather than treating `bar.baz` as one word");
+
+    editor.move_cursor(Direction::WordRight, false);
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 9 }, "a punctuation run (`.`) is its own word too");
+
+    editor.move_cursor(Direction::WordRight, false);
+    assert_eq!(editor.cursor, CursorPos { line: 0, col: 12 }, "and finally to the end of `baz`");
+}
+
+#[test]
+fn word_left_is_word_rights_own_inverse_and_crosses_line_boundaries() {
+    let mut editor = EditorState::new(Document::from_str("foo\nbar"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 1, col: 0 };
+
+    editor.move_cursor(Direction::WordLeft, false);
+    assert_eq!(
+        editor.cursor,
+        CursorPos { line: 0, col: 0 },
+        "Left at column 0 should cross the newline to the previous line's own last word, same as most editors"
+    );
+}
+
+#[test]
+fn shift_word_right_extends_the_selection_one_word_at_a_time() {
+    let mut editor = EditorState::new(Document::from_str("foo bar"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 0 };
+
+    editor.move_cursor(Direction::WordRight, true);
+    assert_eq!(editor.selection(), Some((0, 4)), "Shift+word-right should select rather than just move");
 }
 
 #[test]
@@ -3933,4 +4112,257 @@ fn apply_locations_prefers_the_live_open_buffer_over_a_stale_disk_read() {
         "must reflect the live, unsaved buffer rather than what's on disk: {:?}",
         entry.preview
     );
+}
+
+#[test]
+fn build_peek_preview_reads_a_few_lines_of_context_from_the_open_buffer() {
+    let files = TempFiles::new("peek-open-buffer");
+    std::fs::write(&files.b, "one\ntwo\nthree\nfour\nfive\nsix\nseven\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    open_or_focus_file(&mut state, files.b.clone());
+
+    let preview = build_peek_preview(&state, &location_at(&files.b, 3, 0)).unwrap();
+
+    assert_eq!(preview.path, files.b);
+    assert_eq!(preview.target_line, 3);
+    assert_eq!(preview.lines[preview.target_line - preview.start_line], "four");
+}
+
+#[test]
+fn build_peek_preview_falls_back_to_disk_for_a_file_that_is_not_open() {
+    let files = TempFiles::new("peek-disk");
+    std::fs::write(&files.b, "alpha\nbeta\ngamma\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+
+    let preview = build_peek_preview(&state, &location_at(&files.b, 1, 0)).unwrap();
+
+    assert_eq!(preview.target_line, 1);
+    assert_eq!(preview.lines[preview.target_line - preview.start_line], "beta");
+}
+
+#[test]
+fn apply_peek_response_discards_a_reply_that_does_not_match_the_requested_position() {
+    let files = TempFiles::new("peek-mismatch");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let editor = find_editor_mut(&mut state, &files.a).unwrap();
+    editor.mark_peek_requested(CursorPos { line: 0, col: 0 });
+
+    let preview = PeekPreview { path: files.b.clone(), start_line: 0, target_line: 0, lines: vec!["x".into()] };
+    editor.apply_peek_response(5, 0, Some(preview));
+
+    assert!(editor.peek.is_none(), "a reply for a different position must not populate peek");
+    assert!(!editor.peek_requested_at(0, 0), "must be consumed either way, matched or not");
+}
+
+#[test]
+fn apply_peek_response_suppresses_a_preview_of_the_line_already_under_the_mouse() {
+    let files = TempFiles::new("peek-self");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let editor = find_editor_mut(&mut state, &files.a).unwrap();
+    editor.mark_peek_requested(CursorPos { line: 0, col: 0 });
+
+    let preview = PeekPreview { path: files.a.clone(), start_line: 0, target_line: 0, lines: vec!["a".into()] };
+    editor.apply_peek_response(0, 0, Some(preview));
+
+    assert!(editor.peek.is_none(), "peeking a symbol at its own definition line shouldn't show anything");
+}
+
+#[test]
+fn apply_peek_response_keeps_a_preview_resolved_to_a_different_file() {
+    let files = TempFiles::new("peek-elsewhere");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let editor = find_editor_mut(&mut state, &files.a).unwrap();
+    editor.mark_peek_requested(CursorPos { line: 0, col: 0 });
+
+    let preview = PeekPreview { path: files.b.clone(), start_line: 0, target_line: 0, lines: vec!["fn target() {}".into()] };
+    editor.apply_peek_response(0, 0, Some(preview));
+
+    assert!(editor.peek.is_some());
+}
+
+#[test]
+fn definition_event_routes_to_a_peek_when_one_is_pending_for_that_position() {
+    let files = TempFiles::new("definition-peek-routing");
+    std::fs::write(&files.b, "fn target() {}\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let uri = lsp::Url::from_file_path(&files.a).unwrap();
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.mark_peek_requested(CursorPos { line: 0, col: 0 });
+    }
+
+    let _ = update(
+        &mut state,
+        Message::Lsp(LspEvent::Definition { uri, line: 0, character: 0, locations: vec![location_at(&files.b, 0, 3)] }),
+    );
+
+    assert_eq!(state.active_tab, Some(TabKey::File(files.a.clone())), "a peek reply must not navigate anywhere");
+    assert!(!state.references_open);
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert!(editor.peek.is_some(), "must populate the peek preview instead");
+}
+
+#[test]
+fn definition_event_jumps_normally_when_no_peek_is_pending() {
+    let files = TempFiles::new("definition-jump-routing");
+    std::fs::write(&files.b, "fn target() {}\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    let uri = lsp::Url::from_file_path(&files.a).unwrap();
+
+    let _ = update(
+        &mut state,
+        Message::Lsp(LspEvent::Definition { uri, line: 0, character: 0, locations: vec![location_at(&files.b, 0, 3)] }),
+    );
+
+    assert_eq!(state.active_tab, Some(TabKey::File(files.b.clone())), "with nothing peek-pending, this must be a normal jump");
+}
+
+#[test]
+fn go_to_definition_clears_any_pending_peek_so_its_own_reply_is_not_swallowed() {
+    let files = TempFiles::new("go-to-definition-clears-peek");
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    state.lsp_status = LspStatus::Ready;
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.mark_peek_requested(CursorPos { line: 0, col: 0 });
+    }
+
+    let _ = update(&mut state, Message::GoToDefinition { line: 0, col: 0 });
+
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert!(!editor.peek_requested_at(0, 0), "an explicit Go to Definition must win the race against a passive peek");
+}
+
+#[test]
+fn select_next_occurrence_with_no_selection_selects_the_word_under_the_cursor() {
+    let mut editor = EditorState::new(Document::from_str("let cat = 1;\n"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 5 };
+    editor.select_next_occurrence();
+    assert_eq!(editor.selected_text().as_deref(), Some("cat"));
+    assert!(editor.extra_cursors.is_empty(), "the first press only selects, it doesn't add a cursor yet");
+}
+
+#[test]
+fn select_next_occurrence_adds_a_cursor_per_further_match_and_stops_once_all_are_taken() {
+    let mut editor = EditorState::new(Document::from_str("cat cat cat\n"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 1 };
+
+    editor.select_next_occurrence();
+    assert_eq!(editor.selected_text().as_deref(), Some("cat"));
+    assert!(editor.extra_cursors.is_empty());
+
+    editor.select_next_occurrence();
+    assert_eq!(editor.extra_cursors.len(), 1, "the first match becomes an extra cursor, the second is now primary");
+    assert_eq!(editor.selected_text().as_deref(), Some("cat"));
+
+    editor.select_next_occurrence();
+    assert_eq!(editor.extra_cursors.len(), 2, "all three occurrences are now active cursors");
+
+    editor.select_next_occurrence();
+    assert_eq!(editor.extra_cursors.len(), 2, "every occurrence already has a cursor, so a further press is a no-op");
+}
+
+#[test]
+fn typing_with_multiple_cursors_edits_every_cursor_as_one_undo_step() {
+    let mut editor = EditorState::new(Document::from_str("cat cat cat\n"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 1 };
+    editor.select_next_occurrence();
+    editor.select_next_occurrence();
+    editor.select_next_occurrence();
+    assert_eq!(editor.extra_cursors.len(), 2);
+
+    editor.type_char('x');
+    assert_eq!(editor.document.text().to_string(), "x x x\n", "each selected occurrence is replaced in place");
+
+    assert!(editor.undo(), "there must be something to undo");
+    assert_eq!(
+        editor.document.text().to_string(),
+        "cat cat cat\n",
+        "one Ctrl+Z must undo every cursor's edit at once, not just the primary's"
+    );
+}
+
+#[test]
+fn backspace_with_multiple_cursors_deletes_at_every_cursor() {
+    let mut editor = EditorState::new(Document::from_str("cat cat cat\n"), PathBuf::from("t.txt"));
+    editor.cursor = CursorPos { line: 0, col: 1 };
+    editor.select_next_occurrence();
+    editor.select_next_occurrence();
+    editor.select_next_occurrence();
+
+    assert!(editor.backspace());
+    assert_eq!(editor.document.text().to_string(), "  \n", "each selected \"cat\" is deleted, not just replaced");
+}
+
+#[test]
+fn column_selection_creates_one_cursor_per_line_clamped_to_a_short_lines_own_length() {
+    let mut editor = EditorState::new(Document::from_str("aaaa\nbb\ncccccc\n"), PathBuf::from("t.txt"));
+    editor.set_column_selection(0, 2, 2, 2);
+
+    assert_eq!(editor.cursor, CursorPos { line: 2, col: 2 }, "the line the drag ended on is the primary cursor");
+    assert_eq!(editor.extra_cursors.len(), 2);
+    let line1 = editor.extra_cursors.iter().find(|(c, _)| c.line == 1).expect("line 1 has a cursor too");
+    assert_eq!(line1.0.col, 2, "\"bb\" is only 2 chars long, so column 2 clamps to its own end rather than being skipped");
+}
+
+#[test]
+fn typing_across_a_column_selection_inserts_at_every_line() {
+    let mut editor = EditorState::new(Document::from_str("aaaa\nbb\ncccccc\n"), PathBuf::from("t.txt"));
+    editor.set_column_selection(0, 2, 2, 2);
+
+    editor.type_char('X');
+
+    assert_eq!(editor.document.text().to_string(), "aaXaa\nbbX\nccXcccc\n");
+}
+
+#[test]
+fn toggle_bookmark_adds_then_removes_the_line() {
+    let mut editor = EditorState::new(Document::from_str("a\nb\nc\n"), PathBuf::from("t.txt"));
+    editor.toggle_bookmark(1);
+    assert!(editor.bookmarks.contains(&1));
+    editor.toggle_bookmark(1);
+    assert!(!editor.bookmarks.contains(&1));
+}
+
+#[test]
+fn a_plain_click_ends_multi_cursor_mode() {
+    let files = TempFiles::new("multi-cursor-click");
+    std::fs::write(&files.a, "cat cat cat\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    {
+        let editor = find_editor_mut(&mut state, &files.a).unwrap();
+        editor.cursor = CursorPos { line: 0, col: 1 };
+        editor.select_next_occurrence();
+        editor.select_next_occurrence();
+        assert_eq!(editor.extra_cursors.len(), 1);
+    }
+
+    let _ = update(&mut state, Message::EditorClick { line: 0, col: 0, extend: false, pane: Pane::Primary });
+
+    let editor = find_editor(&state, &files.a).unwrap();
+    assert!(editor.extra_cursors.is_empty(), "an ordinary click must collapse multi-cursor mode back to one caret");
+}
+
+#[test]
+fn ctrl_shift_m_toggles_a_bookmark_through_the_message_handler() {
+    let files = TempFiles::new("bookmark-toggle");
+    std::fs::write(&files.a, "one\ntwo\nthree\n").unwrap();
+    let mut state = State::default();
+    open_or_focus_file(&mut state, files.a.clone());
+    find_editor_mut(&mut state, &files.a).unwrap().cursor = CursorPos { line: 1, col: 0 };
+
+    let _ = update(&mut state, Message::EditorToggleBookmark { pane: Pane::Primary });
+    assert!(find_editor(&state, &files.a).unwrap().bookmarks.contains(&1));
+
+    let _ = update(&mut state, Message::EditorToggleBookmark { pane: Pane::Primary });
+    assert!(!find_editor(&state, &files.a).unwrap().bookmarks.contains(&1));
 }

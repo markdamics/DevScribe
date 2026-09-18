@@ -109,6 +109,28 @@ pub struct EditorCanvas {
     /// primary-only interactions below (go to definition, hover, gutter
     /// revert) to `Pane::Primary`.
     pub pane: Pane,
+    /// Multi-cursor state (`Ctrl+D` / Alt-drag column select) beyond the
+    /// primary `cursor`/`selection` above — each entry is an additional
+    /// caret plus its own selection range, if any. Drawn in the same
+    /// uncached overlay pass as the primary caret (`draw_extra_cursors`)
+    /// rather than through `text_cache`, so this doesn't need its own entry
+    /// in `CacheSig`: it already redraws every frame regardless. Empty
+    /// outside multi-cursor mode, the overwhelmingly common case.
+    pub extra_cursors: Vec<(CursorPos, Option<(usize, usize)>)>,
+    /// Lines with a `Ctrl+Shift+M` bookmark — drawn as a small gutter dot.
+    /// Small and infrequently-changing enough to compare by value in
+    /// `CacheSig` rather than needing an `Rc` pointer-identity shortcut like
+    /// `highlights`/`diagnostics`/`gutter_marks`.
+    pub bookmarks: std::collections::BTreeSet<usize>,
+    /// Sticky-scroll headers (roadmap item 18) — `(header, start_line)`
+    /// pairs, outermost first, for whichever enclosing scopes have scrolled
+    /// above the viewport. Precomputed by `shell.rs`'s `code_area` (it needs
+    /// `EditorState::sticky_scopes_at_line`, which this struct has no access
+    /// to — it only ever holds a bare `Document`) from `first_visible_line`.
+    /// Always empty under word wrap: a wrapped row and a buffer line aren't
+    /// the same thing, and `first_visible_line`'s plain scroll-offset math
+    /// doesn't account for that.
+    pub sticky_scopes: Vec<(String, usize)>,
 }
 
 /// Local interaction state, plus the tessellated-geometry cache — neither is
@@ -128,6 +150,11 @@ pub struct CanvasState {
     /// click detection — a same-cell press within `CLICK_STREAK_WINDOW`
     /// advances `click_streak`; anything else resets it to a fresh single.
     last_click: Option<(Instant, usize, usize)>,
+    /// `Some((line, col))` the drag started at, from an Alt+press until its
+    /// matching release — while set, `CursorMoved` events publish
+    /// `Message::EditorColumnSelect` (a rectangular block selection) instead
+    /// of the ordinary `EditorClick { extend: true, .. }` drag-select.
+    column_select_anchor: Option<(usize, usize)>,
     /// 1 = plain click, 2 = double (select word), 3 = triple (select line),
     /// wrapping back to 1 on a fourth same-cell click.
     click_streak: u8,
@@ -188,6 +215,8 @@ struct CacheSig {
     cursor_line: usize,
     palette: Palette,
     pane: Pane,
+    bookmarks: std::collections::BTreeSet<usize>,
+    sticky_scopes: Vec<(String, usize)>,
 }
 
 impl EditorCanvas {
@@ -231,6 +260,8 @@ impl EditorCanvas {
             cursor_line: self.cursor.line,
             palette: self.palette,
             pane: self.pane,
+            bookmarks: self.bookmarks.clone(),
+            sticky_scopes: self.sticky_scopes.clone(),
         }
     }
 
@@ -413,8 +444,31 @@ impl EditorCanvas {
                 // while actually typing in a file; the help screen stays
                 // reachable from everywhere else (sidebar, chat, welcome).
                 publish(Message::EditorToggleComment { pane })
+            } else if modifiers.shift() && c.eq_ignore_ascii_case("m") {
+                publish(Message::EditorToggleBookmark { pane })
+            } else if c.eq_ignore_ascii_case("d") {
+                publish(Message::EditorSelectNextOccurrence { pane })
             } else {
                 None
+            };
+        }
+
+        // `Ctrl`/`Cmd`+`Left`/`Right` jumps by word (roadmap item 19);
+        // holding `Shift` too extends the selection the same word at a
+        // time, same "Shift turns a move into a select" convention the
+        // plain arrow keys above already follow. Checked separately from
+        // the `Key::Character` shortcuts above since arrow keys are
+        // `Key::Named` — `modifiers.alt()` is excluded so this doesn't
+        // collide with a future Alt-modified binding on the same keys.
+        if modifiers.command()
+            && !modifiers.alt()
+            && let Key::Named(named) = key
+        {
+            let extend = modifiers.shift();
+            return match named {
+                Named::ArrowLeft => publish(Message::EditorMove { dir: Direction::WordLeft, extend, pane }),
+                Named::ArrowRight => publish(Message::EditorMove { dir: Direction::WordRight, extend, pane }),
+                _ => None,
             };
         }
 
@@ -813,6 +867,16 @@ impl EditorCanvas {
                             ..Text::default()
                         });
                     }
+
+                    // `Ctrl+Shift+M` bookmark marker: a small dot in the
+                    // gutter's left margin, clear of both the git-diff bar
+                    // (`x` in `0.0..4.0` above) and the line number (right-
+                    // aligned against `GUTTER_WIDTH`) — shown regardless of
+                    // `show_line_numbers`, same as the git-diff marker,
+                    // since it's a navigation aid, not a line number.
+                    if self.bookmarks.contains(&line) {
+                        frame.fill(&Path::circle(Point::new(10.0, y + line_height / 2.0), 2.5), color(p.status_info));
+                    }
                 }
 
                 let row_text = &text[row_start_byte..row_end_byte];
@@ -935,6 +999,71 @@ impl EditorCanvas {
 
             }
         }
+
+        self.draw_sticky_scroll(frame, bounds);
+    }
+
+    /// Sticky-scroll headers (roadmap item 18) — one fixed-position row per
+    /// `sticky_scopes` entry, pinned to the top of the viewport regardless
+    /// of `scroll_offset` (unlike every line drawn above, which scrolls),
+    /// painted last so its opaque background occludes whatever content line
+    /// would otherwise show through underneath. A plain flat header, not
+    /// the real per-span syntax highlighting the line loop above draws —
+    /// distinguishing "this is a pinned scope name" from real code is the
+    /// point (VS Code's own sticky scroll shows plain text too), and it
+    /// keeps this from needing its own span-slicing pass.
+    fn draw_sticky_scroll(&self, frame: &mut Frame, bounds: Rectangle) {
+        if self.sticky_scopes.is_empty() {
+            return;
+        }
+        let p = self.palette;
+        let font_size = self.font_size;
+        let line_height = self.line_height();
+        let mono = fonts::mono(iced::font::Weight::Medium);
+        let text_x0 = GUTTER_WIDTH + TEXT_INSET;
+
+        for (i, (header, _line)) in self.sticky_scopes.iter().enumerate() {
+            let y = i as f32 * line_height;
+            frame.fill(
+                &Path::rectangle(Point::new(0.0, y), Size::new(bounds.width, line_height)),
+                color(p.surface_raised),
+            );
+            frame.fill_text(Text {
+                content: header.clone(),
+                position: Point::new(text_x0, y),
+                color: color(p.text_body),
+                size: Pixels(font_size),
+                line_height: LineHeight::Absolute(Pixels(line_height)),
+                font: mono,
+                align_y: Vertical::Top,
+                ..Text::default()
+            });
+        }
+        let total_height = self.sticky_scopes.len() as f32 * line_height;
+        frame.fill(
+            &Path::rectangle(Point::new(0.0, total_height - 1.0), Size::new(bounds.width, 1.0)),
+            color(p.border_hairline),
+        );
+    }
+
+    /// `(row_in_line, row_start_char, base_row)` for `col` on `line` —
+    /// word-wrap-aware positioning shared by `draw_caret_and_ghost` (for the
+    /// primary cursor) and `draw_extra_cursors` (for every multi-cursor
+    /// caret/selection edge), so neither has to duplicate the wrap-row scan.
+    fn wrap_row_for_line(&self, line: usize, col: usize, bounds_width: f32) -> (usize, usize, usize) {
+        if !self.word_wrap {
+            return (0, 0, line);
+        }
+        let text_x0 = GUTTER_WIDTH + TEXT_INSET;
+        let char_width = self.char_width();
+        let text = self.document.line_text_capped(line, crate::state::MAX_RENDERED_LINE_CHARS);
+        let wrap_cols = wrap_cols_for(bounds_width - text_x0, char_width);
+        let row_starts = wrap_row_starts(&text, wrap_cols);
+        let col_byte = char_to_byte(&text, col);
+        let row_in_line = row_starts.partition_point(|&b| b <= col_byte).saturating_sub(1).min(row_starts.len() - 1);
+        let row_start_char = byte_to_char(&text, row_starts[row_in_line]);
+        let base_row = self.wrap_offsets.get(line).copied().unwrap_or(0) as usize;
+        (row_in_line, row_start_char, base_row)
     }
 
     /// The caret and ghost-text suggestion — the only parts of the editor
@@ -945,6 +1074,7 @@ impl EditorCanvas {
     /// than reusing `draw_content`'s loop is cheap and keeps the two passes
     /// independent.
     fn draw_caret_and_ghost(&self, frame: &mut Frame, bounds: Rectangle) {
+        self.draw_extra_cursors(frame, bounds);
         if !self.caret_visible && self.ghost_text.is_none() {
             return;
         }
@@ -958,17 +1088,7 @@ impl EditorCanvas {
         let char_width = self.char_width();
         let text_x0 = GUTTER_WIDTH + TEXT_INSET;
 
-        let (row_in_line, row_start_char, base_row) = if self.word_wrap {
-            let text = self.document.line_text_capped(line, crate::state::MAX_RENDERED_LINE_CHARS);
-            let wrap_cols = wrap_cols_for(bounds.width - text_x0, char_width);
-            let row_starts = wrap_row_starts(&text, wrap_cols);
-            let col_byte = char_to_byte(&text, self.cursor.col);
-            let row_in_line = row_starts.partition_point(|&b| b <= col_byte).saturating_sub(1).min(row_starts.len() - 1);
-            let row_start_char = byte_to_char(&text, row_starts[row_in_line]);
-            (row_in_line, row_start_char, self.wrap_offsets[line] as usize)
-        } else {
-            (0, 0, line)
-        };
+        let (row_in_line, row_start_char, base_row) = self.wrap_row_for_line(line, self.cursor.col, bounds.width);
 
         let y = TOP_PAD + (base_row + row_in_line) as f32 * line_height;
         let x = text_x0 + (self.cursor.col - row_start_char) as f32 * char_width;
@@ -996,6 +1116,62 @@ impl EditorCanvas {
                 align_y: Vertical::Top,
                 ..Text::default()
             });
+        }
+    }
+
+    /// Every additional caret/selection from multi-cursor editing (`Ctrl+D`
+    /// / Alt-drag column select) — drawn in the same uncached overlay pass
+    /// as the primary caret, every frame, same reasoning `draw_caret_and_ghost`
+    /// itself gives (there are never more than `MAX_EXTRA_CURSORS` of these,
+    /// so redoing this on every 530ms blink tick is cheap). Selections
+    /// almost always span a single line in practice (a `Ctrl+D` match is a
+    /// literal substring, never containing a newline; a column selection is
+    /// one cursor per line by construction) — the multi-line loop below only
+    /// exists so a pathological or future case degrades gracefully instead
+    /// of drawing something wrong.
+    fn draw_extra_cursors(&self, frame: &mut Frame, bounds: Rectangle) {
+        if self.extra_cursors.is_empty() {
+            return;
+        }
+        let p = self.palette;
+        let line_height = self.line_height();
+        let char_width = self.char_width();
+        let text_x0 = GUTTER_WIDTH + TEXT_INSET;
+
+        for (cursor, selection) in &self.extra_cursors {
+            if let Some((start, end)) = selection {
+                let (start_line, start_col) = self.document.line_col(*start);
+                let (end_line, end_col) = self.document.line_col(*end);
+                for line in start_line..=end_line {
+                    let line_len = self.document.line_len_chars(line);
+                    let col0 = if line == start_line { start_col } else { 0 };
+                    let col1 = if line == end_line { end_col } else { line_len + 1 };
+                    let (row_in_line, row_start_char, base_row) = self.wrap_row_for_line(line, col0, bounds.width);
+                    let y = TOP_PAD + (base_row + row_in_line) as f32 * line_height;
+                    let x0 = text_x0 + col0.saturating_sub(row_start_char) as f32 * char_width;
+                    if x0 > bounds.width {
+                        continue;
+                    }
+                    let x1 = text_x0 + col1.saturating_sub(row_start_char) as f32 * char_width;
+                    frame.fill(
+                        &Path::rectangle(Point::new(x0, y), Size::new((x1 - x0).max(char_width * 0.4), line_height)),
+                        tint(p.accent_solid, 0.6),
+                    );
+                }
+            }
+            if !self.caret_visible || cursor.line >= self.document.line_count() {
+                continue;
+            }
+            let (row_in_line, row_start_char, base_row) = self.wrap_row_for_line(cursor.line, cursor.col, bounds.width);
+            let y = TOP_PAD + (base_row + row_in_line) as f32 * line_height;
+            let x = text_x0 + cursor.col.saturating_sub(row_start_char) as f32 * char_width;
+            if x > bounds.width {
+                continue;
+            }
+            frame.fill(
+                &Path::rectangle(Point::new(x, y + 1.0), Size::new(2.0, line_height - 4.0)),
+                color(p.accent_solid),
+            );
         }
     }
 }
@@ -1103,11 +1279,29 @@ impl canvas::Program<Message> for EditorCanvas {
                 if state.modifiers.shift() {
                     state.last_click = None;
                     state.click_streak = 0;
+                    state.column_select_anchor = None;
                     return Some(
                         canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane })
                             .and_capture(),
                     );
                 }
+
+                // Alt-drag starts a column/block selection: remember where
+                // the drag began (the subsequent `CursorMoved` arm below
+                // reads it) and place a plain single cursor there for now,
+                // same as an ordinary click — doesn't participate in
+                // double/triple-click detection either, since Alt+click
+                // means something different from a repeated plain click.
+                if state.modifiers.alt() {
+                    state.last_click = None;
+                    state.click_streak = 0;
+                    state.column_select_anchor = Some((line, col));
+                    return Some(
+                        canvas::Action::publish(Message::EditorClick { line, col, extend: false, pane })
+                            .and_capture(),
+                    );
+                }
+                state.column_select_anchor = None;
 
                 let now = Instant::now();
                 let repeats_last = state.last_click.is_some_and(|(at, l, c)| {
@@ -1133,7 +1327,20 @@ impl canvas::Program<Message> for EditorCanvas {
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
                 let position = cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))?;
                 let (line, col) = self.hit_test(position, bounds.width);
-                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane: self.pane }).and_capture())
+                let pane = self.pane;
+                if let Some((anchor_line, anchor_col)) = state.column_select_anchor {
+                    return Some(
+                        canvas::Action::publish(Message::EditorColumnSelect {
+                            anchor_line,
+                            anchor_col,
+                            to_line: line,
+                            to_col: col,
+                            pane,
+                        })
+                        .and_capture(),
+                    );
+                }
+                Some(canvas::Action::publish(Message::EditorClick { line, col, extend: true, pane }).and_capture())
             }
             // Passive hover tracking (dwell-based `textDocument/hover`) —
             // only published on an actual cell change, so a stationary
@@ -1163,6 +1370,7 @@ impl canvas::Program<Message> for EditorCanvas {
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
+                state.column_select_anchor = None;
                 None
             }
             // A right-click over the text opens the code-actions context
@@ -1377,6 +1585,15 @@ pub fn line_top(line: usize, font_size: f32) -> f32 {
 /// Line height in px at `font_size` — see `line_top`.
 pub fn line_height_px(font_size: f32) -> f32 {
     font_size * LINE_HEIGHT_RATIO
+}
+
+/// The buffer line currently scrolled to the top of the viewport, at
+/// `scroll_offset`/`font_size` — `line_top`'s own inverse. Feeds
+/// `EditorState::sticky_scopes_at_line` (roadmap item 18): only meaningful
+/// without word wrap, where one buffer line is exactly one visual row (see
+/// `EditorCanvas::sticky_scopes`'s own doc comment).
+pub fn first_visible_line(scroll_offset: f32, font_size: f32) -> usize {
+    ((scroll_offset - TOP_PAD).max(0.0) / line_height_px(font_size)).floor() as usize
 }
 
 /// Absolute x-position (canvas coordinates, what `scroll_offset_x` is

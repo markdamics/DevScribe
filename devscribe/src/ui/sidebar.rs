@@ -250,11 +250,16 @@ fn node_view(node: &Node, depth: usize, p: Palette, row_h: f32, ctx: &TreeCtx<'_
                 .align_y(Vertical::Center);
 
             let path = path.clone();
+            let on_press = if crate::fs_tree::is_image(&path) {
+                Message::OpenImageExternally(path.clone())
+            } else {
+                Message::SelectFile(path.clone())
+            };
             let row_button = button(row_content)
                 .width(Length::Fill)
                 .height(Length::Fixed(row_h))
                 .padding(0.0)
-                .on_press(Message::SelectFile(path.clone()))
+                .on_press(on_press)
                 .style(move |_theme, status| {
                     let hovered = status == button::Status::Hovered;
                     button::Style {
@@ -757,6 +762,8 @@ fn changes_rows(state: &State, p: Palette) -> Element<'static, Message> {
         bottom: 0.0,
         left: 0.0,
     }))
+    .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+    .style(widgets::scrollbar_style(p))
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -944,6 +951,8 @@ pub fn view(state: &State, p: Palette) -> Element<'static, Message> {
     // every row.
     let tree_view = mouse_area(
         scrollable(column(tree_rows).padding([8.0, 4.0]))
+            .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+            .style(widgets::scrollbar_style(p))
             .width(Length::Fill)
             .height(Length::Fill),
     )

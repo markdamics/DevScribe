@@ -16,8 +16,8 @@
 //! verbatim — see `toggle_row`.
 use devscribe_core::theme::{Accent, Palette, Rgba, ThemeMode};
 use iced::font::Weight;
-use iced::widget::{button, column, container, mouse_area, row, scrollable, slider, text, Space};
-use iced::{Alignment, Border, Color, Element, Length};
+use iced::widget::{button, canvas, column, container, mouse_area, row, scrollable, slider, text, Space};
+use iced::{Alignment, Border, Color, Element, Length, Padding};
 
 use devscribe_core::lsp::LspLanguage;
 
@@ -25,6 +25,7 @@ use crate::color::color;
 use crate::density::Density;
 use crate::fonts;
 use crate::server_install;
+use crate::ui::modifier_icon::{ModifierGlyph, ModifierIcon};
 use crate::state::{
     self, Message, SettingsCategory, State, ThemePreview, EDITOR_FONT_SIZE_MAX,
     EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_STEP, MARKDOWN_PREVIEW_ZOOM_MAX,
@@ -128,6 +129,57 @@ fn ui_scale_row(state: &State, p: Palette) -> Element<'static, Message> {
         scale < UI_FONT_SCALE_MAX - f32::EPSILON,
         p,
     )
+}
+
+/// Presets `autosave_row`'s stepper cycles through — `0` is "Off", the
+/// default; the rest are common autosave cadences (VS Code's own default is
+/// 1000ms "afterDelay", but this app has no debounced-typing autosave, only
+/// a flat timer, so seconds-to-minutes presets fit better than sub-second
+/// ones).
+const AUTOSAVE_PRESETS: [u32; 4] = [0, 30, 60, 300];
+
+fn autosave_label(secs: u32) -> String {
+    match secs {
+        0 => "Off".to_string(),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// A label + description on the left (same shape `toggle_row` uses), a
+/// preset stepper on the right instead of an ON/OFF badge — roadmap item
+/// 20's "or on timer" auto-save, independent of `save_on_focus_loss` above.
+fn autosave_row(state: &State, p: Palette) -> Element<'static, Message> {
+    let secs = state.autosave_interval_secs;
+    let idx = AUTOSAVE_PRESETS.iter().position(|&s| s == secs).unwrap_or(0);
+    let dec = AUTOSAVE_PRESETS[idx.saturating_sub(1)];
+    let inc = AUTOSAVE_PRESETS[(idx + 1).min(AUTOSAVE_PRESETS.len() - 1)];
+    row![
+        column![
+            text("Auto-save on a timer")
+                .font(fonts::mono(Weight::Medium))
+                .size(crate::text_scale::px(15.0))
+                .color(color(p.text_strong)),
+            text("Write every dirty buffer on a fixed interval")
+                .font(fonts::mono(Weight::Normal))
+                .size(crate::text_scale::px(13.0))
+                .color(color(p.text_muted)),
+        ]
+        .spacing(2.0)
+        .width(Length::Fill),
+        stepper_row(
+            autosave_label(secs),
+            Message::SetAutosaveInterval(dec),
+            Message::SetAutosaveInterval(inc),
+            idx > 0,
+            idx + 1 < AUTOSAVE_PRESETS.len(),
+            p,
+        ),
+    ]
+    .spacing(8.0)
+    .align_y(Alignment::Center)
+    .padding([8.0, 10.0])
+    .into()
 }
 
 fn markdown_zoom_row(state: &State, p: Palette) -> Element<'static, Message> {
@@ -620,6 +672,7 @@ fn editor_content(state: &State, p: Palette) -> Element<'static, Message> {
                 Message::ToggleSaveOnFocusLoss,
                 p
             ),
+            autosave_row(state, p),
         ]
         .spacing(8.0),
     ]
@@ -723,17 +776,132 @@ fn toolchains_content(state: &State, p: Palette) -> Element<'static, Message> {
     .into()
 }
 
-fn shortcut_row(label: &'static str, keys: &'static str, p: Palette) -> Element<'static, Message> {
+/// One physical key or modifier in a shortcut combo, platform-agnostic —
+/// `key_chip` below turns each into the right label (or, on macOS, icon)
+/// for whichever OS this binary is actually running on, rather than the old
+/// approach of hardcoding one Mac-only Unicode string per shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    /// The app's primary modifier — `Cmd` on macOS, `Ctrl` on Windows/Linux.
+    /// Matches `iced::keyboard::Modifiers::command()`'s own per-OS split,
+    /// which is what every `Primary`-tagged binding in this table is
+    /// actually wired against (`state::global_keys`, `editor_canvas::handle_key`).
+    Primary,
+    Shift,
+    /// `Option` on macOS, `Alt` on Windows/Linux.
+    Alt,
+    /// The literal physical Control key — stays "Ctrl" on every platform,
+    /// including macOS. Only `Ctrl+Tab` (cycle tabs) uses this; see
+    /// `state::global_keys`'s own doc comment on why that one binding is
+    /// never translated to Cmd the way `Primary` is everywhere else.
+    Control,
+    /// Anything that isn't a modifier: a letter, a symbol, or a named key.
+    Lit(&'static str),
+}
+
+/// `true` on macOS, where `Primary`/`Shift`/`Alt`/`Control` render as the
+/// small drawn glyphs (⌘⇧⌥⌃) — the bundled font has no glyphs for those
+/// codepoints, so drawing them (`modifier_icon.rs`) is the only option that
+/// doesn't produce tofu boxes. Windows/Linux instead spell every modifier
+/// out as plain "Ctrl"/"Shift"/"Alt" text, which needs no icon at all: it's
+/// both more legible (nobody's keyboard has a ⌘ key to recognize the symbol
+/// from) and sidesteps the missing-glyph problem entirely.
+const USE_MODIFIER_GLYPHS: bool = cfg!(target_os = "macos");
+
+/// One key rendered as a small pill/"keycap" badge — an icon for a macOS
+/// modifier, plain text for everything else (a letter, a named key, or a
+/// Windows/Linux modifier).
+fn key_chip(key: Key, p: Palette) -> Element<'static, Message> {
+    let content: Element<'static, Message> = if USE_MODIFIER_GLYPHS {
+        let glyph = match key {
+            Key::Primary => Some(ModifierGlyph::Command),
+            Key::Shift => Some(ModifierGlyph::Shift),
+            Key::Alt => Some(ModifierGlyph::Option),
+            Key::Control => Some(ModifierGlyph::Control),
+            Key::Lit(_) => None,
+        };
+        if let Some(glyph) = glyph {
+            canvas(ModifierIcon { glyph, color: color(p.text_strong) })
+                .width(Length::Fixed(13.0))
+                .height(Length::Fixed(13.0))
+                .into()
+        } else {
+            keycap_label(key, p)
+        }
+    } else {
+        keycap_label(key, p)
+    };
+
+    container(content)
+        .padding(Padding { top: 4.0, right: 7.0, bottom: 4.0, left: 7.0 })
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_theme| container::Style {
+            background: Some(color(p.surface_raised).into()),
+            border: Border { color: color(p.border_hairline), width: 1.0, radius: 5.0.into() },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// `key_chip`'s text fallback — every `Lit`, plus every modifier on
+/// Windows/Linux (`USE_MODIFIER_GLYPHS` is `false` there).
+fn keycap_label(key: Key, p: Palette) -> Element<'static, Message> {
+    let label = match key {
+        Key::Primary | Key::Control => "Ctrl",
+        Key::Shift => "Shift",
+        Key::Alt => "Alt",
+        Key::Lit(s) => s,
+    };
+    text(label)
+        .font(fonts::mono(Weight::Medium))
+        .size(crate::text_scale::px(12.0))
+        .color(color(p.text_strong))
+        .into()
+}
+
+/// A row of `key_chip`s for one shortcut, generously spaced (`spacing(6.0)`)
+/// rather than the old glued-together Unicode string — each key now reads as
+/// its own distinct cap instead of a blurred run of symbols.
+fn key_row(keys: &'static [Key], p: Palette) -> Element<'static, Message> {
+    row(keys.iter().map(|&key| key_chip(key, p))).spacing(6.0).align_y(Alignment::Center).into()
+}
+
+fn shortcut_row(label: &'static str, keys: &'static [Key], p: Palette) -> Element<'static, Message> {
     row![
         text(label)
             .font(fonts::sans(Weight::Medium))
             .size(crate::text_scale::px(15.0))
             .color(color(p.text_body))
             .width(Length::Fill),
-        text(keys)
-            .font(fonts::mono(Weight::Medium))
-            .size(crate::text_scale::px(13.0))
-            .color(color(p.text_strong)),
+        key_row(keys, p),
+    ]
+    .align_y(Alignment::Center)
+    .padding([7.0, 0.0])
+    .into()
+}
+
+/// `shortcut_row`'s variant for a binding with two independent ways to
+/// trigger it ("Go to definition" — a click gesture, or a plain function
+/// key) — a `key_row` per alternative, joined by a plain "/" the way the two
+/// used to be joined inside one glued string.
+fn shortcut_row_alt(label: &'static str, alternatives: &'static [&'static [Key]], p: Palette) -> Element<'static, Message> {
+    let mut keys_row = row![].spacing(8.0).align_y(Alignment::Center);
+    for (i, combo) in alternatives.iter().enumerate() {
+        if i > 0 {
+            keys_row = keys_row.push(
+                text("/").font(fonts::mono(Weight::Medium)).size(crate::text_scale::px(13.0)).color(color(p.text_muted)),
+            );
+        }
+        keys_row = keys_row.push(key_row(combo, p));
+    }
+    row![
+        text(label)
+            .font(fonts::sans(Weight::Medium))
+            .size(crate::text_scale::px(15.0))
+            .color(color(p.text_body))
+            .width(Length::Fill),
+        keys_row,
     ]
     .align_y(Alignment::Center)
     .padding([7.0, 0.0])
@@ -751,68 +919,81 @@ fn shortcut_row(label: &'static str, keys: &'static str, p: Palette) -> Element<
 /// (Close tab, Close others, Reopen closed tab, Reveal in tree, Escape) —
 /// a keyboard reference is more useful complete than mockup-literal.
 fn shortcuts_content(p: Palette) -> Element<'static, Message> {
+    use Key::{Alt, Control, Lit, Primary, Shift};
     column![
         column![
             section_label("GENERAL", p),
             column![
-                shortcut_row("Command palette", "\u{2318}K", p),
-                shortcut_row("Keyboard shortcuts", "\u{2318}/", p),
-                shortcut_row("Escape / close", "esc", p),
+                shortcut_row("Command palette", &[Primary, Lit("K")], p),
+                shortcut_row("Quick open recent file", &[Primary, Lit("E")], p),
+                shortcut_row("Keyboard shortcuts", &[Primary, Lit("/")], p),
+                // The one binding that's literally Ctrl on every platform,
+                // never `Primary` — see `Key::Control`'s own doc comment.
+                shortcut_row("Cycle tabs", &[Control, Lit("Tab")], p),
+                shortcut_row("Escape / close", &[Lit("Esc")], p),
             ]
         ]
         .spacing(8.0),
         column![
             section_label("AI CHAT ASSIST", p),
             column![
-                shortcut_row("Toggle chat", "\u{2318}I", p),
-                shortcut_row("Focus chat", "\u{21e7}\u{2318}I", p),
-                shortcut_row("New session", "\u{2325}\u{2318}I", p),
-                shortcut_row("Open actions menu", "\u{21e7}\u{2318}U", p),
-                shortcut_row("Attach file", "\u{2318}U", p),
-                shortcut_row("Send message", "Enter", p),
-                shortcut_row("New line", "\u{21e7}Enter", p),
+                shortcut_row("Toggle chat", &[Primary, Lit("I")], p),
+                shortcut_row("Focus chat", &[Shift, Primary, Lit("I")], p),
+                shortcut_row("New session", &[Alt, Primary, Lit("I")], p),
+                shortcut_row("Open actions menu", &[Shift, Primary, Lit("U")], p),
+                shortcut_row("Attach file", &[Primary, Lit("U")], p),
+                shortcut_row("Send message", &[Lit("Enter")], p),
+                shortcut_row("New line", &[Shift, Lit("Enter")], p),
             ]
         ]
         .spacing(8.0),
         column![
             section_label("FILES", p),
             column![
-                shortcut_row("New file", "\u{2318}N", p),
-                shortcut_row("New folder", "\u{21e7}\u{2318}N", p),
-                shortcut_row("Save", "\u{2318}S", p),
-                shortcut_row("Copy path", "\u{2325}\u{2318}C", p),
+                shortcut_row("New file", &[Primary, Lit("N")], p),
+                shortcut_row("New folder", &[Shift, Primary, Lit("N")], p),
+                shortcut_row("Save", &[Primary, Lit("S")], p),
+                shortcut_row("Copy path", &[Alt, Primary, Lit("C")], p),
             ]
         ]
         .spacing(8.0),
         column![
             section_label("TABS & SEARCH", p),
             column![
-                shortcut_row("Close tab", "\u{2318}W", p),
-                shortcut_row("Close other tabs", "\u{2325}\u{2318}W", p),
-                shortcut_row("Reopen closed tab", "\u{21e7}\u{2318}T", p),
-                shortcut_row("Reveal in tree", "\u{21e7}\u{2318}E", p),
-                shortcut_row("Find in file", "\u{2318}F", p),
-                shortcut_row("Find in project", "\u{21e7}\u{2318}F", p),
-                shortcut_row("Working tree diff", "\u{21e7}\u{2318}D", p),
-                shortcut_row("Go to line", "\u{2318}G", p),
-                shortcut_row("Split editor", "\u{2318}\\", p),
+                shortcut_row("Close tab", &[Primary, Lit("W")], p),
+                shortcut_row("Close other tabs", &[Alt, Primary, Lit("W")], p),
+                shortcut_row("Reopen closed tab", &[Shift, Primary, Lit("T")], p),
+                shortcut_row("Reveal in tree", &[Shift, Primary, Lit("E")], p),
+                shortcut_row("Find in file", &[Primary, Lit("F")], p),
+                shortcut_row("Find in project", &[Shift, Primary, Lit("F")], p),
+                shortcut_row("Working tree diff", &[Shift, Primary, Lit("D")], p),
+                shortcut_row("Go to line", &[Primary, Lit("G")], p),
+                shortcut_row("Split editor", &[Primary, Lit("\\")], p),
             ]
         ]
         .spacing(8.0),
         column![
             section_label("EDITING", p),
             column![
-                shortcut_row("Indent / block indent", "Tab", p),
-                shortcut_row("Dedent / block dedent", "\u{21e7}Tab", p),
-                shortcut_row("Toggle line comment", "\u{2318}/", p),
+                shortcut_row("Indent / block indent", &[Lit("Tab")], p),
+                shortcut_row("Dedent / block dedent", &[Shift, Lit("Tab")], p),
+                shortcut_row("Toggle line comment", &[Primary, Lit("/")], p),
+                shortcut_row("Select next occurrence", &[Primary, Lit("D")], p),
+                shortcut_row_alt(
+                    "Move / select by word",
+                    &[&[Primary, Lit("\u{2190}\u{2192}")], &[Shift, Primary, Lit("\u{2190}\u{2192}")]],
+                    p,
+                ),
+                shortcut_row("Column/block selection", &[Alt, Lit("Drag")], p),
+                shortcut_row("Toggle bookmark", &[Shift, Primary, Lit("M")], p),
             ]
         ]
         .spacing(8.0),
         column![
             section_label("NAVIGATION", p),
             column![
-                shortcut_row("Go to definition", "\u{2318}Click / F12", p),
-                shortcut_row("Find all references", "\u{21e7}F12", p),
+                shortcut_row_alt("Go to definition", &[&[Primary, Lit("Click")], &[Lit("F12")]], p),
+                shortcut_row("Find all references", &[Shift, Lit("F12")], p),
             ]
         ]
         .spacing(8.0),
@@ -873,6 +1054,8 @@ fn category_content(state: &State, p: Palette) -> Element<'static, Message> {
         SettingsCategory::About => about_content(state, p),
     };
     scrollable(container(content).width(Length::Fill).padding(20.0))
+        .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+        .style(widgets::scrollbar_style(p))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

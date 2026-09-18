@@ -257,6 +257,8 @@ pub fn view(editor: &EditorState, p: Palette) -> Element<'static, Message> {
             .padding([8.0, 12.0]);
 
             let tree = scrollable(column(rows).padding([4.0, 12.0]))
+                .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+                .style(widgets::scrollbar_style(p))
                 .width(Length::Fill)
                 .height(Length::Fill);
 

@@ -32,6 +32,14 @@ fn toc_button(pane: Pane, open: bool, p: Palette) -> Element<'static, Message> {
     badge_button(if open { "Hide Outline" } else { "Outline" }, Message::MarkdownToggleToc { pane }, p)
 }
 
+/// Copies the document's raw Markdown source to the clipboard — iced's
+/// `rich_text`-backed preview renderer has no click-drag text selection (see
+/// `Message::CopyText`'s own doc comment), so this is the preview's own
+/// "copyable" affordance rather than a selection-then-Ctrl+C flow.
+fn copy_button(raw_text: String, p: Palette) -> Element<'static, Message> {
+    badge_button("Copy", Message::CopyText(raw_text), p)
+}
+
 fn badge_button(label: &'static str, on_press: Message, p: Palette) -> Element<'static, Message> {
     button(
         text(label)
@@ -147,6 +155,8 @@ fn toc_panel<'a>(pane: Pane, headings: &'a [MarkdownHeading], p: Palette) -> Ele
     });
 
     scrollable(column(entries).width(Length::Fill).padding([8.0, 4.0]))
+        .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+        .style(widgets::scrollbar_style(p))
         .width(Length::Fixed(200.0))
         .height(Length::Fill)
         .into()
@@ -264,7 +274,10 @@ pub fn view(editor: &EditorState, pane: Pane, zoom: f32, p: Palette) -> Element<
     if !editor.markdown_headings.is_empty() {
         badge = badge.push(toc_button(pane, editor.markdown_toc_open, p));
     }
-    let badge = badge.push(edit_button(pane, p)).padding([8.0, 12.0]);
+    let badge = badge
+        .push(copy_button(editor.document.text().to_string(), p))
+        .push(edit_button(pane, p))
+        .padding([8.0, 12.0]);
 
     let settings = markdown::Settings::with_text_size(crate::text_scale::px(15.0) * zoom, style(p));
     let viewer = PreviewViewer { base_dir: editor.path.parent(), zoom };
@@ -273,6 +286,8 @@ pub fn view(editor: &EditorState, pane: Pane, zoom: f32, p: Palette) -> Element<
 
     let preview = scrollable(container(rendered).width(Length::Fill).padding([4.0, 16.0]))
         .id(state::markdown_scroll_id(pane))
+        .direction(scrollable::Direction::Vertical(widgets::thin_scrollbar()))
+        .style(widgets::scrollbar_style(p))
         .width(Length::Fill)
         .height(Length::Fill);
 

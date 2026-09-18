@@ -1,3 +1,4 @@
+use devscribe_core::lsp::DiagnosticSeverity;
 use devscribe_core::theme::Palette;
 use iced::font::Weight;
 use iced::widget::{button, canvas, column, container, mouse_area, responsive, row, scrollable, text, Space};
@@ -9,10 +10,33 @@ use crate::state::{self, ChatMode, EditorState, Message, Pane, State, TabKey};
 use crate::ui::editor_canvas::{self, EditorCanvas};
 use crate::ui::{
     breadcrumb_bar, chat_panel, command_palette, completions, context_menu, diff_view, find_bar, flash,
-    hover_popup, json_view, markdown_view, references_panel, search_view, settings_panel, sidebar,
-    status_bar, tab_bar, title_bar, toast, welcome,
+    hover_popup, json_view, markdown_view, overview_ruler, quick_open, references_panel, search_view,
+    settings_panel, sidebar, status_bar, tab_bar, title_bar, toast, welcome,
 };
 use crate::widgets;
+
+/// The floating "switch back to the rendered view" badge for a JSON/Markdown
+/// file currently showing its plain `code_area` — JSON's "Tree View", or
+/// Markdown's "Preview" (mirrors `json_view::edit_button`/
+/// `markdown_view::edit_button`, the buttons that got it into text mode in
+/// the first place). `None` for any other file, or while already showing
+/// the tree/preview. Used to live as a row of its own under the tab bar
+/// (`breadcrumb_bar::view`); now just this one still-live control, floated
+/// over the editor pane's own top-right corner instead of a bar reserved
+/// for it.
+fn view_mode_toggle(editor: &EditorState, p: Palette) -> Option<Element<'static, Message>> {
+    if editor.json.is_some() && editor.json_text_mode {
+        Some(breadcrumb_bar::toggle_view_button("Tree View", Message::JsonToggleTextMode, p))
+    } else if editor.markdown.is_some() && editor.markdown_text_mode {
+        Some(breadcrumb_bar::toggle_view_button(
+            "Preview",
+            Message::MarkdownToggleTextMode { pane: Pane::Primary },
+            p,
+        ))
+    } else {
+        None
+    }
+}
 
 pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Palette) -> Element<'static, Message> {
     let line_count = editor.document.line_count();
@@ -56,6 +80,18 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
     };
     let diagnostics = editor.diagnostics.clone();
     let gutter_marks = editor.gutter_marks.clone();
+    // Multi-cursor state and bookmarks only ever apply to the primary
+    // pane's own editing session — the split pane is a second read/write
+    // *view* of the same document (see `effective_view`), but `Ctrl+D`/
+    // column-select/bookmarks are keyed off `editor.cursor` specifically,
+    // which the split pane doesn't share, so showing them there would be
+    // showing state that isn't actually its own.
+    let extra_cursors: Vec<(state::CursorPos, Option<(usize, usize)>)> = if pane == Pane::Primary {
+        editor.extra_cursors.iter().map(|&(cursor, anchor)| (cursor, editor.selection_for(cursor, anchor))).collect()
+    } else {
+        Vec::new()
+    };
+    let bookmarks = if pane == Pane::Primary { editor.bookmarks.clone() } else { Default::default() };
     let content_revision = editor.revision();
     let pending_revert_line = editor.pending_revert_line;
     let problem_lens_enabled = state.problem_lens_enabled;
@@ -63,6 +99,14 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
     let word_wrap = state.word_wrap;
     let font_size = state.editor_font_size;
     let scroll_offset = view.scroll_offset;
+    // Roadmap item 18: which enclosing scopes have scrolled above the
+    // viewport, pinned atop the content instead — see `EditorCanvas::
+    // sticky_scopes`'s own doc comment for why word wrap opts out.
+    let sticky_scopes = if word_wrap {
+        Vec::new()
+    } else {
+        editor.sticky_scopes_at_line(editor_canvas::first_visible_line(scroll_offset, font_size))
+    };
     let max_line_chars = editor.max_line_chars();
     // Position-checked here (not trusted from storage) — see
     // `GhostCompletion`'s own doc comment. Only the suggestion's first line
@@ -116,6 +160,9 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
             viewport_height: size.height,
             ghost_text: ghost_text.clone(),
             pane,
+            extra_cursors: extra_cursors.clone(),
+            bookmarks: bookmarks.clone(),
+            sticky_scopes: sticky_scopes.clone(),
         };
 
         // Unwrapped: at least the pane's own width (`size.width`, from
@@ -141,20 +188,21 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
                 content_rows, font_size,
             )));
 
-        scrollable(canvas_widget)
+        let scroll = scrollable(canvas_widget)
             .id(match pane {
                 Pane::Primary => state::editor_scroll_id(),
                 Pane::Split => state::split_editor_scroll_id(),
                 Pane::Solo(id) => state::solo_editor_scroll_id(id),
             })
             .direction(if word_wrap {
-                scrollable::Direction::Vertical(scrollable::Scrollbar::default())
+                scrollable::Direction::Vertical(widgets::thin_scrollbar())
             } else {
                 scrollable::Direction::Both {
-                    vertical: scrollable::Scrollbar::default(),
-                    horizontal: scrollable::Scrollbar::default(),
+                    vertical: widgets::thin_scrollbar(),
+                    horizontal: widgets::thin_scrollbar(),
                 }
             })
+            .style(widgets::scrollbar_style(p))
             .on_scroll(move |viewport| {
                 let offset = viewport.absolute_offset();
                 let bounds = viewport.bounds();
@@ -167,8 +215,41 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
                 }
             })
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+        // Every marker row below is resolved through the same word-wrap
+        // mapping the canvas itself draws with (`row_for_line`), so the
+        // ruler's ticks land on the same visual row the wrapped text
+        // actually renders at — see `overview_ruler`'s own doc comment.
+        let row_for_line = |line: usize| -> usize {
+            if word_wrap {
+                wrap_offsets.get(line).copied().unwrap_or(0) as usize
+            } else {
+                line
+            }
+        };
+        let diagnostic_rows: Vec<(usize, DiagnosticSeverity)> =
+            diagnostics.iter().map(|d| (row_for_line(d.start.line), d.severity)).collect();
+        let find_rows: Vec<usize> =
+            find_matches.iter().map(|&(start, _)| row_for_line(document.line_col(start).0)).collect();
+        let bookmark_rows: Vec<usize> = bookmarks.iter().map(|&line| row_for_line(line)).collect();
+
+        let ruler = canvas(overview_ruler::OverviewRuler {
+            palette: p,
+            pane,
+            total_rows: content_rows.max(1),
+            content_height: editor_canvas::content_height(content_rows, font_size),
+            viewport_height: size.height,
+            scroll_offset,
+            cursor_row: row_for_line(cursor.line),
+            diagnostic_rows,
+            find_rows,
+            bookmark_rows,
+        })
+        .width(Length::Fixed(overview_ruler::WIDTH))
+        .height(Length::Fill);
+
+        row![scroll, ruler].width(Length::Fill).height(Length::Fill).into()
     });
 
     let base = container(editor_pane)
@@ -185,18 +266,27 @@ pub(crate) fn code_area(editor: &EditorState, state: &State, pane: Pane, p: Pale
         base.into()
     };
 
-    // The split pane skips the breadcrumb bar rather than rendering a
-    // non-interactive copy of it: `JumpToBreadcrumb` has no pane of its own
-    // and always jumps the primary editor, so showing it here (looking
-    // clickable) over the split file would be misleading. `content_area`
-    // gives the split pane its own lightweight header instead.
-    let mut rows: Vec<Element<'static, Message>> = Vec::new();
-    if pane == Pane::Primary {
-        rows.push(breadcrumb_bar::view(editor, p));
-    }
-    rows.push(editor_area);
+    // The split pane skips this floating badge rather than rendering a
+    // non-interactive copy of it: `JsonToggleTextMode`/`MarkdownToggleTextMode`
+    // both flip the *shared* `EditorState`'s mode flag, not anything scoped
+    // to a pane, so showing a second live control for it over the split file
+    // would just be a second way to trigger the exact same toggle.
+    let editor_area: Element<'static, Message> = if pane == Pane::Primary {
+        if let Some(toggle) = view_mode_toggle(editor, p) {
+            let positioned = container(toggle)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_right(Length::Fill)
+                .padding(8.0);
+            iced::widget::stack![editor_area, positioned].into()
+        } else {
+            editor_area
+        }
+    } else {
+        editor_area
+    };
 
-    column(rows).width(Length::Fill).height(Length::Fill).into()
+    editor_area
 }
 
 /// The mockup's styled "no buffer open" state (item 22): a two-line message
@@ -439,6 +529,7 @@ pub fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
     layers.extend(status_bar::language_picker_view(state, p));
     layers.extend(status_bar::encoding_info_view(state, p));
     layers.extend(command_palette::view(state));
+    layers.extend(quick_open::view(state));
     layers.extend(settings_panel::view(state));
     layers.extend(tab_bar::overflow_menu(state, p));
     layers.extend(tab_bar::hover_preview(state, p));
